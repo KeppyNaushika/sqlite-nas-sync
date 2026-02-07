@@ -1,0 +1,43 @@
+{
+  "name": "sqlite-nas-sync",
+  "version": "0.2.0",
+  "description": "Sync SQLite databases across multiple clients via NAS with changelog-based conflict resolution",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "docs": "typedoc",
+    "docs:serve": "typedoc && npx serve docs/api -l 3333",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "sqlite",
+    "nas",
+    "sync",
+    "database",
+    "conflict-resolution",
+    "multi-client",
+    "changelog"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.0",
+    "typedoc": "^0.28.16",
+    "typescript": "^5.4.5",
+    "vitest": "^3.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

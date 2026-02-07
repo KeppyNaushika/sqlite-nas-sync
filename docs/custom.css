@@ -1,0 +1,199 @@
+/* === sqlite-nas-sync TypeDoc カスタムテーマ === */
+
+:root {
+  /* カラー上書き */
+  --light-color-background: #fafafa;
+  --light-color-background-secondary: #ffffff;
+  --light-color-text: #1a1a2e;
+  --light-color-text-aside: #64748b;
+  --light-color-link: #4f46e5;
+
+  --dark-color-background: #0f0f1a;
+  --dark-color-background-secondary: #1a1a2e;
+  --dark-color-text: #e2e8f0;
+  --dark-color-text-aside: #94a3b8;
+  --dark-color-link: #818cf8;
+}
+
+/* ベース */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+    "Noto Sans JP", sans-serif !important;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: 0.01em;
+  line-height: 1.7;
+}
+
+/* ヘッダー */
+.tsd-page-toolbar {
+  border-bottom: none !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06) !important;
+}
+
+.tsd-page-toolbar .title {
+  font-weight: 700 !important;
+  letter-spacing: -0.03em;
+  font-size: 1.1em;
+}
+
+/* ページタイトル */
+.tsd-page-title h1 {
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  font-size: 2.2rem;
+  margin-bottom: 0.5em;
+}
+
+/* パネル — 枠線なし、影で浮かせる */
+.tsd-panel {
+  border: none !important;
+  border-radius: 12px !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05) !important;
+  padding: 20px 24px !important;
+}
+
+/* アコーディオン見出し */
+.tsd-panel-group > .tsd-accordion-summary h2 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-size: 1.3em;
+}
+
+/* メンバー */
+.tsd-member {
+  padding: 16px 0;
+}
+
+.tsd-member .tsd-anchor + h3 {
+  font-weight: 600;
+}
+
+/* シグネチャ */
+.tsd-signature {
+  font-family: "SF Mono", "Menlo", "Monaco", "Cascadia Code",
+    "Consolas", monospace !important;
+  font-size: 0.85em;
+  border-radius: 8px;
+  padding: 14px 18px !important;
+  border: none !important;
+  background: var(--color-background) !important;
+}
+
+/* コードブロック */
+pre {
+  border-radius: 10px !important;
+  padding: 18px 20px !important;
+  border: none !important;
+  font-size: 0.88em;
+}
+
+pre > code,
+code {
+  font-family: "SF Mono", "Menlo", "Monaco", "Cascadia Code",
+    "Consolas", monospace !important;
+  font-size: 0.9em;
+}
+
+/* インラインコード */
+p code,
+li code,
+td code {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+
+/* リンク */
+a {
+  text-decoration: none;
+  transition: opacity 0.15s ease;
+}
+
+a:hover {
+  opacity: 0.75;
+}
+
+/* ナビゲーション */
+.tsd-navigation a {
+  border-radius: 6px;
+  padding: 5px 10px;
+  transition: background-color 0.12s ease;
+}
+
+.tsd-navigation a:hover {
+  background-color: rgba(79, 70, 229, 0.05);
+}
+
+.tsd-navigation a.current {
+  font-weight: 600;
+  background-color: rgba(79, 70, 229, 0.08);
+}
+
+/* コメント */
+.tsd-comment p {
+  line-height: 1.8;
+}
+
+/* @remarks / @example ラベル */
+.tsd-tag-example h4,
+.tsd-tag-remarks h4 {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 0.7em;
+  letter-spacing: 0.1em;
+  opacity: 0.5;
+  margin-bottom: 10px;
+}
+
+/* テーブル */
+.tsd-typography table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.tsd-typography th {
+  font-weight: 600;
+  text-align: left;
+  border-bottom: 2px solid rgba(0, 0, 0, 0.08);
+}
+
+.tsd-typography td,
+.tsd-typography th {
+  padding: 10px 14px;
+}
+
+.tsd-typography td {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+/* フッター */
+footer {
+  border-top: none !important;
+  margin-top: 4rem;
+  padding-top: 2rem;
+  opacity: 0.4;
+}
+
+footer p {
+  font-size: 0.75em;
+}
+
+/* スクロールバー */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
