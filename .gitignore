@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.sqlite
+*.db
+.DS_Store
+coverage/
+.env
+*.log
+__tests__/test-data*/
+docs/api/

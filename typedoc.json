@@ -1,0 +1,13 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "out": "docs/api",
+  "name": "sqlite-nas-sync",
+  "readme": "none",
+  "excludeInternal": true,
+  "excludePrivate": true,
+  "includeVersion": true,
+  "categorizeByGroup": true,
+  "sort": ["source-order"],
+  "customCss": "docs/custom.css"
+}
