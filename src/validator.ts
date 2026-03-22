@@ -7,6 +7,7 @@
  * @module validator
  */
 import Database from 'better-sqlite3';
+import { TableConfig } from './types';
 
 /**
  * バリデーションエラーの詳細。
@@ -61,12 +62,15 @@ function escapeIdentifier(identifier: string): string {
  */
 export function validateDatabase(
   db: Database.Database,
-  tables: string[],
+  tables: TableConfig[],
   primaryKey: string
 ): ValidationError[] {
   const errors: ValidationError[] = [];
 
-  for (const table of tables) {
+  for (const tableConfig of tables) {
+    const table = tableConfig.name;
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+
     // テーブル存在確認
     const exists = db
       .prepare(
@@ -102,12 +106,12 @@ export function validateDatabase(
       });
     }
 
-    // updatedAtカラム確認
-    const hasUpdatedAt = columns.some((col) => col.name === 'updatedAt');
-    if (!hasUpdatedAt) {
+    // タイムスタンプカラム確認
+    const hasTimestamp = columns.some((col) => col.name === timestampColumn);
+    if (!hasTimestamp) {
       errors.push({
         table,
-        message: `Column 'updatedAt' does not exist`,
+        message: `Column '${timestampColumn}' does not exist`,
       });
     }
   }

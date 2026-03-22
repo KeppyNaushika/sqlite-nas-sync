@@ -35,7 +35,8 @@ export function applyInsert(
   tableName: string,
   primaryKey: string,
   record: Record<string, unknown>,
-  columns: string[]
+  columns: string[],
+  timestampColumn: string = 'updatedAt'
 ): { action: 'inserted' | 'upserted'; conflict?: ConflictInfo } {
   const escapedTable = escapeIdentifier(tableName);
   const escapedColumns = columns.map((c) => escapeIdentifier(c));
@@ -63,9 +64,9 @@ export function applyInsert(
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
         .get(pkValue) as Record<string, unknown> | undefined;
 
-      const remoteUpdatedAt = String(record['updatedAt'] ?? '');
+      const remoteUpdatedAt = String(record[timestampColumn] ?? '');
       const localUpdatedAt = localRecord
-        ? String(localRecord['updatedAt'] ?? '')
+        ? String(localRecord[timestampColumn] ?? '')
         : '';
 
       if (!localRecord || remoteUpdatedAt > localUpdatedAt) {
@@ -132,7 +133,8 @@ export function applyUpdate(
   tableName: string,
   primaryKey: string,
   remoteRecord: Record<string, unknown>,
-  columns: string[]
+  columns: string[],
+  timestampColumn: string = 'updatedAt'
 ): { action: 'updated' | 'skipped' | 'inserted'; conflict?: ConflictInfo } {
   const escapedTable = escapeIdentifier(tableName);
   const escapedPk = escapeIdentifier(primaryKey);
@@ -157,8 +159,8 @@ export function applyUpdate(
   }
 
   // LWW比較
-  const remoteUpdatedAt = String(remoteRecord['updatedAt'] ?? '');
-  const localUpdatedAt = String(localRecord['updatedAt'] ?? '');
+  const remoteUpdatedAt = String(remoteRecord[timestampColumn] ?? '');
+  const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
 
   if (remoteUpdatedAt > localUpdatedAt) {
     const updateColumns = columns.filter((c) => c !== primaryKey);

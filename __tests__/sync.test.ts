@@ -31,7 +31,7 @@ describe('performSync', () => {
         updatedAt TEXT NOT NULL
       )
     `);
-    setupChangelog(db, ['users', 'posts'], 'id');
+    setupChangelog(db, [{ name: 'users' }, { name: 'posts' }], 'id');
     return { db, dbPath };
   }
 
@@ -40,7 +40,7 @@ describe('performSync', () => {
       dbPath,
       nasPath: nasDir,
       clientId,
-      tables: ['users', 'posts'],
+      tables: [{ name: 'users' }, { name: 'posts' }],
       primaryKey: 'id',
       changelogRetentionDays: 7,
     };

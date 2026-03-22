@@ -1,3 +1,22 @@
+import Database from 'better-sqlite3';
+
+/**
+ * テーブル別の同期設定。
+ */
+export interface TableConfig {
+  /** テーブル名 */
+  name: string;
+  /**
+   * LWW比較に使うタイムスタンプカラム名。
+   * @defaultValue `'updatedAt'`
+   */
+  timestampColumn?: string;
+  /**
+   * trueの場合、sync時にこのテーブルへのDELETE操作を適用しない（tombstone保護）。
+   */
+  deleteProtected?: boolean;
+}
+
 /**
  * 同期の設定オプション。
  *
@@ -9,7 +28,7 @@
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: ['users', 'posts'],
+ *   tables: [{ name: 'users' }, { name: 'posts', deleteProtected: true }],
  * };
  * ```
  */
@@ -20,8 +39,8 @@ export interface SyncConfig {
   nasPath: string;
   /** このクライアントの一意識別子（UUID推奨） */
   clientId: string;
-  /** sync対象テーブル名の配列 */
-  tables: string[];
+  /** sync対象テーブル設定の配列 */
+  tables: TableConfig[];
   /**
    * 主キーカラム名。全対象テーブルで共通。
    * @defaultValue `'id'`
@@ -38,6 +57,11 @@ export interface SyncConfig {
    * @defaultValue `7`
    */
   changelogRetentionDays?: number;
+  /**
+   * sync完了後に呼ばれるコールバック。
+   * changelog掃除の後に実行される。
+   */
+  onAfterSync?: (localDb: Database.Database, result: SyncResult) => void;
 }
 
 /**
