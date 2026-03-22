@@ -7,6 +7,7 @@
  * @module setup
  */
 import Database from 'better-sqlite3';
+import { TableConfig } from './types';
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
@@ -38,7 +39,7 @@ function escapeIdentifier(identifier: string): string {
  */
 export function setupChangelog(
   db: Database.Database,
-  tables: string[],
+  tables: TableConfig[],
   primaryKey: string
 ): void {
   // _changelog テーブル
@@ -67,7 +68,8 @@ export function setupChangelog(
   // テーブルごとにトリガーを作成
   const escapedPk = escapeIdentifier(primaryKey);
 
-  for (const table of tables) {
+  for (const tableConfig of tables) {
+    const table = tableConfig.name;
     const escapedTable = escapeIdentifier(table);
 
     // INSERT トリガー

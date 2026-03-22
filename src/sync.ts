@@ -7,7 +7,7 @@
  * @module sync
  */
 import Database from 'better-sqlite3';
-import { SyncConfig, SyncResult, ChangelogEntry, DEFAULTS } from './types';
+import { SyncConfig, SyncResult, ChangelogEntry, TableConfig, DEFAULTS } from './types';
 import {
   readChangelog,
   getMaxChangelogId,
@@ -117,15 +117,23 @@ function processChangelogEntries(
   remoteDb: Database.Database,
   entries: ChangelogEntry[],
   primaryKey: string,
-  configTables: string[],
+  configTables: TableConfig[],
   result: SyncResult
 ): void {
   // テーブルごとのカラム情報をキャッシュ
   const columnCache = new Map<string, string[]>();
+  // テーブル名 → TableConfig のマップ
+  const tableConfigMap = new Map<string, TableConfig>();
+  for (const tc of configTables) {
+    tableConfigMap.set(tc.name, tc);
+  }
 
   for (const entry of entries) {
     // config.tables に含まれないテーブルはスキップ
-    if (!configTables.includes(entry.tableName)) continue;
+    const tableConfig = tableConfigMap.get(entry.tableName);
+    if (!tableConfig) continue;
+
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
 
     let columns = columnCache.get(entry.tableName);
     if (!columns) {
@@ -134,6 +142,9 @@ function processChangelogEntries(
     }
 
     if (entry.operation === 'DELETE') {
+      // deleteProtected の場合はスキップ
+      if (tableConfig.deleteProtected) continue;
+
       const { action } = applyDelete(
         localDb,
         entry.tableName,
@@ -157,7 +168,8 @@ function processChangelogEntries(
           entry.tableName,
           primaryKey,
           remoteRecord,
-          columns
+          columns,
+          timestampColumn
         );
         if (action === 'inserted') result.inserted++;
         if (action === 'upserted') result.conflictsResolved++;
@@ -173,7 +185,8 @@ function processChangelogEntries(
           entry.tableName,
           primaryKey,
           remoteRecord,
-          columns
+          columns,
+          timestampColumn
         );
         if (action === 'updated') result.updated++;
         if (action === 'inserted') result.inserted++;
@@ -203,7 +216,7 @@ function processChangelogEntries(
 function performFullTableFallback(
   localDb: Database.Database,
   remoteDb: Database.Database,
-  tables: string[],
+  tables: TableConfig[],
   primaryKey: string,
   lastSyncedAt: string | null,
   result: SyncResult
@@ -212,8 +225,11 @@ function performFullTableFallback(
     'Changelog gap detected, performing full-table fallback (deletes cannot be detected)'
   );
 
-  for (const table of tables) {
+  for (const tableConfig of tables) {
+    const table = tableConfig.name;
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
     const escapedTable = escapeIdentifier(table);
+    const escapedTimestamp = escapeIdentifier(timestampColumn);
 
     // リモートDBにテーブルが存在するか確認
     const exists = remoteDb
@@ -229,7 +245,7 @@ function performFullTableFallback(
     if (lastSyncedAt) {
       remoteRecords = remoteDb
         .prepare(
-          `SELECT * FROM ${escapedTable} WHERE "updatedAt" > ?`
+          `SELECT * FROM ${escapedTable} WHERE ${escapedTimestamp} > ?`
         )
         .all(lastSyncedAt) as Record<string, unknown>[];
     } else {
@@ -245,7 +261,8 @@ function performFullTableFallback(
         table,
         primaryKey,
         remoteRecord,
-        columns
+        columns,
+        timestampColumn
       );
       if (action === 'updated') result.updated++;
       if (action === 'inserted') result.inserted++;
@@ -385,6 +402,11 @@ export async function performSync(
 
   // 4. 古い_changelogエントリの掃除
   cleanupChangelog(localDb, retentionDays);
+
+  // 5. onAfterSync コールバック
+  if (config.onAfterSync) {
+    config.onAfterSync(localDb, result);
+  }
 
   return result;
 }

@@ -41,7 +41,7 @@ describe('Integration Tests', () => {
       dbPath,
       nasPath: nasDir,
       clientId,
-      tables: ['users', 'posts'],
+      tables: [{ name: 'users' }, { name: 'posts' }],
       primaryKey: 'id',
       intervalMs: 100,
       changelogRetentionDays: 7,
@@ -312,7 +312,7 @@ describe('Integration Tests', () => {
       expect(() =>
         setupSync({
           ...makeConfig(dbPath, 'invalid'),
-          tables: ['users', 'nonexistent'],
+          tables: [{ name: 'users' }, { name: 'nonexistent' }],
         })
       ).toThrow('Validation failed');
     });
@@ -353,6 +353,149 @@ describe('Integration Tests', () => {
 
       expect(users).toHaveLength(1);
       expect(posts).toHaveLength(1);
+    });
+  });
+
+  describe('カスタムtimestampColumn', () => {
+    function createClientDbWithModifiedAt(clientId: string): string {
+      const clientDir = path.join(testDir, clientId);
+      fs.mkdirSync(clientDir, { recursive: true });
+      const dbPath = path.join(clientDir, 'local.sqlite');
+
+      const db = new Database(dbPath);
+      db.exec(`
+        CREATE TABLE items (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          modifiedAt TEXT NOT NULL
+        )
+      `);
+      db.close();
+      return dbPath;
+    }
+
+    it('カスタムtimestampColumnでLWWが正しく動作する', async () => {
+      const pathA = createClientDbWithModifiedAt('client-a');
+      const pathB = createClientDbWithModifiedAt('client-b');
+
+      const config = (dbPath: string, clientId: string): SyncConfig => ({
+        dbPath,
+        nasPath: nasDir,
+        clientId,
+        tables: [{ name: 'items', timestampColumn: 'modifiedAt' }],
+        primaryKey: 'id',
+        intervalMs: 100,
+        changelogRetentionDays: 7,
+      });
+
+      const syncA = setupSync(config(pathA, 'client-a'));
+      const syncB = setupSync(config(pathB, 'client-b'));
+
+      // 両方に同じIDのレコード（Bが新しい）
+      const dbA = new Database(pathA);
+      dbA.prepare(`INSERT INTO items (id, name, modifiedAt) VALUES (?, ?, ?)`).run(
+        'i1', 'Old Item', '2024-01-01T00:00:00Z'
+      );
+      dbA.close();
+
+      const dbB = new Database(pathB);
+      dbB.prepare(`INSERT INTO items (id, name, modifiedAt) VALUES (?, ?, ?)`).run(
+        'i1', 'New Item', '2024-06-01T00:00:00Z'
+      );
+      dbB.close();
+
+      // A sync → B sync → A resync
+      await syncA.syncNow();
+      await syncB.syncNow();
+      await syncA.syncNow();
+
+      syncA.stop();
+      syncB.stop();
+
+      // 両方ともBの新しいデータになっている
+      const dbACheck = new Database(pathA);
+      const itemA = dbACheck.prepare(`SELECT * FROM items WHERE id = ?`).get('i1') as any;
+      dbACheck.close();
+      expect(itemA.name).toBe('New Item');
+
+      const dbBCheck = new Database(pathB);
+      const itemB = dbBCheck.prepare(`SELECT * FROM items WHERE id = ?`).get('i1') as any;
+      dbBCheck.close();
+      expect(itemB.name).toBe('New Item');
+    });
+  });
+
+  describe('deleteProtected', () => {
+    it('deleteProtected: true のテーブルではDELETEがスキップされる', async () => {
+      const pathA = createClientDb('client-a');
+      const pathB = createClientDb('client-b');
+
+      const configWithProtect = (dbPath: string, clientId: string): SyncConfig => ({
+        dbPath,
+        nasPath: nasDir,
+        clientId,
+        tables: [
+          { name: 'users', deleteProtected: true },
+          { name: 'posts' },
+        ],
+        primaryKey: 'id',
+        intervalMs: 100,
+        changelogRetentionDays: 7,
+      });
+
+      const syncA = setupSync(configWithProtect(pathA, 'client-a'));
+      const syncB = setupSync(configWithProtect(pathB, 'client-b'));
+
+      // Client A: レコード追加 → sync
+      const dbA1 = new Database(pathA);
+      dbA1.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+      dbA1.close();
+      await syncA.syncNow();
+
+      // Client B: sync → レコード取得
+      await syncB.syncNow();
+      expect(getUser(pathB, 'u1')).toBeTruthy();
+
+      // Client A: レコード削除 → sync
+      const dbA2 = new Database(pathA);
+      dbA2.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
+      dbA2.close();
+      await syncA.syncNow();
+
+      // Client B: 再sync → deleteProtectedなのでレコードは残る
+      const resultB = await syncB.syncNow();
+      syncA.stop();
+      syncB.stop();
+
+      expect(resultB.deleted).toBe(0);
+      expect(getUser(pathB, 'u1')).toBeTruthy();
+    });
+  });
+
+  describe('onAfterSync', () => {
+    it('sync完了後にonAfterSyncが呼ばれる', async () => {
+      const pathA = createClientDb('client-a');
+
+      let callbackCalled = false;
+      let callbackResult: SyncResult | null = null;
+
+      const config: SyncConfig = {
+        ...makeConfig(pathA, 'client-a'),
+        onAfterSync: (_db, result) => {
+          callbackCalled = true;
+          callbackResult = result;
+        },
+      };
+
+      const syncA = setupSync(config);
+      await syncA.syncNow();
+      syncA.stop();
+
+      expect(callbackCalled).toBe(true);
+      expect(callbackResult).toBeTruthy();
+      expect(callbackResult!.warnings).toBeDefined();
     });
   });
 });

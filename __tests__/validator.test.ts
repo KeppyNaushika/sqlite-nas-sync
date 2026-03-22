@@ -22,12 +22,12 @@ describe('validateDatabase', () => {
       )
     `);
 
-    const errors = validateDatabase(db, ['users'], 'id');
+    const errors = validateDatabase(db, [{ name: 'users' }], 'id');
     expect(errors).toHaveLength(0);
   });
 
   it('テーブルが存在しない場合エラー', () => {
-    const errors = validateDatabase(db, ['nonexistent'], 'id');
+    const errors = validateDatabase(db, [{ name: 'nonexistent' }], 'id');
     expect(errors).toHaveLength(1);
     expect(errors[0].table).toBe('nonexistent');
     expect(errors[0].message).toContain('does not exist');
@@ -42,7 +42,7 @@ describe('validateDatabase', () => {
       )
     `);
 
-    const errors = validateDatabase(db, ['users'], 'id');
+    const errors = validateDatabase(db, [{ name: 'users' }], 'id');
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain("Primary key column 'id' does not exist");
   });
@@ -56,7 +56,7 @@ describe('validateDatabase', () => {
       )
     `);
 
-    const errors = validateDatabase(db, ['users'], 'id');
+    const errors = validateDatabase(db, [{ name: 'users' }], 'id');
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain('must be TEXT type');
   });
@@ -69,7 +69,7 @@ describe('validateDatabase', () => {
       )
     `);
 
-    const errors = validateDatabase(db, ['users'], 'id');
+    const errors = validateDatabase(db, [{ name: 'users' }], 'id');
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain("'updatedAt' does not exist");
   });
@@ -89,16 +89,51 @@ describe('validateDatabase', () => {
       )
     `);
 
-    const errors = validateDatabase(db, ['users', 'logs'], 'id');
+    const errors = validateDatabase(db, [{ name: 'users' }, { name: 'logs' }], 'id');
     // logs: INTEGER PK + updatedAtなし
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors.every((e) => e.table === 'logs')).toBe(true);
   });
 
   it('テーブル不在の場合、後続チェックをスキップ', () => {
-    const errors = validateDatabase(db, ['missing'], 'id');
+    const errors = validateDatabase(db, [{ name: 'missing' }], 'id');
     // エラーは1つだけ（不在エラーのみ、PKやupdatedAtのエラーは出ない）
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toBe('Table does not exist');
+  });
+
+  it('カスタムtimestampColumnが存在しない場合エラー', () => {
+    db.exec(`
+      CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+
+    const errors = validateDatabase(
+      db,
+      [{ name: 'items', timestampColumn: 'modifiedAt' }],
+      'id'
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("'modifiedAt' does not exist");
+  });
+
+  it('カスタムtimestampColumnが存在する場合はエラーなし', () => {
+    db.exec(`
+      CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        modifiedAt TEXT NOT NULL
+      )
+    `);
+
+    const errors = validateDatabase(
+      db,
+      [{ name: 'items', timestampColumn: 'modifiedAt' }],
+      'id'
+    );
+    expect(errors).toHaveLength(0);
   });
 });

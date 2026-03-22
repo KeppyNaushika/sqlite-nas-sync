@@ -28,7 +28,7 @@ describe('setupChangelog', () => {
   });
 
   it('_changelog テーブルを作成する', () => {
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
 
     const table = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_changelog'`)
@@ -37,7 +37,7 @@ describe('setupChangelog', () => {
   });
 
   it('_sync_state テーブルを作成する', () => {
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
 
     const table = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_sync_state'`)
@@ -46,7 +46,7 @@ describe('setupChangelog', () => {
   });
 
   it('テーブルごとに3つのトリガーを作成する', () => {
-    setupChangelog(db, ['users', 'posts'], 'id');
+    setupChangelog(db, [{ name: 'users' }, { name: 'posts' }], 'id');
 
     const triggers = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='trigger'`)
@@ -63,12 +63,12 @@ describe('setupChangelog', () => {
   });
 
   it('冪等: 2回実行してもエラーにならない', () => {
-    setupChangelog(db, ['users'], 'id');
-    expect(() => setupChangelog(db, ['users'], 'id')).not.toThrow();
+    setupChangelog(db, [{ name: 'users' }], 'id');
+    expect(() => setupChangelog(db, [{ name: 'users' }], 'id')).not.toThrow();
   });
 
   it('INSERT時に_changelogにエントリが記録される', () => {
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
 
     db.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
@@ -82,7 +82,7 @@ describe('setupChangelog', () => {
   });
 
   it('UPDATE時に_changelogにエントリが記録される', () => {
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
 
     db.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
@@ -96,7 +96,7 @@ describe('setupChangelog', () => {
   });
 
   it('DELETE時に_changelogにエントリが記録される', () => {
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
 
     db.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
@@ -125,7 +125,7 @@ describe('setupChangelog', () => {
       )
     `);
 
-    setupChangelog(fileDb, ['users'], 'id');
+    setupChangelog(fileDb, [{ name: 'users' }], 'id');
 
     const journalMode = fileDb.pragma('journal_mode', { simple: true });
     expect(journalMode).toBe('wal');
@@ -146,7 +146,7 @@ describe('setupChangelog', () => {
       )
     `);
 
-    setupChangelog(db, ['users', 'comments'], 'id');
+    setupChangelog(db, [{ name: 'users' }, { name: 'comments' }], 'id');
 
     db.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'

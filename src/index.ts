@@ -17,7 +17,7 @@
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: ['users', 'posts'],
+ *   tables: [{ name: 'users' }, { name: 'posts' }],
  * });
  *
  * // 手動同期
@@ -65,7 +65,7 @@ import { performSync } from './sync';
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: ['users', 'posts'],
+ *   tables: [{ name: 'users' }, { name: 'posts' }],
  *   intervalMs: 60000,         // 1分間隔
  *   changelogRetentionDays: 14 // 14日間保持
  * });
@@ -171,6 +171,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
 
 // 公開型のre-export
 export type {
+  TableConfig,
   SyncConfig,
   SyncInstance,
   SyncResult,

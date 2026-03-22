@@ -20,7 +20,7 @@ describe('changelog', () => {
         updatedAt TEXT NOT NULL
       )
     `);
-    setupChangelog(db, ['users'], 'id');
+    setupChangelog(db, [{ name: 'users' }], 'id');
   });
 
   afterEach(() => {
