@@ -498,4 +498,66 @@ describe('Integration Tests', () => {
       expect(callbackResult!.warnings).toBeDefined();
     });
   });
+
+  describe('schemaVersion自動ハッシュ', () => {
+    it('同じスキーマのクライアント同士は自動的に同期される', async () => {
+      const pathA = createClientDb('client-a');
+      const pathB = createClientDb('client-b');
+
+      // schemaVersion未指定 → 自動ハッシュが使われる
+      const syncA = setupSync(makeConfig(pathA, 'client-a'));
+      const syncB = setupSync(makeConfig(pathB, 'client-b'));
+
+      insertUserViaDb(pathA, 'u1', 'Alice', 'a@test.com', '2024-01-01T00:00:00Z');
+      await syncA.syncNow();
+      const result = await syncB.syncNow();
+
+      syncA.stop();
+      syncB.stop();
+
+      expect(result.inserted).toBe(1);
+      expect(getUser(pathB, 'u1')).toBeTruthy();
+    });
+
+    it('スキーマが異なるクライアントは自動的にスキップされる', async () => {
+      const pathA = createClientDb('client-a');
+
+      // Client B は異なるスキーマ（emailカラムなし）
+      const clientBDir = path.join(testDir, 'client-b');
+      fs.mkdirSync(clientBDir, { recursive: true });
+      const pathB = path.join(clientBDir, 'local.sqlite');
+      const dbB = new Database(pathB);
+      dbB.exec(`
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      dbB.exec(`
+        CREATE TABLE posts (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          body TEXT,
+          userId TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      dbB.close();
+
+      const syncA = setupSync(makeConfig(pathA, 'client-a'));
+      const syncB = setupSync(makeConfig(pathB, 'client-b'));
+
+      insertUserViaDb(pathA, 'u1', 'Alice', 'a@test.com', '2024-01-01T00:00:00Z');
+      await syncA.syncNow();
+      const result = await syncB.syncNow();
+
+      syncA.stop();
+      syncB.stop();
+
+      // スキーマが異なるので同期がスキップされる
+      expect(result.inserted).toBe(0);
+      expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
+    });
+  });
 });

@@ -6,6 +6,7 @@
  *
  * @module setup
  */
+import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { TableConfig } from './types';
 
@@ -148,4 +149,63 @@ export function readSchemaVersion(
   } catch {
     return null;
   }
+}
+
+/** @internal PRAGMA table_info が返すカラム情報 */
+interface ColumnInfo {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: unknown;
+  pk: number;
+}
+
+/**
+ * 同期対象テーブルのスキーマからハッシュ値を自動生成する。
+ *
+ * 各テーブルの `PRAGMA table_info` からカラム名・型・notnull・pk を取得し、
+ * テーブル名でソートした上でSHA-256ハッシュを生成する。
+ * スキーマが変更されると自動的に異なるハッシュが返るため、
+ * 手動でバージョンを管理する必要がない。
+ *
+ * @param db - 対象のSQLiteデータベース接続
+ * @param tables - ハッシュ対象のテーブル設定配列
+ * @returns スキーマのSHA-256ハッシュ（先頭16文字）
+ */
+export function computeSchemaHash(
+  db: Database.Database,
+  tables: TableConfig[]
+): string {
+  const parts: string[] = [];
+
+  // テーブル名でソートして安定した順序にする
+  const sortedTables = [...tables].sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const tableConfig of sortedTables) {
+    const tableName = tableConfig.name;
+
+    try {
+      const columns = db
+        .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
+        .all() as ColumnInfo[];
+
+      // カラムをcid順（定義順）で処理
+      const colDescs = columns
+        .sort((a, b) => a.cid - b.cid)
+        .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.pk}`)
+        .join(',');
+
+      parts.push(`${tableName}(${colDescs})`);
+    } catch {
+      // テーブルが存在しない場合はスキップ
+    }
+  }
+
+  const hash = crypto
+    .createHash('sha256')
+    .update(parts.join('|'))
+    .digest('hex');
+
+  return hash.slice(0, 16);
 }
