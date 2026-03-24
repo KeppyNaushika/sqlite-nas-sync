@@ -62,6 +62,18 @@ export interface SyncConfig {
    * changelog掃除の後に実行される。
    */
   onAfterSync?: (localDb: Database.Database, result: SyncResult) => void;
+  /**
+   * アプリケーションのスキーマバージョン。
+   *
+   * 指定すると `_sync_meta` テーブルにバージョンを記録し、
+   * sync時にリモートDBのバージョンと比較する。
+   * バージョンが一致しないリモートクライアントはスキップされる。
+   *
+   * これによりスキーマ移行中の混在環境でデータ破損を防止できる。
+   *
+   * @example `"20260324_002"` や `"v2.0.0"` など任意の文字列
+   */
+  schemaVersion?: string;
 }
 
 /**

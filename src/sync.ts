@@ -16,6 +16,7 @@ import {
 } from './changelog';
 import { applyInsert, applyUpdate, applyDelete } from './conflict';
 import { copyToNas, listRemoteClients, openRemoteDb } from './nas';
+import { readSchemaVersion, writeSchemaVersion } from './setup';
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
@@ -313,7 +314,12 @@ export async function performSync(
     warnings: [],
   };
 
-  // 1. ローカルDBをNASにコピー
+  // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
+  if (config.schemaVersion) {
+    writeSchemaVersion(localDb, config.schemaVersion);
+  }
+
+  // 1. ローカルDBをNASにコピー（schemaVersion込み）
   await copyToNas(localDb, config.nasPath, config.clientId);
 
   // 2. NAS上の他クライアントDB列挙
@@ -330,6 +336,17 @@ export async function performSync(
           `Failed to open remote database: ${remote.clientId}`
         );
         continue;
+      }
+
+      // schemaVersionチェック: バージョンが一致しないリモートはスキップ
+      if (config.schemaVersion) {
+        const remoteVersion = readSchemaVersion(remoteDb);
+        if (remoteVersion !== config.schemaVersion) {
+          result.warnings.push(
+            `Skipping client ${remote.clientId}: schema version mismatch (local=${config.schemaVersion}, remote=${remoteVersion ?? 'unknown'})`
+          );
+          continue;
+        }
       }
 
       const { lastSeenId, lastSyncedAt } = getSyncState(

@@ -103,6 +103,49 @@ export function setupChangelog(
     `);
   }
 
+  // _sync_meta テーブル（スキーマバージョン等のメタ情報）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _sync_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
   // WALモード設定
   db.pragma('journal_mode = WAL');
+}
+
+/**
+ * `_sync_meta` テーブルにスキーマバージョンを書き込む。
+ *
+ * @param db - 対象のSQLiteデータベース接続
+ * @param schemaVersion - 書き込むスキーマバージョン文字列
+ */
+export function writeSchemaVersion(
+  db: Database.Database,
+  schemaVersion: string
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO _sync_meta (key, value) VALUES ('schemaVersion', ?)`
+  ).run(schemaVersion);
+}
+
+/**
+ * `_sync_meta` テーブルからスキーマバージョンを読み取る。
+ *
+ * @param db - 対象のSQLiteデータベース接続
+ * @returns スキーマバージョン文字列。未設定の場合は `null`
+ */
+export function readSchemaVersion(
+  db: Database.Database
+): string | null {
+  // _sync_meta テーブルが存在しない場合も考慮
+  try {
+    const row = db
+      .prepare(`SELECT value FROM _sync_meta WHERE key = 'schemaVersion'`)
+      .get() as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null;
+  }
 }

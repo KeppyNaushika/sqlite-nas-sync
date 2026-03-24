@@ -44,7 +44,7 @@ import {
   DEFAULTS,
 } from './types';
 import { validateDatabase } from './validator';
-import { setupChangelog } from './setup';
+import { setupChangelog, writeSchemaVersion } from './setup';
 import { performSync } from './sync';
 
 /**
@@ -87,8 +87,13 @@ export function setupSync(config: SyncConfig): SyncInstance {
     );
   }
 
-  // _changelog / _sync_state / トリガー 作成
+  // _changelog / _sync_state / _sync_meta / トリガー 作成
   setupChangelog(db, config.tables, primaryKey);
+
+  // schemaVersion の初期書き込み
+  if (config.schemaVersion) {
+    writeSchemaVersion(db, config.schemaVersion);
+  }
 
   // 内部状態
   let intervalHandle: ReturnType<typeof setInterval> | null = null;

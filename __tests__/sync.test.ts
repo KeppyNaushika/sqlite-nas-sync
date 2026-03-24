@@ -178,6 +178,69 @@ describe('performSync', () => {
     dbB.close();
   });
 
+  it('schemaVersionが一致するリモートは正常に同期される', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+      'u1', 'Alice', '2024-01-01T00:00:00Z'
+    );
+    const configA = { ...makeConfig(pathA, 'client-a'), schemaVersion: 'v2' };
+    await performSync(dbA, configA);
+    dbA.close();
+
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
+    const result = await performSync(dbB, configB);
+
+    expect(result.inserted).toBe(1);
+    const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
+    expect(user.name).toBe('Alice');
+
+    dbB.close();
+  });
+
+  it('schemaVersionが不一致のリモートはスキップされる', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+      'u1', 'Alice', '2024-01-01T00:00:00Z'
+    );
+    const configA = { ...makeConfig(pathA, 'client-a'), schemaVersion: 'v1' };
+    await performSync(dbA, configA);
+    dbA.close();
+
+    // Client B は v2 で同期 → v1 の Client A はスキップされるべき
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
+    const result = await performSync(dbB, configB);
+
+    expect(result.inserted).toBe(0);
+    expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
+
+    const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
+    expect(user).toBeUndefined();
+
+    dbB.close();
+  });
+
+  it('schemaVersionが未設定のリモートはスキップされる', async () => {
+    // Client A: schemaVersion未指定で同期
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+      'u1', 'Alice', '2024-01-01T00:00:00Z'
+    );
+    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    dbA.close();
+
+    // Client B: schemaVersion指定で同期 → 未設定のAはスキップ
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
+    const result = await performSync(dbB, configB);
+
+    expect(result.inserted).toBe(0);
+    expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
+
+    dbB.close();
+  });
+
   it('リモートDBオープン失敗時は警告を出して続行する', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     await performSync(dbA, makeConfig(pathA, 'client-a'));
