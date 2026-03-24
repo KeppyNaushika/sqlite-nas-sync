@@ -44,7 +44,7 @@ import {
   DEFAULTS,
 } from './types';
 import { validateDatabase } from './validator';
-import { setupChangelog, writeSchemaVersion } from './setup';
+import { setupChangelog, writeSchemaVersion, computeSchemaHash } from './setup';
 import { performSync } from './sync';
 
 /**
@@ -90,10 +90,13 @@ export function setupSync(config: SyncConfig): SyncInstance {
   // _changelog / _sync_state / _sync_meta / トリガー 作成
   setupChangelog(db, config.tables, primaryKey);
 
-  // schemaVersion の初期書き込み
-  if (config.schemaVersion) {
-    writeSchemaVersion(db, config.schemaVersion);
-  }
+  // schemaVersion: 明示指定がなければテーブルスキーマから自動生成
+  const resolvedSchemaVersion =
+    config.schemaVersion ?? computeSchemaHash(db, config.tables);
+  writeSchemaVersion(db, resolvedSchemaVersion);
+
+  // configにresolved値を反映（performSyncで参照される）
+  const resolvedConfig: SyncConfig = { ...config, schemaVersion: resolvedSchemaVersion };
 
   // 内部状態
   let intervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -123,7 +126,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
       emit('sync:start');
 
       try {
-        const result = await performSync(db, config);
+        const result = await performSync(db, resolvedConfig);
         lastResult = result;
         lastSyncedAt = new Date();
         emit('sync:complete', result);
@@ -138,7 +141,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
 
     start(): void {
       if (intervalHandle) return;
-      const ms = config.intervalMs ?? DEFAULTS.intervalMs;
+      const ms = resolvedConfig.intervalMs ?? DEFAULTS.intervalMs;
       intervalHandle = setInterval(async () => {
         try {
           await instance.syncNow();
