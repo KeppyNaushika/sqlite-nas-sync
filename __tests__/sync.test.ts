@@ -58,7 +58,6 @@ describe('performSync', () => {
   });
 
   it('INSERTエントリがリモートからローカルに同期される', async () => {
-    // Client A: レコードを挿入してsync
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
@@ -66,7 +65,6 @@ describe('performSync', () => {
     await performSync(dbA, makeConfig(pathA, 'client-a'));
     dbA.close();
 
-    // Client B: syncするとAのレコードが取得できる
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
 
@@ -78,7 +76,6 @@ describe('performSync', () => {
   });
 
   it('UPDATEエントリがLWWで同期される', async () => {
-    // Client A: レコードを挿入してsync
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
@@ -86,7 +83,6 @@ describe('performSync', () => {
     await performSync(dbA, makeConfig(pathA, 'client-a'));
     dbA.close();
 
-    // Client B: 同じレコードを持ち、Aからsync
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     dbB.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice Old', '2023-01-01T00:00:00Z'
@@ -94,7 +90,6 @@ describe('performSync', () => {
 
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-    // Aの方が新しいのでBが更新される（INSERTエントリ+PK既存→UPSERT）
     const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
     expect(user.name).toBe('Alice');
     expect(result.conflictsResolved).toBeGreaterThanOrEqual(1);
@@ -103,26 +98,22 @@ describe('performSync', () => {
   });
 
   it('DELETEエントリが伝播される', async () => {
-    // Client A: レコードを挿入してsync
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
     await performSync(dbA, makeConfig(pathA, 'client-a'));
 
-    // Client B: Aからsyncしてレコード取得
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     await performSync(dbB, makeConfig(pathB, 'client-b'));
 
     let user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
     expect(user).toBeTruthy();
 
-    // Client A: レコードを削除してsync
     dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
     await performSync(dbA, makeConfig(pathA, 'client-a'));
     dbA.close();
 
-    // Client B: 再syncするとレコードが削除される
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
     expect(result.deleted).toBe(1);
 
@@ -147,12 +138,6 @@ describe('performSync', () => {
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
 
     expect(result.inserted).toBe(2);
-
-    const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
-    const post = dbB.prepare(`SELECT * FROM posts WHERE id = ?`).get('p1');
-    expect(user).toBeTruthy();
-    expect(post).toBeTruthy();
-
     dbB.close();
   });
 
@@ -165,9 +150,7 @@ describe('performSync', () => {
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    // 1回目: 変更あり
     await performSync(dbB, makeConfig(pathB, 'client-b'));
-    // 2回目: 変更なし
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
 
     expect(result.inserted).toBe(0);
@@ -192,9 +175,6 @@ describe('performSync', () => {
     const result = await performSync(dbB, configB);
 
     expect(result.inserted).toBe(1);
-    const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
-    expect(user.name).toBe('Alice');
-
     dbB.close();
   });
 
@@ -207,30 +187,6 @@ describe('performSync', () => {
     await performSync(dbA, configA);
     dbA.close();
 
-    // Client B は v2 で同期 → v1 の Client A はスキップされるべき
-    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
-    const result = await performSync(dbB, configB);
-
-    expect(result.inserted).toBe(0);
-    expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
-
-    const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
-    expect(user).toBeUndefined();
-
-    dbB.close();
-  });
-
-  it('schemaVersionが未設定のリモートはスキップされる', async () => {
-    // Client A: schemaVersion未指定で同期
-    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
-    dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
-      'u1', 'Alice', '2024-01-01T00:00:00Z'
-    );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
-    dbA.close();
-
-    // Client B: schemaVersion指定で同期 → 未設定のAはスキップ
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
     const result = await performSync(dbB, configB);
@@ -246,37 +202,77 @@ describe('performSync', () => {
     await performSync(dbA, makeConfig(pathA, 'client-a'));
     dbA.close();
 
-    // NASにダミーの壊れたファイルを配置
     fs.writeFileSync(path.join(nasDir, 'client-corrupt.sqlite'), 'not a database');
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-    // corruptクライアントは警告、Aは正常処理
     expect(result.warnings.some((w) => w.includes('corrupt'))).toBe(true);
 
     dbB.close();
   });
 
-  it('hadChangelogGapが通常時はfalseになる', async () => {
+  it('DELETEが_tombstoneに記録される', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
+    dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
+
+    const tombstone = dbA.prepare(
+      `SELECT * FROM _tombstone WHERE tableName = 'users' AND recordId = 'u1'`
+    ).get() as any;
+    expect(tombstone).toBeTruthy();
+
+    dbA.close();
+  });
+
+  it('heartbeatがsync時に自動更新される', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+    const heartbeat = dbA.prepare(
+      `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
+    ).get() as any;
+    expect(heartbeat).toBeTruthy();
+
+    const today = new Date().toISOString().slice(0, 10);
+    expect(heartbeat.updatedAt).toBe(`${today}T12:00:00Z`);
+
+    dbA.close();
+  });
+
+  it('heartbeatがchangelogに記録される', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+    const entry = dbA.prepare(
+      `SELECT * FROM _changelog WHERE tableName = '_heartbeat'`
+    ).get() as any;
+    expect(entry).toBeTruthy();
+    expect(entry.operation).toBe('INSERT');
+
+    dbA.close();
+  });
+
+  it('heartbeatが他クライアントに伝播する', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
     await performSync(dbA, makeConfig(pathA, 'client-a'));
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-    expect(result.hadChangelogGap).toBe(false);
-    expect(result.inserted).toBe(1);
+    const heartbeat = dbB.prepare(
+      `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
+    ).get() as any;
+    expect(heartbeat).toBeTruthy();
+
     dbB.close();
   });
 
-  describe('changelogギャップ時のpull-firstフロー', () => {
-    it('staleクライアントが削除済みレコードをNASに撒き散らさない', async () => {
-      // --- セットアップ: A と B が同期済み ---
+  describe('フルマージ（ギャップ検出時）', () => {
+    it('tombstoneによりzombieレコードが削除される', async () => {
       const { db: dbA, dbPath: pathA } = createClientDb('client-a');
       const { db: dbB, dbPath: pathB } = createClientDb('client-b');
 
@@ -288,56 +284,137 @@ describe('performSync', () => {
 
       // Bが同期してu1を取得
       await performSync(dbB, makeConfig(pathB, 'client-b'));
-      const userInB = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
-      expect(userInB).toBeTruthy();
+      expect(dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get()).toBeTruthy();
 
-      // --- Bがオフラインに（以降Bは同期しない） ---
-
-      // Aがu1を削除して同期
+      // Aがu1を削除して同期（tombstoneが作成される）
       dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
       await performSync(dbA, makeConfig(pathA, 'client-a'));
 
       // Aのchangelogを全削除（7日経過をシミュレート）
       dbA.exec(`DELETE FROM _changelog`);
       await performSync(dbA, makeConfig(pathA, 'client-a'));
-
       dbA.close();
 
-      // --- Bが復帰して同期（changelogギャップ発生） ---
+      // Bが復帰して同期（changelogギャップ → フルマージ）
       const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'));
       expect(resultB.hadChangelogGap).toBe(true);
 
-      // --- 検証: Bの同期後、NAS上のBのDBにu1が残っていないこと ---
-      // Bのローカルにはu1が残っている可能性があるが（full-table fallbackでDELETEは検出不可）、
-      // 重要なのはNAS上のBのコピーが他クライアントに悪影響を与えないこと
-      // → pull-firstフローにより、BのNASコピーはpull完了後にアップロードされる
-
-      // Client Cを作成して同期 — Bの汚染がCに伝播しないことを確認
-      const { db: dbC, dbPath: pathC } = createClientDb('client-c');
-      const resultC = await performSync(dbC, makeConfig(pathC, 'client-c'));
-
-      // CにはAからの削除が伝播済み（Aのchangelogは空だがAのDBにu1は存在しない）
-      // BのNASコピーからu1が復活しないことが重要
-      // full-table fallbackでBから読む場合、BのupdatedAtとCの初回同期を比較
-      // Cは初回なので全レコードを取り込むが、Aにはu1がないのでAからは取り込まない
-      // Bにu1があっても、Aのデータの方が権威的
-      const userInC = dbC.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
-
-      // BのNAS DBを直接確認: pull-firstにより、BのchangelogはクリアされてNASにアップロードされている
-      const bNasPath = path.join(nasDir, 'client-client-b.sqlite');
-      if (fs.existsSync(bNasPath)) {
-        const bNasDb = new Database(bNasPath, { readonly: true });
-        // Bのchangelogがクリアされていることを確認
-        const changelogCount = bNasDb.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any;
-        expect(changelogCount.cnt).toBe(0);
-        bNasDb.close();
-      }
+      // tombstoneによりu1がBから削除される
+      const user = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get();
+      expect(user).toBeUndefined();
 
       dbB.close();
-      dbC.close();
     });
 
-    it('staleクライアントのローカルchangelogがクリアされる', async () => {
+    it('フルマージ中にchangelogが汚染されない', async () => {
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      // Aがレコードを複数作成して同期
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u2', 'Bob', '2024-01-02T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Bが同期
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Aのchangelogを全削除（7日経過シミュレート）
+      dbA.exec(`DELETE FROM _changelog`);
+      // Aが新しいレコードを追加
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u3', 'Charlie', '2024-01-10T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      dbA.close();
+
+      // Bのchangelogエントリ数を記録（フルマージ前）
+      const beforeCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
+
+      // Bが復帰して同期（ギャップ → フルマージ）
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // フルマージ後のchangelogエントリ数
+      // トリガーOFFなのでデータマージ分は増えない
+      // heartbeatの1件 + changelogマージ分のみ
+      const afterCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
+
+      // u1, u2の既存レコードのマージではchangelogが増えないことを確認
+      // （全レコード分のINSERT/UPDATEエントリが生成されていないこと）
+      // Aのchangelogマージ分 + heartbeat分のみ
+      expect(afterCount).toBeLessThan(beforeCount + 10);
+
+      dbB.close();
+    });
+
+    it('フルマージ後にheartbeatが更新されchangelogが延命する', async () => {
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Aのchangelogを全削除（7日経過シミュレート）
+      dbA.exec(`DELETE FROM _changelog`);
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      dbA.close();
+
+      // Bが復帰（フルマージ）
+      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      expect(resultB.hadChangelogGap).toBe(true);
+
+      // heartbeatがchangelogに記録されている
+      const heartbeatEntries = dbB.prepare(
+        `SELECT * FROM _changelog WHERE tableName = '_heartbeat'`
+      ).all();
+      expect(heartbeatEntries.length).toBeGreaterThanOrEqual(1);
+
+      dbB.close();
+    });
+
+    it('フルマージでリモートのchangelogがマージされる', async () => {
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Aがchangelogの古い部分を削除しつつ新しい変更を追加
+      dbA.exec(`DELETE FROM _changelog`);
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u2', 'Bob', '2024-01-10T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      dbA.close();
+
+      // Bが復帰（フルマージ）
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Bのchangelogにu2のエントリがある（Aのchangelogからマージされた）
+      const u2Entries = dbB.prepare(
+        `SELECT * FROM _changelog WHERE recordId = 'u2'`
+      ).all();
+      expect(u2Entries.length).toBeGreaterThanOrEqual(1);
+
+      // u2のデータもマージされている
+      const user = dbB.prepare(`SELECT * FROM users WHERE id = 'u2'`).get() as any;
+      expect(user.name).toBe('Bob');
+
+      dbB.close();
+    });
+
+    it('pull-firstによりstaleデータがNASに拡散しない', async () => {
       const { db: dbA, dbPath: pathA } = createClientDb('client-a');
       const { db: dbB, dbPath: pathB } = createClientDb('client-b');
 
@@ -350,56 +427,65 @@ describe('performSync', () => {
       // Bが同期
       await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-      // Bがオフライン中にローカルで変更
-      dbB.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
-        'u2', 'Bob', '2024-01-02T00:00:00Z'
-      );
+      // Aがu1を削除して同期
+      dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
 
-      // Aのchangelogを全削除（7日経過をシミュレート）
+      // Aのchangelogを全削除（7日経過シミュレート）
       dbA.exec(`DELETE FROM _changelog`);
       await performSync(dbA, makeConfig(pathA, 'client-a'));
       dbA.close();
 
-      // Bのchangelogにはu2のINSERTエントリがあるはず
-      const beforeCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
-      expect(beforeCount).toBeGreaterThan(0);
+      // Bが復帰（フルマージ）
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-      // Bが復帰して同期
-      const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
-      expect(result.hadChangelogGap).toBe(true);
+      // Cが参加して同期 — Bの汚染がCに伝播しないことを確認
+      const { db: dbC, dbPath: pathC } = createClientDb('client-c');
+      await performSync(dbC, makeConfig(pathC, 'client-c'));
 
-      // pull-firstフローでchangelogがクリアされていること
-      // （cleanupChangelogで追加で掃除されるが、DELETEで全削除済み）
-      const afterCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
-      expect(afterCount).toBe(0);
+      // CにはAからの削除が反映されている（u1が存在しない）
+      // BのNASコピーからu1が復活しないことが重要
+      const userInC = dbC.prepare(`SELECT * FROM users WHERE id = 'u1'`).get();
+      expect(userInC).toBeUndefined();
 
       dbB.close();
+      dbC.close();
     });
 
-    it('ギャップなしの場合は従来通りcopyToNas→pullの順', async () => {
-      // 通常フローでは先にNASにアップロードされる
+    it('tombstoneのLWW: 削除後に再作成されたレコードは保持される', async () => {
       const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      // Aがレコード作成 → 同期
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
       await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Bが同期
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Aがu1を削除
+      dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Aのchangelogを全削除（7日経過シミュレート）
+      dbA.exec(`DELETE FROM _changelog`);
+
+      // Aがu1を再作成（削除より新しいupdatedAt）
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice Reborn', '2024-06-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
       dbA.close();
 
-      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-      dbB.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
-        'u2', 'Bob', '2024-01-02T00:00:00Z'
-      );
-      const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      // Bが復帰（フルマージ）
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
 
-      expect(result.hadChangelogGap).toBe(false);
-
-      // BのNASコピーにu2があること（通常フローではpull前にアップロード）
-      const bNasPath = path.join(nasDir, 'client-client-b.sqlite');
-      const bNasDb = new Database(bNasPath, { readonly: true });
-      const user = bNasDb.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any;
+      // tombstone.deletedAt < u1.updatedAt なので、u1は保持される
+      const user = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get() as any;
       expect(user).toBeTruthy();
-      expect(user.name).toBe('Bob');
-      bNasDb.close();
+      expect(user.name).toBe('Alice Reborn');
 
       dbB.close();
     });

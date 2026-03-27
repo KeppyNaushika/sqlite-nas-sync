@@ -45,7 +45,25 @@ describe('setupChangelog', () => {
     expect(table).toBeTruthy();
   });
 
-  it('テーブルごとに3つのトリガーを作成する', () => {
+  it('_tombstone テーブルを作成する', () => {
+    setupChangelog(db, [{ name: 'users' }], 'id');
+
+    const table = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_tombstone'`)
+      .get();
+    expect(table).toBeTruthy();
+  });
+
+  it('_heartbeat テーブルを作成する', () => {
+    setupChangelog(db, [{ name: 'users' }], 'id');
+
+    const table = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_heartbeat'`)
+      .get();
+    expect(table).toBeTruthy();
+  });
+
+  it('テーブルごとに3つのトリガー + heartbeatトリガー2つを作成する', () => {
     setupChangelog(db, [{ name: 'users' }, { name: 'posts' }], 'id');
 
     const triggers = db
@@ -59,7 +77,10 @@ describe('setupChangelog', () => {
     expect(triggerNames).toContain('_changelog_after_insert_posts');
     expect(triggerNames).toContain('_changelog_after_update_posts');
     expect(triggerNames).toContain('_changelog_after_delete_posts');
-    expect(triggers).toHaveLength(6);
+    expect(triggerNames).toContain('_changelog_after_insert__heartbeat');
+    expect(triggerNames).toContain('_changelog_after_update__heartbeat');
+    // 6 (users/posts) + 2 (_heartbeat insert/update) = 8
+    expect(triggers).toHaveLength(8);
   });
 
   it('冪等: 2回実行してもエラーにならない', () => {
@@ -95,7 +116,7 @@ describe('setupChangelog', () => {
     expect(entries[1].recordId).toBe('u1');
   });
 
-  it('DELETE時に_changelogにエントリが記録される', () => {
+  it('DELETE時に_changelogと_tombstoneにエントリが記録される', () => {
     setupChangelog(db, [{ name: 'users' }], 'id');
 
     db.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
@@ -107,6 +128,13 @@ describe('setupChangelog', () => {
     expect(entries).toHaveLength(2);
     expect(entries[1].operation).toBe('DELETE');
     expect(entries[1].recordId).toBe('u1');
+
+    // _tombstone にも記録される
+    const tombstone = db
+      .prepare(`SELECT * FROM _tombstone WHERE tableName = ? AND recordId = ?`)
+      .get('users', 'u1') as any;
+    expect(tombstone).toBeTruthy();
+    expect(tombstone.deletedAt).toBeTruthy();
   });
 
   it('WALモードが設定される（ファイルDB）', () => {
