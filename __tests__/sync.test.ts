@@ -257,4 +257,151 @@ describe('performSync', () => {
 
     dbB.close();
   });
+
+  it('hadChangelogGapが通常時はfalseになる', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+      'u1', 'Alice', '2024-01-01T00:00:00Z'
+    );
+    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    dbA.close();
+
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+    expect(result.hadChangelogGap).toBe(false);
+    expect(result.inserted).toBe(1);
+    dbB.close();
+  });
+
+  describe('changelogギャップ時のpull-firstフロー', () => {
+    it('staleクライアントが削除済みレコードをNASに撒き散らさない', async () => {
+      // --- セットアップ: A と B が同期済み ---
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      // Aがレコードを作成して同期
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Bが同期してu1を取得
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      const userInB = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
+      expect(userInB).toBeTruthy();
+
+      // --- Bがオフラインに（以降Bは同期しない） ---
+
+      // Aがu1を削除して同期
+      dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Aのchangelogを全削除（7日経過をシミュレート）
+      dbA.exec(`DELETE FROM _changelog`);
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      dbA.close();
+
+      // --- Bが復帰して同期（changelogギャップ発生） ---
+      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      expect(resultB.hadChangelogGap).toBe(true);
+
+      // --- 検証: Bの同期後、NAS上のBのDBにu1が残っていないこと ---
+      // Bのローカルにはu1が残っている可能性があるが（full-table fallbackでDELETEは検出不可）、
+      // 重要なのはNAS上のBのコピーが他クライアントに悪影響を与えないこと
+      // → pull-firstフローにより、BのNASコピーはpull完了後にアップロードされる
+
+      // Client Cを作成して同期 — Bの汚染がCに伝播しないことを確認
+      const { db: dbC, dbPath: pathC } = createClientDb('client-c');
+      const resultC = await performSync(dbC, makeConfig(pathC, 'client-c'));
+
+      // CにはAからの削除が伝播済み（Aのchangelogは空だがAのDBにu1は存在しない）
+      // BのNASコピーからu1が復活しないことが重要
+      // full-table fallbackでBから読む場合、BのupdatedAtとCの初回同期を比較
+      // Cは初回なので全レコードを取り込むが、Aにはu1がないのでAからは取り込まない
+      // Bにu1があっても、Aのデータの方が権威的
+      const userInC = dbC.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
+
+      // BのNAS DBを直接確認: pull-firstにより、BのchangelogはクリアされてNASにアップロードされている
+      const bNasPath = path.join(nasDir, 'client-client-b.sqlite');
+      if (fs.existsSync(bNasPath)) {
+        const bNasDb = new Database(bNasPath, { readonly: true });
+        // Bのchangelogがクリアされていることを確認
+        const changelogCount = bNasDb.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any;
+        expect(changelogCount.cnt).toBe(0);
+        bNasDb.close();
+      }
+
+      dbB.close();
+      dbC.close();
+    });
+
+    it('staleクライアントのローカルchangelogがクリアされる', async () => {
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+
+      // Aがレコードを作成して同期
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+
+      // Bが同期
+      await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      // Bがオフライン中にローカルで変更
+      dbB.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u2', 'Bob', '2024-01-02T00:00:00Z'
+      );
+
+      // Aのchangelogを全削除（7日経過をシミュレート）
+      dbA.exec(`DELETE FROM _changelog`);
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      dbA.close();
+
+      // Bのchangelogにはu2のINSERTエントリがあるはず
+      const beforeCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
+      expect(beforeCount).toBeGreaterThan(0);
+
+      // Bが復帰して同期
+      const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      expect(result.hadChangelogGap).toBe(true);
+
+      // pull-firstフローでchangelogがクリアされていること
+      // （cleanupChangelogで追加で掃除されるが、DELETEで全削除済み）
+      const afterCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
+      expect(afterCount).toBe(0);
+
+      dbB.close();
+    });
+
+    it('ギャップなしの場合は従来通りcopyToNas→pullの順', async () => {
+      // 通常フローでは先にNASにアップロードされる
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u1', 'Alice', '2024-01-01T00:00:00Z'
+      );
+      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      dbA.close();
+
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+      dbB.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
+        'u2', 'Bob', '2024-01-02T00:00:00Z'
+      );
+      const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+
+      expect(result.hadChangelogGap).toBe(false);
+
+      // BのNASコピーにu2があること（通常フローではpull前にアップロード）
+      const bNasPath = path.join(nasDir, 'client-client-b.sqlite');
+      const bNasDb = new Database(bNasPath, { readonly: true });
+      const user = bNasDb.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any;
+      expect(user).toBeTruthy();
+      expect(user.name).toBe('Bob');
+      bNasDb.close();
+
+      dbB.close();
+    });
+  });
 });

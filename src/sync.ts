@@ -15,7 +15,7 @@ import {
   cleanupChangelog,
 } from './changelog';
 import { applyInsert, applyUpdate, applyDelete } from './conflict';
-import { copyToNas, listRemoteClients, openRemoteDb } from './nas';
+import { copyToNas, ensureDirectory, listRemoteClients, openRemoteDb } from './nas';
 import { readSchemaVersion, writeSchemaVersion } from './setup';
 
 /**
@@ -273,59 +273,20 @@ function performFullTableFallback(
 }
 
 /**
- * 同期処理を実行する。
+ * 各リモートクライアントからchangelogを読み取り、ローカルDBに適用する。
  *
- * 以下のステップを順に実行する:
- * 1. ローカルDBをNASにアトミックコピー（`backup()` API使用）
- * 2. NAS上の他クライアントDBファイルを列挙
- * 3. 各リモートクライアントについて:
- *    - `_sync_state` から `lastSeenId` を取得
- *    - changelogギャップをチェック（あればフルテーブルフォールバック）
- *    - `_changelog` から差分エントリを読み取り
- *    - 同一recordIdの重複を最新のみに縮約
- *    - トランザクション内でINSERT/UPDATE/DELETEを適用
- *    - `_sync_state` の `lastSeenId` を更新
- * 4. 古い `_changelog` エントリを掃除
- *
- * @param localDb - ローカルSQLiteデータベース接続
- * @param config - 同期設定
- * @returns 同期結果の統計情報
- * @throws NASへのコピーに失敗した場合
- *
- * @remarks
- * 個別のリモートクライアントの処理失敗は警告として記録され、
- * 他のクライアントの処理には影響しない。
+ * @returns いずれかのリモートでchangelogギャップが検出されたかどうか
+ * @internal
  */
-export async function performSync(
+function pullFromRemotes(
   localDb: Database.Database,
-  config: SyncConfig
-): Promise<SyncResult> {
-  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey;
-  const retentionDays =
-    config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays;
+  remoteClients: { clientId: string; filePath: string }[],
+  config: SyncConfig,
+  primaryKey: string,
+  result: SyncResult
+): boolean {
+  let hadGap = false;
 
-  const result: SyncResult = {
-    clientsSynced: 0,
-    inserted: 0,
-    updated: 0,
-    deleted: 0,
-    skipped: 0,
-    conflictsResolved: 0,
-    warnings: [],
-  };
-
-  // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
-  if (config.schemaVersion) {
-    writeSchemaVersion(localDb, config.schemaVersion);
-  }
-
-  // 1. ローカルDBをNASにコピー（schemaVersion込み）
-  await copyToNas(localDb, config.nasPath, config.clientId);
-
-  // 2. NAS上の他クライアントDB列挙
-  const remoteClients = listRemoteClients(config.nasPath, config.clientId);
-
-  // 3. 各リモートクライアントを処理
   for (const remote of remoteClients) {
     let remoteDb: Database.Database | null = null;
 
@@ -356,6 +317,7 @@ export async function performSync(
 
       // ギャップチェック
       if (hasChangelogGap(remoteDb, lastSeenId)) {
+        hadGap = true;
         const transaction = localDb.transaction(() => {
           performFullTableFallback(
             localDb,
@@ -417,10 +379,121 @@ export async function performSync(
     }
   }
 
-  // 4. 古い_changelogエントリの掃除
+  return hadGap;
+}
+
+/**
+ * 同期処理を実行する。
+ *
+ * 以下のステップを順に実行する:
+ *
+ * **通常フロー（ギャップなし）:**
+ * 1. ローカルDBをNASにアトミックコピー
+ * 2. 各リモートクライアントからchangelogベースでpull
+ *
+ * **ギャップ検出時（pull-firstフロー）:**
+ * 1. NASへのアップロードを**スキップ**（staleデータの拡散を防止）
+ * 2. 各リモートからfull-table fallbackでpull
+ * 3. ローカルの古いchangelogをクリア（staleなchangelogの拡散を防止）
+ * 4. pull完了後にローカルDBをNASにアップロード（クリーンな状態）
+ *
+ * @param localDb - ローカルSQLiteデータベース接続
+ * @param config - 同期設定
+ * @returns 同期結果の統計情報
+ * @throws NASへのコピーに失敗した場合
+ *
+ * @remarks
+ * 個別のリモートクライアントの処理失敗は警告として記録され、
+ * 他のクライアントの処理には影響しない。
+ *
+ * ギャップ検出時、staleクライアントのローカル変更はリモートより古い場合
+ * LWWにより上書きされる。これは意図的な設計で、staleクライアントが
+ * 他のクライアントに悪影響を与えないことを優先する。
+ */
+export async function performSync(
+  localDb: Database.Database,
+  config: SyncConfig
+): Promise<SyncResult> {
+  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey;
+  const retentionDays =
+    config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays;
+
+  const result: SyncResult = {
+    clientsSynced: 0,
+    inserted: 0,
+    updated: 0,
+    deleted: 0,
+    skipped: 0,
+    conflictsResolved: 0,
+    warnings: [],
+    hadChangelogGap: false,
+  };
+
+  // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
+  if (config.schemaVersion) {
+    writeSchemaVersion(localDb, config.schemaVersion);
+  }
+
+  // 1. NASディレクトリを確保し、リモートクライアントを列挙
+  ensureDirectory(config.nasPath);
+  const remoteClients = listRemoteClients(config.nasPath, config.clientId);
+
+  // 2. ギャップ事前チェック: いずれかのリモートにchangelogギャップがあるか確認
+  let hasAnyGap = false;
+  for (const remote of remoteClients) {
+    let remoteDb: Database.Database | null = null;
+    try {
+      remoteDb = openRemoteDb(remote.filePath);
+      if (!remoteDb) continue;
+
+      // schemaVersionが不一致ならこのリモートはスキップ対象なのでギャップ判定不要
+      if (config.schemaVersion) {
+        const remoteVersion = readSchemaVersion(remoteDb);
+        if (remoteVersion !== config.schemaVersion) continue;
+      }
+
+      const { lastSeenId } = getSyncState(localDb, remote.clientId);
+      if (hasChangelogGap(remoteDb, lastSeenId)) {
+        hasAnyGap = true;
+        break;
+      }
+    } finally {
+      if (remoteDb) {
+        try { remoteDb.close(); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  if (hasAnyGap) {
+    // === Pull-first フロー ===
+    // staleクライアントのデータをNASに撒き散らさないため、
+    // まずリモートから全変更を取り込み、その後にアップロードする
+
+    result.hadChangelogGap = true;
+
+    // 3a. リモートから変更をpull（アップロード前）
+    pullFromRemotes(localDb, remoteClients, config, primaryKey, result);
+
+    // 3b. ローカルのstaleなchangelogをクリア
+    //     pull時にトリガーが新しいchangelogエントリを生成するが、
+    //     それ以前の古いエントリは他クライアントに読まれると害になるため削除
+    localDb.exec(`DELETE FROM _changelog`);
+
+    // 3c. クリーンな状態をNASにアップロード
+    await copyToNas(localDb, config.nasPath, config.clientId);
+  } else {
+    // === 通常フロー ===
+    // 4a. ローカルDBをNASにコピー（schemaVersion込み）
+    await copyToNas(localDb, config.nasPath, config.clientId);
+
+    // 4b. リモートから変更をpull
+    pullFromRemotes(localDb, remoteClients, config, primaryKey, result);
+  }
+
+  // 5. 古い_changelogエントリの掃除
   cleanupChangelog(localDb, retentionDays);
 
-  // 5. onAfterSync コールバック
+  // 6. onAfterSync コールバック
   if (config.onAfterSync) {
     config.onAfterSync(localDb, result);
   }
