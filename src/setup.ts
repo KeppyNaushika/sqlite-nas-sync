@@ -1,8 +1,8 @@
 /**
  * changelog テーブル・トリガーのセットアップ機能を提供するモジュール。
  *
- * `_changelog` テーブル、`_sync_state` テーブル、
- * および対象テーブルごとのINSERT/UPDATE/DELETEトリガーを作成する。
+ * `_changelog` テーブル、`_sync_state` テーブル、`_tombstone` テーブル、
+ * `_heartbeat` テーブル、および対象テーブルごとのINSERT/UPDATE/DELETEトリガーを作成する。
  *
  * @module setup
  */
@@ -66,6 +66,24 @@ export function setupChangelog(
     )
   `);
 
+  // _tombstone テーブル（DELETE記録の長期保持）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _tombstone (
+      tableName TEXT NOT NULL,
+      recordId  TEXT NOT NULL,
+      deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (tableName, recordId)
+    )
+  `);
+
+  // _heartbeat テーブル（changelog延命用）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _heartbeat (
+      id        TEXT PRIMARY KEY,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+
   // テーブルごとにトリガーを作成
   const escapedPk = escapeIdentifier(primaryKey);
 
@@ -93,16 +111,36 @@ export function setupChangelog(
       END
     `);
 
-    // DELETE トリガー
+    // DELETE トリガー（_tombstone にも記録）
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_delete_${table}
       AFTER DELETE ON ${escapedTable} FOR EACH ROW
       BEGIN
         INSERT INTO _changelog (tableName, recordId, operation)
         VALUES ('${table}', OLD.${escapedPk}, 'DELETE');
+        INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt)
+        VALUES ('${table}', OLD.${escapedPk}, datetime('now'));
       END
     `);
   }
+
+  // _heartbeat のchangelogトリガー
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS _changelog_after_insert__heartbeat
+    AFTER INSERT ON _heartbeat FOR EACH ROW
+    BEGIN
+      INSERT INTO _changelog (tableName, recordId, operation)
+      VALUES ('_heartbeat', NEW.id, 'INSERT');
+    END
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS _changelog_after_update__heartbeat
+    AFTER UPDATE ON _heartbeat FOR EACH ROW
+    BEGIN
+      INSERT INTO _changelog (tableName, recordId, operation)
+      VALUES ('_heartbeat', NEW.id, 'UPDATE');
+    END
+  `);
 
   // _sync_meta テーブル（スキーマバージョン等のメタ情報）
   db.exec(`

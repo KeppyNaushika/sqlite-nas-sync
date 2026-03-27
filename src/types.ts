@@ -74,6 +74,17 @@ export interface SyncConfig {
    * @example `"20260324_002"` や `"v2.0.0"` など任意の文字列
    */
   schemaVersion?: string;
+
+  /**
+   * heartbeat 機能を有効にするかどうか。
+   *
+   * `true` の場合、sync時に当日のheartbeatが未実行であれば
+   * `_heartbeat` テーブルを更新し、changelogにエントリを追加する。
+   * これによりchangelogが7日間で空になるのを防止する。
+   *
+   * @defaultValue `true`
+   */
+  heartbeatEnabled?: boolean;
 }
 
 /**
@@ -271,4 +282,5 @@ export const DEFAULTS = {
   primaryKey: 'id',
   intervalMs: 30000,
   changelogRetentionDays: 7,
+  heartbeatEnabled: true,
 } as const;
