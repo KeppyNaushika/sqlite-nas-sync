@@ -146,6 +146,13 @@ export interface SyncResult {
   conflictsResolved: number;
   /** 致命的でない警告メッセージの配列 */
   warnings: string[];
+  /**
+   * changelogギャップが検出されたかどうか。
+   *
+   * `true` の場合、このクライアントは長期間同期しておらず、
+   * pull-first モードで同期が行われた（NASアップロードはpull完了後）。
+   */
+  hadChangelogGap: boolean;
 }
 
 /**
