@@ -1,6 +1,6 @@
 {
   "name": "sqlite-nas-sync",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Sync SQLite databases across multiple clients via NAS with changelog-based conflict resolution",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
