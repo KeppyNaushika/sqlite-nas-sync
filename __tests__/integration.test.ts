@@ -41,7 +41,6 @@ describe('Integration Tests', () => {
       dbPath,
       nasPath: nasDir,
       clientId,
-      tables: [{ name: 'users' }, { name: 'posts' }],
       primaryKey: 'id',
       intervalMs: 100,
       changelogRetentionDays: 7,
@@ -271,6 +270,72 @@ describe('Integration Tests', () => {
     });
   });
 
+  describe('getSyncedTables', () => {
+    it('検出されたテーブル名のリストを返す', () => {
+      const pathA = createClientDb('client-a');
+      const syncA = setupSync(makeConfig(pathA, 'client-a'));
+
+      const tables = syncA.getSyncedTables();
+      expect(tables.sort()).toEqual(['posts', 'users']);
+
+      syncA.stop();
+    });
+
+    it('返り値はスナップショットでありミューテートしても内部状態に影響しない', () => {
+      const pathA = createClientDb('client-a');
+      const syncA = setupSync(makeConfig(pathA, 'client-a'));
+
+      const tables = syncA.getSyncedTables();
+      tables.push('hacked');
+
+      const tables2 = syncA.getSyncedTables();
+      expect(tables2).not.toContain('hacked');
+
+      syncA.stop();
+    });
+  });
+
+  describe('excludeTables', () => {
+    it('指定したテーブルが同期対象から外れる', async () => {
+      const pathA = createClientDb('client-a');
+      const pathB = createClientDb('client-b');
+
+      const config = (dbPath: string, clientId: string): SyncConfig => ({
+        ...makeConfig(dbPath, clientId),
+        excludeTables: ['posts'],
+      });
+
+      const syncA = setupSync(config(pathA, 'client-a'));
+      expect(syncA.getSyncedTables()).toEqual(['users']);
+
+      // posts に直接 INSERT してもトリガーが作られていないので changelog に乗らない
+      const dbA = new Database(pathA);
+      dbA.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'a@test.com', '2024-01-01T00:00:00Z');
+      dbA.prepare(
+        `INSERT INTO posts (id, title, body, userId, updatedAt) VALUES (?, ?, ?, ?, ?)`
+      ).run('p1', 'Hidden', 'Body', 'u1', '2024-01-01T00:00:00Z');
+      dbA.close();
+
+      await syncA.syncNow();
+      syncA.stop();
+
+      const syncB = setupSync(config(pathB, 'client-b'));
+      const result = await syncB.syncNow();
+      syncB.stop();
+
+      // users だけ同期される
+      expect(result.inserted).toBe(1);
+      const dbB = new Database(pathB);
+      const users = dbB.prepare(`SELECT * FROM users`).all();
+      const posts = dbB.prepare(`SELECT * FROM posts`).all();
+      dbB.close();
+      expect(users).toHaveLength(1);
+      expect(posts).toHaveLength(0);
+    });
+  });
+
   describe('start / stop 定期sync', () => {
     it('start()で定期syncが開始され、stop()で停止する', async () => {
       const pathA = createClientDb('client-a');
@@ -295,26 +360,36 @@ describe('Integration Tests', () => {
   });
 
   describe('バリデーションエラー', () => {
-    it('テーブルが存在しない場合にエラーをスローする', () => {
+    it('同期対象テーブルが0件の場合にエラーをスローする', () => {
       const clientDir = path.join(testDir, 'invalid');
       fs.mkdirSync(clientDir, { recursive: true });
       const dbPath = path.join(clientDir, 'local.sqlite');
       const db = new Database(dbPath);
+      // 同期対象になりうるテーブルを一切作らない
+      db.close();
+
+      expect(() => setupSync(makeConfig(dbPath, 'invalid'))).toThrow(
+        'No sync tables discovered'
+      );
+    });
+
+    it('PKがTEXT型でないテーブルがある場合にエラーをスローする', () => {
+      const clientDir = path.join(testDir, 'invalid-pk');
+      fs.mkdirSync(clientDir, { recursive: true });
+      const dbPath = path.join(clientDir, 'local.sqlite');
+      const db = new Database(dbPath);
       db.exec(`
-        CREATE TABLE users (
-          id TEXT PRIMARY KEY,
+        CREATE TABLE bad (
+          id INTEGER PRIMARY KEY,
           name TEXT NOT NULL,
           updatedAt TEXT NOT NULL
         )
       `);
       db.close();
 
-      expect(() =>
-        setupSync({
-          ...makeConfig(dbPath, 'invalid'),
-          tables: [{ name: 'users' }, { name: 'nonexistent' }],
-        })
-      ).toThrow('Validation failed');
+      expect(() => setupSync(makeConfig(dbPath, 'invalid-pk'))).toThrow(
+        'Validation failed'
+      );
     });
   });
 
@@ -382,7 +457,7 @@ describe('Integration Tests', () => {
         dbPath,
         nasPath: nasDir,
         clientId,
-        tables: [{ name: 'items', timestampColumn: 'modifiedAt' }],
+        tableOptions: { items: { timestampColumn: 'modifiedAt' } },
         primaryKey: 'id',
         intervalMs: 100,
         changelogRetentionDays: 7,
@@ -434,10 +509,7 @@ describe('Integration Tests', () => {
         dbPath,
         nasPath: nasDir,
         clientId,
-        tables: [
-          { name: 'users', deleteProtected: true },
-          { name: 'posts' },
-        ],
+        tableOptions: { users: { deleteProtected: true } },
         primaryKey: 'id',
         intervalMs: 100,
         changelogRetentionDays: 7,
