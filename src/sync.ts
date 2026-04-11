@@ -485,6 +485,7 @@ function pullNormal(
   localDb: Database.Database,
   remoteClients: { clientId: string; filePath: string }[],
   config: SyncConfig,
+  tables: TableConfig[],
   primaryKey: string,
   result: SyncResult
 ): void {
@@ -530,7 +531,7 @@ function pullNormal(
           remoteDb!,
           deduplicated,
           primaryKey,
-          config.tables,
+          tables,
           result
         );
       });
@@ -571,6 +572,7 @@ function pullFullMerge(
   localDb: Database.Database,
   remoteClients: { clientId: string; filePath: string }[],
   config: SyncConfig,
+  tables: TableConfig[],
   primaryKey: string,
   retentionDays: number,
   result: SyncResult
@@ -580,7 +582,7 @@ function pullFullMerge(
   );
 
   // トリガー無効化
-  disableTriggers(localDb, config.tables);
+  disableTriggers(localDb, tables);
 
   try {
     for (const remote of remoteClients) {
@@ -609,10 +611,10 @@ function pullFullMerge(
         // トランザクション内でフルマージ
         const transaction = localDb.transaction(() => {
           // 1. 全レコードをLWWでマージ
-          performFullMergeData(localDb, remoteDb!, config.tables, primaryKey, result);
+          performFullMergeData(localDb, remoteDb!, tables, primaryKey, result);
 
           // 2. tombstone適用
-          applyTombstones(localDb, remoteDb!, config.tables, primaryKey, result);
+          applyTombstones(localDb, remoteDb!, tables, primaryKey, result);
 
           // 3. changelogマージ（7日以内）
           mergeChangelog(localDb, remoteDb!, retentionDays);
@@ -639,7 +641,7 @@ function pullFullMerge(
     }
   } finally {
     // トリガー再有効化（必ず実行）
-    reEnableTriggers(localDb, config.tables, primaryKey);
+    reEnableTriggers(localDb, tables, primaryKey);
   }
 }
 
@@ -659,6 +661,7 @@ function pullFullMerge(
  *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param config - 同期設定
+ * @param tables - 同期対象テーブル設定の配列（{@link discoverTables} 等で解決済み）
  * @returns 同期結果の統計情報
  * @throws NASへのコピーに失敗した場合
  *
@@ -668,7 +671,8 @@ function pullFullMerge(
  */
 export async function performSync(
   localDb: Database.Database,
-  config: SyncConfig
+  config: SyncConfig,
+  tables: TableConfig[]
 ): Promise<SyncResult> {
   const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey;
   const retentionDays =
@@ -725,7 +729,7 @@ export async function performSync(
     result.hadChangelogGap = true;
 
     // 3a. トリガーOFFでフルマージ（データ + tombstone + changelog）
-    pullFullMerge(localDb, remoteClients, config, primaryKey, retentionDays, result);
+    pullFullMerge(localDb, remoteClients, config, tables, primaryKey, retentionDays, result);
 
     // 3b. heartbeat更新（トリガーON状態 → changelogに1件 → changelog延命）
     if (heartbeatEnabled) {
@@ -740,7 +744,7 @@ export async function performSync(
     await copyToNas(localDb, config.nasPath, config.clientId);
 
     // 4b. リモートから変更をpull
-    pullNormal(localDb, remoteClients, config, primaryKey, result);
+    pullNormal(localDb, remoteClients, config, tables, primaryKey, result);
 
     // 4c. heartbeat更新
     if (heartbeatEnabled) {

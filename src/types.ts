@@ -2,6 +2,10 @@ import Database from 'better-sqlite3';
 
 /**
  * テーブル別の同期設定。
+ *
+ * `discoverTables` の戻り値、および内部の同期処理で利用される。
+ * ユーザーが直接構築することは通常無く、{@link SyncConfig.tableOptions}
+ * 経由で部分指定する。
  */
 export interface TableConfig {
   /** テーブル名 */
@@ -18,9 +22,51 @@ export interface TableConfig {
 }
 
 /**
+ * テーブル別のオプション指定。
+ *
+ * {@link SyncConfig.tableOptions} で利用する、{@link TableConfig} から
+ * `name` を除いた形。
+ */
+export type TableOptions = Omit<TableConfig, 'name'>;
+
+/**
+ * {@link discoverTables} に渡す検出オプション。
+ */
+export interface DiscoverOptions {
+  /**
+   * 主キーカラム名。このカラムが存在するテーブルだけが検出対象になる。
+   * @defaultValue `'id'`
+   */
+  primaryKey?: string;
+  /**
+   * 検出から除外するテーブル名の配列。
+   * ローカル専用キャッシュ等を持つ場合に使用。
+   * @defaultValue `[]`
+   */
+  excludeTables?: string[];
+  /**
+   * テーブル別の追加オプション。
+   * 指定しないテーブルはデフォルト動作（`updatedAt` / `deleteProtected: false`）。
+   * @defaultValue `{}`
+   */
+  tableOptions?: Record<string, TableOptions>;
+  /**
+   * `id` を持つが `updatedAt`（または指定 `timestampColumn`）が無いテーブルを
+   * 検出した際の警告コールバック。指定しなければ `console.warn` に出力される。
+   *
+   * 警告はあくまで「同期対象から外しました」の通知であり、エラーではない。
+   * 意図的に除外したい場合は {@link excludeTables} を使えば警告も抑制される。
+   */
+  onWarning?: (message: string) => void;
+}
+
+/**
  * 同期の設定オプション。
  *
  * {@link setupSync} に渡してSyncインスタンスを生成する。
+ *
+ * 同期対象テーブルはDBから自動検出される（明示指定不要）。
+ * 検出条件: `_*` / `sqlite_*` 以外で、`id` カラムと `updatedAt` カラムを持つテーブル。
  *
  * @example
  * ```ts
@@ -28,7 +74,26 @@ export interface TableConfig {
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: [{ name: 'users' }, { name: 'posts', deleteProtected: true }],
+ *   // tables は不要 — DB から自動検出
+ * };
+ * ```
+ *
+ * @example 一部テーブルを除外する
+ * ```ts
+ * const config: SyncConfig = {
+ *   // ...
+ *   excludeTables: ['LocalCache', 'TempLog'],
+ * };
+ * ```
+ *
+ * @example 一部テーブルにオプションを指定する
+ * ```ts
+ * const config: SyncConfig = {
+ *   // ...
+ *   tableOptions: {
+ *     User: { deleteProtected: true },
+ *     Audit: { timestampColumn: 'modifiedAt' },
+ *   },
  * };
  * ```
  */
@@ -39,8 +104,17 @@ export interface SyncConfig {
   nasPath: string;
   /** このクライアントの一意識別子（UUID推奨） */
   clientId: string;
-  /** sync対象テーブル設定の配列 */
-  tables: TableConfig[];
+  /**
+   * 自動検出から除外するテーブル名の配列。
+   * @defaultValue `[]`
+   */
+  excludeTables?: string[];
+  /**
+   * テーブル別の追加オプション。
+   * 指定しないテーブルはデフォルト動作。
+   * @defaultValue `{}`
+   */
+  tableOptions?: Record<string, TableOptions>;
   /**
    * 主キーカラム名。全対象テーブルで共通。
    * @defaultValue `'id'`
@@ -69,7 +143,7 @@ export interface SyncConfig {
    * sync時にリモートDBのバージョンと比較する。
    * バージョンが一致しないリモートクライアントはスキップされる。
    *
-   * これによりスキーマ移行中の混在環境でデータ破損を防止できる。
+   * 未指定の場合はテーブルスキーマから自動でハッシュが生成される。
    *
    * @example `"20260324_002"` や `"v2.0.0"` など任意の文字列
    */
@@ -85,6 +159,14 @@ export interface SyncConfig {
    * @defaultValue `true`
    */
   heartbeatEnabled?: boolean;
+
+  /**
+   * テーブル自動検出時の警告ログコールバック。
+   *
+   * `id` を持つが `updatedAt` が無いテーブルが見つかった際に呼ばれる。
+   * 未指定なら `console.warn` に出力される。
+   */
+  onDiscoveryWarning?: (message: string) => void;
 }
 
 /**
@@ -121,6 +203,13 @@ export interface SyncInstance {
    * @returns 同期状態のスナップショット
    */
   getStatus(): SyncStatus;
+  /**
+   * このインスタンスが同期対象として認識しているテーブル名の一覧を返す。
+   *
+   * `setupSync` 時に `discoverTables` で検出された結果のスナップショット。
+   * マージ処理など、ライブラリ外で同じテーブル集合を扱いたい場合に利用する。
+   */
+  getSyncedTables(): string[];
   /**
    * イベントリスナーを登録する。
    *
