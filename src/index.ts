@@ -9,6 +9,9 @@
  * この関数に {@link SyncConfig} を渡すと、同期操作を行う
  * {@link SyncInstance} が返される。
  *
+ * 同期対象テーブルはDBから自動検出されるため、明示的な指定は不要。
+ * `id` カラムと `updatedAt` カラムを持つ非内部テーブルが対象となる。
+ *
  * @example
  * ```ts
  * import { setupSync } from 'sqlite-nas-sync';
@@ -17,7 +20,6 @@
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: [{ name: 'users' }, { name: 'posts' }],
  * });
  *
  * // 手動同期
@@ -43,7 +45,7 @@ import {
   SyncEventCallback,
   DEFAULTS,
 } from './types';
-import { validateDatabase } from './validator';
+import { discoverTables, validateDatabase } from './validator';
 import { setupChangelog, writeSchemaVersion, computeSchemaHash } from './setup';
 import { performSync } from './sync';
 
@@ -52,12 +54,13 @@ import { performSync } from './sync';
  *
  * 以下の初期化処理を行い、{@link SyncInstance} を返す:
  * 1. ローカルDBをオープンし、WALモードを有効化
- * 2. テーブル構造をバリデーション（PK型、updatedAtカラム等）
- * 3. `_changelog` / `_sync_state` テーブルとトリガーを作成
+ * 2. {@link discoverTables} で同期対象テーブルを自動検出
+ * 3. テーブル構造をバリデーション（PK型、updatedAtカラム等）
+ * 4. `_changelog` / `_sync_state` テーブルとトリガーを作成
  *
  * @param config - 同期設定
  * @returns 同期操作を行うインスタンス
- * @throws バリデーション失敗時（テーブル不在、PK型不正等）
+ * @throws バリデーション失敗時、または検出された同期対象テーブルが0件の場合
  *
  * @example
  * ```ts
@@ -65,7 +68,6 @@ import { performSync } from './sync';
  *   dbPath: './data/local.sqlite',
  *   nasPath: '/mnt/nas/shared-db/',
  *   clientId: 'client-abc123',
- *   tables: [{ name: 'users' }, { name: 'posts' }],
  *   intervalMs: 60000,         // 1分間隔
  *   changelogRetentionDays: 14 // 14日間保持
  * });
@@ -78,8 +80,33 @@ export function setupSync(config: SyncConfig): SyncInstance {
   const db = new Database(config.dbPath);
   db.pragma('journal_mode = WAL');
 
-  // バリデーション
-  const errors = validateDatabase(db, config.tables, primaryKey);
+  // 同期対象テーブルを自動検出
+  const tables = discoverTables(db, {
+    primaryKey,
+    excludeTables: config.excludeTables,
+    tableOptions: config.tableOptions,
+    onWarning: config.onDiscoveryWarning,
+  });
+
+  if (tables.length === 0) {
+    db.close();
+    throw new Error(
+      `No sync tables discovered in ${config.dbPath}. ` +
+        `Ensure tables exist with "${primaryKey}" and "updatedAt" columns ` +
+        `(or pass tableOptions to use a different timestamp column).`
+    );
+  }
+
+  // 検出結果をログ出力（デバッグおよび「想定とのズレ」の早期発見用）
+  // eslint-disable-next-line no-console
+  console.log(
+    `[sqlite-nas-sync] Auto-detected ${tables.length} sync table(s): ${tables
+      .map((t) => t.name)
+      .join(', ')}`
+  );
+
+  // バリデーション（discoverTablesは存在チェック済みだが、PK型まではチェックしない）
+  const errors = validateDatabase(db, tables, primaryKey);
   if (errors.length > 0) {
     db.close();
     throw new Error(
@@ -88,15 +115,18 @@ export function setupSync(config: SyncConfig): SyncInstance {
   }
 
   // _changelog / _sync_state / _sync_meta / トリガー 作成
-  setupChangelog(db, config.tables, primaryKey);
+  setupChangelog(db, tables, primaryKey);
 
   // schemaVersion: 明示指定がなければテーブルスキーマから自動生成
   const resolvedSchemaVersion =
-    config.schemaVersion ?? computeSchemaHash(db, config.tables);
+    config.schemaVersion ?? computeSchemaHash(db, tables);
   writeSchemaVersion(db, resolvedSchemaVersion);
 
   // configにresolved値を反映（performSyncで参照される）
   const resolvedConfig: SyncConfig = { ...config, schemaVersion: resolvedSchemaVersion };
+
+  // 検出済みテーブル名のスナップショット
+  const syncedTableNames = tables.map((t) => t.name);
 
   // 内部状態
   let intervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -126,7 +156,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
       emit('sync:start');
 
       try {
-        const result = await performSync(db, resolvedConfig);
+        const result = await performSync(db, resolvedConfig, tables);
         lastResult = result;
         lastSyncedAt = new Date();
         emit('sync:complete', result);
@@ -167,6 +197,10 @@ export function setupSync(config: SyncConfig): SyncInstance {
       };
     },
 
+    getSyncedTables(): string[] {
+      return [...syncedTableNames];
+    },
+
     on(event: SyncEvent, callback: SyncEventCallback): void {
       const existing = listeners.get(event) ?? [];
       existing.push(callback);
@@ -177,9 +211,14 @@ export function setupSync(config: SyncConfig): SyncInstance {
   return instance;
 }
 
+// 公開API: テーブル自動検出
+export { discoverTables } from './validator';
+
 // 公開型のre-export
 export type {
   TableConfig,
+  TableOptions,
+  DiscoverOptions,
   SyncConfig,
   SyncInstance,
   SyncResult,

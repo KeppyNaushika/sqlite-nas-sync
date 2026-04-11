@@ -4,11 +4,13 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { setupChangelog } from '../src/setup';
 import { performSync } from '../src/sync';
-import { SyncConfig } from '../src/types';
+import { SyncConfig, TableConfig } from '../src/types';
 
 describe('performSync', () => {
   const testDir = path.join(__dirname, 'test-data-sync');
   const nasDir = path.join(testDir, 'nas');
+
+  const TABLES: TableConfig[] = [{ name: 'users' }, { name: 'posts' }];
 
   function createClientDb(clientId: string): { db: Database.Database; dbPath: string } {
     const clientDir = path.join(testDir, clientId);
@@ -31,7 +33,7 @@ describe('performSync', () => {
         updatedAt TEXT NOT NULL
       )
     `);
-    setupChangelog(db, [{ name: 'users' }, { name: 'posts' }], 'id');
+    setupChangelog(db, TABLES, 'id');
     return { db, dbPath };
   }
 
@@ -40,7 +42,6 @@ describe('performSync', () => {
       dbPath,
       nasPath: nasDir,
       clientId,
-      tables: [{ name: 'users' }, { name: 'posts' }],
       primaryKey: 'id',
       changelogRetentionDays: 7,
     };
@@ -62,11 +63,11 @@ describe('performSync', () => {
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     expect(result.inserted).toBe(1);
     const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
@@ -80,7 +81,7 @@ describe('performSync', () => {
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
@@ -88,7 +89,7 @@ describe('performSync', () => {
       'u1', 'Alice Old', '2023-01-01T00:00:00Z'
     );
 
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     const user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
     expect(user.name).toBe('Alice');
@@ -102,19 +103,19 @@ describe('performSync', () => {
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    await performSync(dbB, makeConfig(pathB, 'client-b'));
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     let user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
     expect(user).toBeTruthy();
 
     dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
     expect(result.deleted).toBe(1);
 
     user = dbB.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
@@ -131,11 +132,11 @@ describe('performSync', () => {
     dbA.prepare(`INSERT INTO posts (id, title, userId, updatedAt) VALUES (?, ?, ?, ?)`).run(
       'p1', 'Hello', 'u1', '2024-01-01T00:00:00Z'
     );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     expect(result.inserted).toBe(2);
     dbB.close();
@@ -146,12 +147,12 @@ describe('performSync', () => {
     dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    await performSync(dbB, makeConfig(pathB, 'client-b'));
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     expect(result.inserted).toBe(0);
     expect(result.updated).toBe(0);
@@ -167,12 +168,12 @@ describe('performSync', () => {
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
     const configA = { ...makeConfig(pathA, 'client-a'), schemaVersion: 'v2' };
-    await performSync(dbA, configA);
+    await performSync(dbA, configA, TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
-    const result = await performSync(dbB, configB);
+    const result = await performSync(dbB, configB, TABLES);
 
     expect(result.inserted).toBe(1);
     dbB.close();
@@ -184,12 +185,12 @@ describe('performSync', () => {
       'u1', 'Alice', '2024-01-01T00:00:00Z'
     );
     const configA = { ...makeConfig(pathA, 'client-a'), schemaVersion: 'v1' };
-    await performSync(dbA, configA);
+    await performSync(dbA, configA, TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
     const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
-    const result = await performSync(dbB, configB);
+    const result = await performSync(dbB, configB, TABLES);
 
     expect(result.inserted).toBe(0);
     expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
@@ -199,13 +200,13 @@ describe('performSync', () => {
 
   it('リモートDBオープン失敗時は警告を出して続行する', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     fs.writeFileSync(path.join(nasDir, 'client-corrupt.sqlite'), 'not a database');
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    const result = await performSync(dbB, makeConfig(pathB, 'client-b'));
+    const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     expect(result.warnings.some((w) => w.includes('corrupt'))).toBe(true);
 
@@ -229,7 +230,7 @@ describe('performSync', () => {
 
   it('heartbeatがsync時に自動更新される', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
     const heartbeat = dbA.prepare(
       `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
@@ -244,7 +245,7 @@ describe('performSync', () => {
 
   it('heartbeatがchangelogに記録される', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
     const entry = dbA.prepare(
       `SELECT * FROM _changelog WHERE tableName = '_heartbeat'`
@@ -257,11 +258,11 @@ describe('performSync', () => {
 
   it('heartbeatが他クライアントに伝播する', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a');
-    await performSync(dbA, makeConfig(pathA, 'client-a'));
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
     dbA.close();
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b');
-    await performSync(dbB, makeConfig(pathB, 'client-b'));
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
     const heartbeat = dbB.prepare(
       `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
@@ -280,23 +281,23 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Bが同期してu1を取得
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
       expect(dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get()).toBeTruthy();
 
       // Aがu1を削除して同期（tombstoneが作成される）
       dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Aのchangelogを全削除（7日経過をシミュレート）
       dbA.exec(`DELETE FROM _changelog`);
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bが復帰して同期（changelogギャップ → フルマージ）
-      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
       expect(resultB.hadChangelogGap).toBe(true);
 
       // tombstoneによりu1がBから削除される
@@ -317,10 +318,10 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u2', 'Bob', '2024-01-02T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Bが同期
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Aのchangelogを全削除（7日経過シミュレート）
       dbA.exec(`DELETE FROM _changelog`);
@@ -328,14 +329,14 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u3', 'Charlie', '2024-01-10T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bのchangelogエントリ数を記録（フルマージ前）
       const beforeCount = (dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any).cnt;
 
       // Bが復帰して同期（ギャップ → フルマージ）
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // フルマージ後のchangelogエントリ数
       // トリガーOFFなのでデータマージ分は増えない
@@ -357,17 +358,17 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Aのchangelogを全削除（7日経過シミュレート）
       dbA.exec(`DELETE FROM _changelog`);
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bが復帰（フルマージ）
-      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'));
+      const resultB = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
       expect(resultB.hadChangelogGap).toBe(true);
 
       // heartbeatがchangelogに記録されている
@@ -386,20 +387,20 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Aがchangelogの古い部分を削除しつつ新しい変更を追加
       dbA.exec(`DELETE FROM _changelog`);
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u2', 'Bob', '2024-01-10T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bが復帰（フルマージ）
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Bのchangelogにu2のエントリがある（Aのchangelogからマージされた）
       const u2Entries = dbB.prepare(
@@ -422,26 +423,26 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Bが同期
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Aがu1を削除して同期
       dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Aのchangelogを全削除（7日経過シミュレート）
       dbA.exec(`DELETE FROM _changelog`);
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bが復帰（フルマージ）
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Cが参加して同期 — Bの汚染がCに伝播しないことを確認
       const { db: dbC, dbPath: pathC } = createClientDb('client-c');
-      await performSync(dbC, makeConfig(pathC, 'client-c'));
+      await performSync(dbC, makeConfig(pathC, 'client-c'), TABLES);
 
       // CにはAからの削除が反映されている（u1が存在しない）
       // BのNASコピーからu1が復活しないことが重要
@@ -460,14 +461,14 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice', '2024-01-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Bが同期
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // Aがu1を削除
       dbA.prepare(`DELETE FROM users WHERE id = ?`).run('u1');
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
 
       // Aのchangelogを全削除（7日経過シミュレート）
       dbA.exec(`DELETE FROM _changelog`);
@@ -476,11 +477,11 @@ describe('performSync', () => {
       dbA.prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`).run(
         'u1', 'Alice Reborn', '2024-06-01T00:00:00Z'
       );
-      await performSync(dbA, makeConfig(pathA, 'client-a'));
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
       dbA.close();
 
       // Bが復帰（フルマージ）
-      await performSync(dbB, makeConfig(pathB, 'client-b'));
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
 
       // tombstone.deletedAt < u1.updatedAt なので、u1は保持される
       const user = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get() as any;
