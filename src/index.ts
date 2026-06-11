@@ -222,6 +222,7 @@ export type {
   SyncConfig,
   SyncInstance,
   SyncResult,
+  SkippedRemote,
   SyncStatus,
   SyncEvent,
   SyncEventCallback,

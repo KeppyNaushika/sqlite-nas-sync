@@ -477,6 +477,27 @@ function updateHeartbeat(localDb: Database.Database): void {
 }
 
 /**
+ * スキーマバージョン不一致でスキップしたリモートを結果に記録する。
+ *
+ * 後方互換のため warnings にも文字列を追加する。
+ * 同一クライアントは1回のsyncにつき1エントリのみ記録する。
+ *
+ * @internal
+ */
+function recordSkippedRemote(
+  result: SyncResult,
+  clientId: string,
+  remoteVersion: string | null,
+  localVersion: string
+): void {
+  if (result.skippedRemotes.some((s) => s.clientId === clientId)) return;
+  result.skippedRemotes.push({ clientId, remoteVersion, localVersion });
+  result.warnings.push(
+    `Skipping client ${clientId}: schema version mismatch (local=${localVersion}, remote=${remoteVersion ?? 'unknown'})`
+  );
+}
+
+/**
  * 通常のchangelogベース差分同期を実行する。
  *
  * @internal
@@ -506,8 +527,11 @@ function pullNormal(
       if (config.schemaVersion) {
         const remoteVersion = readSchemaVersion(remoteDb);
         if (remoteVersion !== config.schemaVersion) {
-          result.warnings.push(
-            `Skipping client ${remote.clientId}: schema version mismatch (local=${config.schemaVersion}, remote=${remoteVersion ?? 'unknown'})`
+          recordSkippedRemote(
+            result,
+            remote.clientId,
+            remoteVersion,
+            config.schemaVersion
           );
           continue;
         }
@@ -598,8 +622,11 @@ function pullFullMerge(
         if (config.schemaVersion) {
           const remoteVersion = readSchemaVersion(remoteDb);
           if (remoteVersion !== config.schemaVersion) {
-            result.warnings.push(
-              `Skipping client ${remote.clientId}: schema version mismatch (local=${config.schemaVersion}, remote=${remoteVersion ?? 'unknown'})`
+            recordSkippedRemote(
+              result,
+              remote.clientId,
+              remoteVersion,
+              config.schemaVersion
             );
             continue;
           }
@@ -677,6 +704,7 @@ export async function performSync(
     skipped: 0,
     conflictsResolved: 0,
     warnings: [],
+    skippedRemotes: [],
     hadChangelogGap: false,
   };
 

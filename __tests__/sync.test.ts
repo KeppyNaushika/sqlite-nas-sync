@@ -195,6 +195,25 @@ describe('performSync', () => {
     expect(result.inserted).toBe(0);
     expect(result.warnings.some((w) => w.includes('schema version mismatch'))).toBe(true);
 
+    // 構造化されたskippedRemotesにも記録される
+    expect(result.skippedRemotes).toEqual([
+      { clientId: 'client-a', remoteVersion: 'v1', localVersion: 'v2' },
+    ]);
+
+    dbB.close();
+  });
+
+  it('schemaVersionが一致するsyncではskippedRemotesは空', async () => {
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    const configA = { ...makeConfig(pathA, 'client-a'), schemaVersion: 'v2' };
+    await performSync(dbA, configA, TABLES);
+    dbA.close();
+
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    const configB = { ...makeConfig(pathB, 'client-b'), schemaVersion: 'v2' };
+    const result = await performSync(dbB, configB, TABLES);
+
+    expect(result.skippedRemotes).toEqual([]);
     dbB.close();
   });
 

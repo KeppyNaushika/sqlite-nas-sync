@@ -227,6 +227,20 @@ export interface SyncInstance {
 }
 
 /**
+ * スキーマバージョン不一致によりスキップされたリモートクライアントの情報。
+ *
+ * アプリ側でユーザー通知（「他のクライアントが別バージョンを使用中」等）に利用する。
+ */
+export interface SkippedRemote {
+  /** スキップされたリモートのクライアントID */
+  clientId: string;
+  /** リモート側のスキーマバージョン。読み取れなかった場合は `null` */
+  remoteVersion: string | null;
+  /** ローカル側のスキーマバージョン */
+  localVersion: string;
+}
+
+/**
  * 同期実行の結果統計。
  *
  * {@link SyncInstance.syncNow} の戻り値として返される。
@@ -246,6 +260,13 @@ export interface SyncResult {
   conflictsResolved: number;
   /** 致命的でない警告メッセージの配列 */
   warnings: string[];
+  /**
+   * スキーマバージョン不一致でスキップされたリモートクライアントの一覧。
+   *
+   * {@link SyncConfig.schemaVersion} 指定時のみ記録される。
+   * 同一クライアントは1回のsyncにつき1エントリ。
+   */
+  skippedRemotes: SkippedRemote[];
   /**
    * changelogギャップが検出されたかどうか。
    *
