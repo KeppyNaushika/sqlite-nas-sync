@@ -57,12 +57,12 @@ describe('conflict', () => {
       expect(row.name).toBe('Alice Updated');
     });
 
-    it('UNIQUE制約違反（PK以外）でUPSERTする', () => {
+    it('セカンダリUNIQUE違反（別ID・同一ユニークキー）でリモートが新しい場合、ローカル行を置換する', () => {
       db.prepare(
         `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
       ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
 
-      // 異なるIDだが同じemail
+      // 異なるIDだが同じemail、リモートの方が新しい
       const result = applyInsert(db, 'users', 'id', {
         id: 'u2',
         name: 'Alice Clone',
@@ -71,11 +71,60 @@ describe('conflict', () => {
       }, columns);
 
       expect(result.action).toBe('upserted');
-      expect(result.conflict).toBeDefined();
+      expect(result.conflict?.resolution).toBe('remote_wins');
+
+      // 敗者（u1）は削除され、勝者（u2）が存在する
+      const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
+      const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any;
+      expect(u1).toBeUndefined();
+      expect(u2.name).toBe('Alice Clone');
+    });
+
+    it('セカンダリUNIQUE違反でローカルが新しい場合、リモート行を採用しない', () => {
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z');
+
+      const result = applyInsert(db, 'users', 'id', {
+        id: 'u2',
+        name: 'Alice Clone',
+        email: 'alice@example.com',
+        updatedAt: '2024-01-01T00:00:00Z',
+      }, columns);
+
+      expect(result.action).toBe('upserted');
+      expect(result.conflict?.resolution).toBe('local_wins');
+
+      // ローカル（u1）が保持され、リモート（u2）は挿入されない
+      const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
+      const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2');
+      expect(u1.name).toBe('Alice');
+      expect(u2).toBeUndefined();
     });
   });
 
   describe('applyUpdate', () => {
+    it('ローカルにPKが無くセカンダリUNIQUE違反になる場合も競合解決される', () => {
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+
+      // リモートのUPDATEエントリだが、ローカルにu2は無く、emailがu1と衝突する
+      const result = applyUpdate(db, 'users', 'id', {
+        id: 'u2',
+        name: 'Alice Remote',
+        email: 'alice@example.com',
+        updatedAt: '2024-06-01T00:00:00Z',
+      }, columns);
+
+      // 例外にならず、LWWで解決される（リモートが新しい → 置換）
+      expect(result.action).toBe('updated');
+      const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
+      const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any;
+      expect(u1).toBeUndefined();
+      expect(u2.name).toBe('Alice Remote');
+    });
+
     it('リモートが新しい場合は更新する', () => {
       db.prepare(
         `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
