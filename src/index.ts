@@ -214,6 +214,11 @@ export function setupSync(config: SyncConfig): SyncInstance {
 // 公開API: テーブル自動検出
 export { discoverTables } from './validator';
 
+// 公開API: レコードレベル競合解決
+// アプリ側が手動マージ（例: 同期無効化時のクライアントDB統合）を行う際に、
+// syncNowと同一のLWW競合解決（セカンダリUNIQUE違反の収束を含む）を再利用できる。
+export { applyInsert, applyUpdate, applyDelete } from './conflict';
+
 // 公開型のre-export
 export type {
   TableConfig,
@@ -226,4 +231,5 @@ export type {
   SyncStatus,
   SyncEvent,
   SyncEventCallback,
+  ConflictInfo,
 } from './types';
