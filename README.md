@@ -160,6 +160,42 @@ const tables = discoverTables(db, {
 | `tableOptions` | `Record<string, TableOptions>` | `{}` | テーブル別のオプション |
 | `onWarning` | `(message) => void` | `console.warn` | `id` を持つが `updatedAt` が無い時の警告ハンドラ |
 
+### `applyInsert` / `applyUpdate` / `applyDelete`
+
+`syncNow` が内部で使うレコードレベルのLWW競合解決を、公開APIとして利用できます。
+アプリ側で手動マージ（例: 同期無効化時のクライアントDB統合、管理スクリプトでの
+複数DB統合）を行う際に、同期本体と同一の競合解決ロジックを再利用するための関数です。
+
+- `applyInsert(db, tableName, primaryKey, record, columns, timestampColumn?)` —
+  INSERTを試み、UNIQUE制約違反時はLWWでフォールバック。同一PKの重複は
+  `updatedAt` 比較でUPDATE、別PK・同一ユニークキー（セカンダリUNIQUE違反）も
+  `updatedAt` 比較で一方に収束させる
+- `applyUpdate(db, tableName, primaryKey, record, columns, timestampColumn?)` —
+  LWWでUPDATE。ローカルに行が無ければ `applyInsert` 経由でINSERT
+- `applyDelete(db, tableName, primaryKey, recordId)` — 主キー指定でDELETE
+
+```typescript
+import Database from 'better-sqlite3';
+import { applyInsert, discoverTables } from 'sqlite-nas-sync';
+
+// 例: クライアントDBをメインDBへLWWマージする
+const mainDb = new Database('./main.sqlite');
+mainDb.exec(`ATTACH DATABASE './client.sqlite' AS remote`);
+for (const table of discoverTables(mainDb)) {
+  const rows = mainDb
+    .prepare(`SELECT * FROM remote."${table.name}"`)
+    .all() as Record<string, unknown>[];
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+  for (const row of rows) {
+    applyInsert(mainDb, table.name, 'id', row, columns);
+  }
+}
+mainDb.exec('DETACH DATABASE remote');
+```
+
+戻り値には実行されたアクション（`inserted` / `upserted` 等）と、競合があった場合は
+`ConflictInfo`（`resolution: 'local_wins' | 'remote_wins'` を含む）が入ります。
+
 ### `SyncInstance`
 
 #### `syncNow(): Promise<SyncResult>`
