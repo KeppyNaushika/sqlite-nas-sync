@@ -7,7 +7,9 @@
  * @module nas
  */
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { RemoteClient } from './types';
 
@@ -90,17 +92,82 @@ export function listRemoteClients(
 }
 
 /**
- * リモートDBを読み取り専用で安全にオープンする。
+ * リモートDBへの安全なハンドル。
  *
- * 以下の手順で安全性を確保する:
- * 1. `{ readonly: true }` でオープン
- * 2. `PRAGMA query_only = ON` を設定
- * 3. `PRAGMA integrity_check` で整合性を検証
+ * `cleanup()` を必ず呼び出して、開いた接続と一時ファイルを解放すること。
+ */
+export interface RemoteDbHandle {
+  /** 読み取り専用でオープンされたデータベース接続。 */
+  db: Database.Database;
+  /** 接続を閉じ、ローカル一時ファイル（あれば）を削除する。 */
+  cleanup: () => void;
+}
+
+/**
+ * NAS上のリモートDBファイルをローカル一時領域にコピーしてから読み取り専用で開く。
  *
- * オープンまたは整合性チェックに失敗した場合は `null` を返す。
+ * NAS（SMB/NFS等）上のSQLiteファイルを直接 `better-sqlite3` で開くと、
+ * 他クライアントによる atomic copy 中の rename と読み取りが衝突して
+ * I/Oエラーや「database is locked」となることがある。
+ * これを避けるため、まずローカル領域（`os.tmpdir()` 配下）にコピーし、
+ * そのローカルコピーを開く。
  *
- * @param filePath - オープンするDBファイルのパス
- * @returns データベース接続。失敗時は `null`
+ * 戻り値の `cleanup()` を呼ぶことで、接続のクローズと一時ファイルの削除が行われる。
+ * 呼び忘れると一時ファイルが残り続けるため、必ず `try/finally` で囲むこと。
+ *
+ * @param filePath - NAS上のオリジナルDBファイルパス
+ * @param tmpDir - 一時ファイルを置くディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync` を使う。
+ * @returns ハンドル。コピー失敗・オープン失敗・整合性NG時は `null`。
+ */
+export function openRemoteDbViaLocalCopy(
+  filePath: string,
+  tmpDir?: string
+): RemoteDbHandle | null {
+  const effectiveTmpDir = tmpDir ?? path.join(os.tmpdir(), 'sqlite-nas-sync');
+  let tmpPath: string | null = null;
+
+  try {
+    ensureDirectory(effectiveTmpDir);
+
+    const unique = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    tmpPath = path.join(effectiveTmpDir, `remote-${unique}.sqlite`);
+
+    fs.copyFileSync(filePath, tmpPath);
+
+    const db = new Database(tmpPath, { readonly: true });
+    db.pragma('query_only = ON');
+
+    const integrity = db.pragma('integrity_check', { simple: true }) as string;
+    if (integrity !== 'ok') {
+      try { db.close(); } catch { /* ignore */ }
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      return null;
+    }
+
+    const fileToCleanup = tmpPath;
+    return {
+      db,
+      cleanup: () => {
+        try { db.close(); } catch { /* ignore */ }
+        try { fs.unlinkSync(fileToCleanup); } catch { /* ignore */ }
+      },
+    };
+  } catch {
+    if (tmpPath) {
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+    return null;
+  }
+}
+
+/**
+ * リモートDBを読み取り専用でオープンする（旧API）。
+ *
+ * @deprecated v0.9.0 以降は {@link openRemoteDbViaLocalCopy} を使うこと。
+ *   NAS上のファイルを直接開くと、書き込み中の他クライアントとの衝突で
+ *   I/Oエラーが発生し、changelog 暴走の原因になる。
+ *
+ * 互換性のため残しているが、内部からは利用していない。
  */
 export function openRemoteDb(
   filePath: string
@@ -109,7 +176,6 @@ export function openRemoteDb(
     const db = new Database(filePath, { readonly: true });
     db.pragma('query_only = ON');
 
-    // 整合性チェック
     const result = db.pragma('integrity_check', { simple: true }) as string;
     if (result !== 'ok') {
       db.close();

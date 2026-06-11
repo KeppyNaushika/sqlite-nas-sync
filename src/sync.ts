@@ -16,7 +16,7 @@ import {
   cleanupChangelog,
 } from './changelog';
 import { applyInsert, applyUpdate, applyDelete } from './conflict';
-import { copyToNas, ensureDirectory, listRemoteClients, openRemoteDb } from './nas';
+import { copyToNas, ensureDirectory, listRemoteClients, openRemoteDbViaLocalCopy } from './nas';
 import { readSchemaVersion, writeSchemaVersion } from './setup';
 
 /**
@@ -490,16 +490,17 @@ function pullNormal(
   result: SyncResult
 ): void {
   for (const remote of remoteClients) {
-    let remoteDb: Database.Database | null = null;
+    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
 
     try {
-      remoteDb = openRemoteDb(remote.filePath);
-      if (!remoteDb) {
+      handle = openRemoteDbViaLocalCopy(remote.filePath);
+      if (!handle) {
         result.warnings.push(
           `Failed to open remote database: ${remote.clientId}`
         );
         continue;
       }
+      const remoteDb = handle.db;
 
       // schemaVersionチェック
       if (config.schemaVersion) {
@@ -523,23 +524,22 @@ function pullNormal(
 
       // エントリの重複排除
       const deduplicated = deduplicateEntries(entries);
+      const maxId = entries[entries.length - 1].id;
 
-      // トランザクション内で適用
+      // 適用と lastSeenId 更新を 1 つのトランザクションで原子的に。
+      // ここで例外が出れば全てロールバックされ、次回 sync で同じ差分を再試行できる。
       const transaction = localDb.transaction(() => {
         processChangelogEntries(
           localDb,
-          remoteDb!,
+          remoteDb,
           deduplicated,
           primaryKey,
           tables,
           result
         );
+        updateSyncState(localDb, remote.clientId, maxId);
       });
       transaction();
-
-      // lastSeenId更新
-      const maxId = entries[entries.length - 1].id;
-      updateSyncState(localDb, remote.clientId, maxId);
 
       result.clientsSynced++;
     } catch (err) {
@@ -547,12 +547,8 @@ function pullNormal(
         `Sync failed for client ${remote.clientId}: ${err}`
       );
     } finally {
-      if (remoteDb) {
-        try {
-          remoteDb.close();
-        } catch {
-          // ignore close errors
-        }
+      if (handle) {
+        handle.cleanup();
       }
     }
   }
@@ -586,16 +582,17 @@ function pullFullMerge(
 
   try {
     for (const remote of remoteClients) {
-      let remoteDb: Database.Database | null = null;
+      let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
 
       try {
-        remoteDb = openRemoteDb(remote.filePath);
-        if (!remoteDb) {
+        handle = openRemoteDbViaLocalCopy(remote.filePath);
+        if (!handle) {
           result.warnings.push(
             `Failed to open remote database: ${remote.clientId}`
           );
           continue;
         }
+        const remoteDb = handle.db;
 
         // schemaVersionチェック
         if (config.schemaVersion) {
@@ -608,34 +605,27 @@ function pullFullMerge(
           }
         }
 
-        // トランザクション内でフルマージ
+        // フルマージ本体と lastSeenId 更新を 1 つのトランザクションで原子的に。
+        // 途中で例外が出れば mergeChangelog の大量INSERTを含めて全てロールバックされ、
+        // 次回 sync で同じギャップが再検出されてやり直せる。
+        // これがないと、changelogが膨張したまま lastSeenId が更新されず、毎回ループする。
         const transaction = localDb.transaction(() => {
-          // 1. 全レコードをLWWでマージ
-          performFullMergeData(localDb, remoteDb!, tables, primaryKey, result);
-
-          // 2. tombstone適用
-          applyTombstones(localDb, remoteDb!, tables, primaryKey, result);
-
-          // 3. changelogマージ（7日以内）
-          mergeChangelog(localDb, remoteDb!, retentionDays);
+          performFullMergeData(localDb, remoteDb, tables, primaryKey, result);
+          applyTombstones(localDb, remoteDb, tables, primaryKey, result);
+          mergeChangelog(localDb, remoteDb, retentionDays);
+          const maxId = getMaxChangelogId(remoteDb);
+          updateSyncState(localDb, remote.clientId, maxId);
         });
         transaction();
 
-        // lastSeenId更新
-        const maxId = getMaxChangelogId(remoteDb);
-        updateSyncState(localDb, remote.clientId, maxId);
         result.clientsSynced++;
       } catch (err) {
         result.warnings.push(
           `Full merge failed for client ${remote.clientId}: ${err}`
         );
       } finally {
-        if (remoteDb) {
-          try {
-            remoteDb.close();
-          } catch {
-            // ignore close errors
-          }
+        if (handle) {
+          handle.cleanup();
         }
       }
     }
@@ -702,10 +692,11 @@ export async function performSync(
   // 2. ギャップ事前チェック: いずれかのリモートにchangelogギャップがあるか確認
   let hasAnyGap = false;
   for (const remote of remoteClients) {
-    let remoteDb: Database.Database | null = null;
+    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
     try {
-      remoteDb = openRemoteDb(remote.filePath);
-      if (!remoteDb) continue;
+      handle = openRemoteDbViaLocalCopy(remote.filePath);
+      if (!handle) continue;
+      const remoteDb = handle.db;
 
       if (config.schemaVersion) {
         const remoteVersion = readSchemaVersion(remoteDb);
@@ -718,8 +709,8 @@ export async function performSync(
         break;
       }
     } finally {
-      if (remoteDb) {
-        try { remoteDb.close(); } catch { /* ignore */ }
+      if (handle) {
+        handle.cleanup();
       }
     }
   }
