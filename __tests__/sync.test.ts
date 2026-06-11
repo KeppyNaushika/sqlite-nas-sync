@@ -10,7 +10,11 @@ describe('performSync', () => {
   const testDir = path.join(__dirname, 'test-data-sync');
   const nasDir = path.join(testDir, 'nas');
 
-  const TABLES: TableConfig[] = [{ name: 'users' }, { name: 'posts' }];
+  const TABLES: TableConfig[] = [
+    { name: 'users' },
+    { name: 'posts' },
+    { name: 'decisions' },
+  ];
 
   function createClientDb(clientId: string): { db: Database.Database; dbPath: string } {
     const clientDir = path.join(testDir, clientId);
@@ -30,6 +34,15 @@ describe('performSync', () => {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         userId TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    // セカンダリUNIQUE制約を持つテーブル（「1セルにつき1確定」のようなアプリを想定）
+    db.exec(`
+      CREATE TABLE decisions (
+        id TEXT PRIMARY KEY,
+        cellKey TEXT NOT NULL UNIQUE,
+        value TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
     `);
@@ -159,6 +172,39 @@ describe('performSync', () => {
     expect(result.deleted).toBe(0);
     expect(result.clientsSynced).toBe(1);
 
+    dbB.close();
+  });
+
+  it('別ID・同一ユニークキーの行が両クライアントで作成された場合、LWWで1行に収束する', async () => {
+    // A・Bが独立に同じ論理エンティティ（cellKey=c1）の行を作成
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(
+      `INSERT INTO decisions (id, cellKey, value, updatedAt) VALUES (?, ?, ?, ?)`
+    ).run('d-a', 'c1', 'score:5', '2024-01-01T00:00:00Z');
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    dbB.prepare(
+      `INSERT INTO decisions (id, cellKey, value, updatedAt) VALUES (?, ?, ?, ?)`
+    ).run('d-b', 'c1', 'score:8', '2024-06-01T00:00:00Z');
+
+    // B同期: Aのd-aを受信 → ローカルd-bの方が新しい → d-bを保持
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+    // A同期: Bのd-bを受信 → リモートd-bの方が新しい → d-aを削除しd-bに置換
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+    // B再同期: Aのd-a削除（tombstone/changelog）を受信しても結果は変わらない
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+
+    for (const [label, db] of [['A', dbA], ['B', dbB]] as const) {
+      const rows = db
+        .prepare(`SELECT * FROM decisions WHERE cellKey = ?`)
+        .all('c1') as any[];
+      expect(rows, `client-${label}`).toHaveLength(1);
+      expect(rows[0].id, `client-${label}`).toBe('d-b');
+      expect(rows[0].value, `client-${label}`).toBe('score:8');
+    }
+
+    dbA.close();
     dbB.close();
   });
 

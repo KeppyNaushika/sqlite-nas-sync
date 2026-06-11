@@ -17,6 +17,29 @@ function escapeIdentifier(identifier: string): string {
 }
 
 /**
+ * UNIQUE制約エラーのメッセージから違反したカラム名を抽出する。
+ *
+ * better-sqlite3のエラーメッセージ形式:
+ * `UNIQUE constraint failed: Table.colA, Table.colB`
+ *
+ * @returns 違反したカラム名の配列。解析できない場合は空配列。
+ * @internal
+ */
+function parseUniqueConflictColumns(
+  err: unknown,
+  tableName: string
+): string[] {
+  const message = err instanceof Error ? err.message : String(err);
+  const match = /UNIQUE constraint failed: (.+)$/.exec(message);
+  if (!match) return [];
+  return match[1]
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.startsWith(`${tableName}.`))
+    .map((part) => part.slice(tableName.length + 1));
+}
+
+/**
  * リモートのINSERT操作をローカルDBに適用する。
  *
  * 通常のINSERTを試み、UNIQUE制約違反（PK重複やユニークカラム重複）が
@@ -56,35 +79,97 @@ export function applyInsert(
       sqliteErr.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
       sqliteErr.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
     ) {
-      // UNIQUE違反 → LWWでUPSERT
       const escapedPk = escapeIdentifier(primaryKey);
       const pkValue = record[primaryKey];
+      const remoteUpdatedAt = String(record[timestampColumn] ?? '');
 
+      // ケース1: 同一PKの行が存在する（PK重複）→ LWWでUPDATE
       const localRecord = localDb
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
         .get(pkValue) as Record<string, unknown> | undefined;
 
-      const remoteUpdatedAt = String(record[timestampColumn] ?? '');
-      const localUpdatedAt = localRecord
-        ? String(localRecord[timestampColumn] ?? '')
-        : '';
+      if (localRecord) {
+        const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
 
-      if (!localRecord || remoteUpdatedAt > localUpdatedAt) {
-        // リモートが新しい → UPDATE
-        const updateColumns = columns.filter((c) => c !== primaryKey);
-        const setClause = updateColumns
-          .map((c) => `${escapeIdentifier(c)} = ?`)
-          .join(', ');
-        const updateValues = [
-          ...updateColumns.map((c) => record[c]),
-          pkValue,
-        ];
+        if (remoteUpdatedAt > localUpdatedAt) {
+          const updateColumns = columns.filter((c) => c !== primaryKey);
+          const setClause = updateColumns
+            .map((c) => `${escapeIdentifier(c)} = ?`)
+            .join(', ');
+          const updateValues = [
+            ...updateColumns.map((c) => record[c]),
+            pkValue,
+          ];
+
+          localDb
+            .prepare(
+              `UPDATE ${escapedTable} SET ${setClause} WHERE ${escapedPk} = ?`
+            )
+            .run(...updateValues);
+
+          return {
+            action: 'upserted',
+            conflict: {
+              table: tableName,
+              recordId: String(pkValue),
+              localUpdatedAt,
+              remoteUpdatedAt,
+              resolution: 'remote_wins',
+            },
+          };
+        }
+
+        return {
+          action: 'upserted',
+          conflict: {
+            table: tableName,
+            recordId: String(pkValue),
+            localUpdatedAt,
+            remoteUpdatedAt,
+            resolution: 'local_wins',
+          },
+        };
+      }
+
+      // ケース2: 別PK・同一ユニークキーの行が存在する（セカンダリUNIQUE違反）。
+      // 各クライアントが独立に同じ論理エンティティの行を作成した場合に発生する。
+      // 違反したカラムからローカルの競合行を特定し、LWWで一方に収束させる。
+      const uniqueColumns = parseUniqueConflictColumns(err, tableName);
+      const conflictRow =
+        uniqueColumns.length > 0
+          ? (localDb
+              .prepare(
+                `SELECT * FROM ${escapedTable} WHERE ${uniqueColumns
+                  .map((c) => `${escapeIdentifier(c)} = ?`)
+                  .join(' AND ')}`
+              )
+              .get(...uniqueColumns.map((c) => record[c])) as
+              | Record<string, unknown>
+              | undefined)
+          : undefined;
+
+      if (!conflictRow) {
+        // 競合行を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
+        throw err;
+      }
+
+      const localUpdatedAt = String(conflictRow[timestampColumn] ?? '');
+
+      if (remoteUpdatedAt > localUpdatedAt) {
+        // リモートが新しい → ローカルの競合行を削除してリモート行を挿入。
+        // DELETEトリガーが発火するため、敗者行の削除はchangelog/tombstone経由で
+        // 他クライアントにも伝播し、全体が勝者行に収束する。
+        const escapedColumns = columns.map((c) => escapeIdentifier(c));
+        const insertPlaceholders = columns.map(() => '?').join(', ');
 
         localDb
+          .prepare(`DELETE FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+          .run(conflictRow[primaryKey]);
+        localDb
           .prepare(
-            `UPDATE ${escapedTable} SET ${setClause} WHERE ${escapedPk} = ?`
+            `INSERT INTO ${escapedTable} (${escapedColumns.join(', ')}) VALUES (${insertPlaceholders})`
           )
-          .run(...updateValues);
+          .run(...values);
 
         return {
           action: 'upserted',
@@ -98,11 +183,12 @@ export function applyInsert(
         };
       }
 
+      // ローカルが新しい → リモート行は採用しない
       return {
         action: 'upserted',
         conflict: {
           table: tableName,
-          recordId: String(pkValue),
+          recordId: String(conflictRow[primaryKey]),
           localUpdatedAt,
           remoteUpdatedAt,
           resolution: 'local_wins',
@@ -145,17 +231,27 @@ export function applyUpdate(
     .get(pkValue) as Record<string, unknown> | undefined;
 
   if (!localRecord) {
-    // ローカルに存在しない → INSERT（リモートでINSERT後UPDATEされた場合など）
-    const escapedColumns = columns.map((c) => escapeIdentifier(c));
-    const placeholders = columns.map(() => '?').join(', ');
-    const values = columns.map((c) => remoteRecord[c]);
-
-    localDb
-      .prepare(
-        `INSERT INTO ${escapedTable} (${escapedColumns.join(', ')}) VALUES (${placeholders})`
-      )
-      .run(...values);
-    return { action: 'inserted' };
+    // ローカルに存在しない → INSERT（リモートでINSERT後UPDATEされた場合など）。
+    // セカンダリUNIQUE違反（別PK・同一ユニークキー）の可能性があるため、
+    // 競合解決込みのapplyInsertを経由する。
+    const insertResult = applyInsert(
+      localDb,
+      tableName,
+      primaryKey,
+      remoteRecord,
+      columns,
+      timestampColumn
+    );
+    if (insertResult.action === 'inserted') {
+      return { action: 'inserted' };
+    }
+    return {
+      action:
+        insertResult.conflict?.resolution === 'remote_wins'
+          ? 'updated'
+          : 'skipped',
+      conflict: insertResult.conflict,
+    };
   }
 
   // LWW比較
