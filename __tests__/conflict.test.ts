@@ -163,6 +163,28 @@ describe('conflict', () => {
       expect(row.name).toBe('Alice');
     });
 
+    it('タイムゾーンオフセット混在でも時刻として比較する（字句比較だと更新喪失する回帰ケース）', () => {
+      // ローカルは 10:00 UTC。リモートは +09:00 表記の 18:30（=09:30 UTC）で実際は古い。
+      // 字句比較では "T18:30" > "T10:00" となりリモートが新しく見えてしまうが、
+      // julianday 正規化により本当の時刻順（ローカルが新しい）で local_wins になるべき。
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2026-05-13T10:00:00.000+00:00');
+
+      const result = applyUpdate(db, 'users', 'id', {
+        id: 'u1',
+        name: 'Alice Stale',
+        email: 'alice.stale@example.com',
+        updatedAt: '2026-05-13T18:30:00.000+09:00',
+      }, columns);
+
+      expect(result.action).toBe('skipped');
+      expect(result.conflict?.resolution).toBe('local_wins');
+
+      const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
+      expect(row.name).toBe('Alice');
+    });
+
     it('同じタイムスタンプならスキップする', () => {
       db.prepare(
         `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
