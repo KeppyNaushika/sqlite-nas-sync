@@ -164,7 +164,7 @@ export function applyInsert(
       if (localRecord) {
         const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
 
-        if (remoteUpdatedAt > localUpdatedAt) {
+        if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
           const updateColumns = columns.filter((c) => c !== primaryKey);
           const setClause = updateColumns
             .map((c) => `${escapeIdentifier(c)} = ?`)
@@ -228,7 +228,7 @@ export function applyInsert(
 
       const localUpdatedAt = String(conflictRow[timestampColumn] ?? '');
 
-      if (remoteUpdatedAt > localUpdatedAt) {
+      if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
         // リモートが新しい → ローカルの競合行を削除してリモート行を挿入。
         // DELETEトリガーが発火するため、敗者行の削除はchangelog/tombstone経由で
         // 他クライアントにも伝播し、全体が勝者行に収束する。
@@ -331,7 +331,7 @@ export function applyUpdate(
   const remoteUpdatedAt = String(remoteRecord[timestampColumn] ?? '');
   const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
 
-  if (remoteUpdatedAt > localUpdatedAt) {
+  if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
     const updateColumns = columns.filter((c) => c !== primaryKey);
     const setClause = updateColumns
       .map((c) => `${escapeIdentifier(c)} = ?`)
