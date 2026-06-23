@@ -40,17 +40,78 @@ function parseUniqueConflictColumns(
 }
 
 /**
+ * 2つのタイムスタンプを「時刻」として比較する。
+ *
+ * `updatedAt` はISO-T形式（例: `2026-05-13T23:17:35.111+00:00`）、
+ * `_tombstone.deletedAt` / `_changelog.changedAt` はトリガの `datetime('now')` による
+ * スペース形式（例: `2026-05-02 02:19:56`）で、**文字列としては比較できない**
+ * （同日でも ' '(0x20) < 'T'(0x54) となり削除側が常に小さく扱われる）。
+ * SQLiteの `julianday()` で正規化して数値比較し、解析不能時のみ文字列比較に
+ * フォールバックする。
+ *
+ * @returns `a` が `b` より後（新しい）なら true
+ * @internal
+ */
+export function isLaterTimestamp(
+  db: Database.Database,
+  a: string,
+  b: string
+): boolean {
+  const row = db
+    .prepare(`SELECT julianday(?) AS ja, julianday(?) AS jb`)
+    .get(a, b) as { ja: number | null; jb: number | null };
+  if (row.ja != null && row.jb != null) return row.ja > row.jb;
+  return a > b;
+}
+
+/**
+ * ローカル `_tombstone` に、指定レコードの削除が `recordTimestamp` と同時刻以降で
+ * 記録されているか（＝そのレコードの挿入/更新はLWW上スキップすべきか）を返す。
+ *
+ * これにより「削除済みより古い（or 同時刻の）挿入/更新」による行の復活を防ぎ、
+ * クライアント処理順に依存しない決定論的LWWを実現する。
+ * `_tombstone` テーブルが無いDBでは常に false。
+ *
+ * @internal
+ */
+export function isShadowedByTombstone(
+  localDb: Database.Database,
+  tableName: string,
+  recordId: string,
+  recordTimestamp: string
+): boolean {
+  const hasTombstone = localDb
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get();
+  if (!hasTombstone) return false;
+
+  const ts = localDb
+    .prepare(
+      `SELECT deletedAt FROM _tombstone WHERE tableName = ? AND recordId = ?`
+    )
+    .get(tableName, recordId) as { deletedAt: string } | undefined;
+  if (!ts) return false;
+
+  // record が削除より「厳密に新しい」場合のみ採用。さもなくば（同時刻含め）削除が勝つ。
+  return !isLaterTimestamp(localDb, recordTimestamp, String(ts.deletedAt));
+}
+
+/**
  * リモートのINSERT操作をローカルDBに適用する。
  *
  * 通常のINSERTを試み、UNIQUE制約違反（PK重複やユニークカラム重複）が
  * 発生した場合はLWW（Last-Write-Wins）でUPSERTにフォールバックする。
+ * ローカル `_tombstone` により、より新しい削除が記録済みのレコードは
+ * 再挿入せずスキップする（決定論的LWW）。
  *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param tableName - 対象テーブル名
  * @param primaryKey - 主キーカラム名
  * @param record - 挿入するリモートレコード
  * @param columns - テーブルのカラム名配列
- * @returns 実行されたアクション（`inserted` or `upserted`）と競合情報
+ * @returns 実行されたアクション（`inserted` / `upserted` / `skipped`）と競合情報
  * @throws UNIQUE制約以外のSQLiteエラー
  */
 export function applyInsert(
@@ -60,11 +121,23 @@ export function applyInsert(
   record: Record<string, unknown>,
   columns: string[],
   timestampColumn: string = 'updatedAt'
-): { action: 'inserted' | 'upserted'; conflict?: ConflictInfo } {
+): { action: 'inserted' | 'upserted' | 'skipped'; conflict?: ConflictInfo } {
   const escapedTable = escapeIdentifier(tableName);
   const escapedColumns = columns.map((c) => escapeIdentifier(c));
   const placeholders = columns.map(() => '?').join(', ');
   const values = columns.map((c) => record[c]);
+
+  // より新しい削除(tombstone)が記録済みのスロットには再挿入しない（決定論的LWW: 削除が勝つ）
+  if (
+    isShadowedByTombstone(
+      localDb,
+      tableName,
+      String(record[primaryKey]),
+      String(record[timestampColumn] ?? '')
+    )
+  ) {
+    return { action: 'skipped' };
+  }
 
   try {
     localDb
