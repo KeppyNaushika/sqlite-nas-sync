@@ -15,7 +15,7 @@ import {
   hasChangelogGap,
   cleanupChangelog,
 } from './changelog';
-import { applyInsert, applyUpdate, applyDelete } from './conflict';
+import { applyInsert, applyUpdate, isLaterTimestamp } from './conflict';
 import { copyToNas, ensureDirectory, listRemoteClients, openRemoteDbViaLocalCopy } from './nas';
 import { readSchemaVersion, writeSchemaVersion } from './setup';
 
@@ -107,6 +107,86 @@ function updateSyncState(
 }
 
 /**
+ * リモートDBの `_tombstone` から指定レコードの削除時刻を取得する。
+ * `_tombstone` を持たない（旧バージョン由来の）クライアントでは null。
+ * @internal
+ */
+function getRemoteDeletedAt(
+  remoteDb: Database.Database,
+  tableName: string,
+  recordId: string
+): string | null {
+  const exists = remoteDb
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get();
+  if (!exists) return null;
+  const row = remoteDb
+    .prepare(
+      `SELECT deletedAt FROM _tombstone WHERE tableName = ? AND recordId = ?`
+    )
+    .get(tableName, recordId) as { deletedAt: string } | undefined;
+  return row ? String(row.deletedAt) : null;
+}
+
+/**
+ * tombstoneに基づくLWW削除をローカルに適用する。
+ *
+ * - ローカル `_tombstone` に max(deletedAt) を記録する（以降の挿入/更新による
+ *   復活を抑止する根拠となる。{@link applyInsert} がこれを参照する）。
+ * - ローカル行が存在し、`deletedAt` がその `updatedAt` より新しい場合のみ実際に削除する。
+ *
+ * 無条件削除ではなくLWWで判定するため、クライアントの処理順に依存せず
+ * 「最新の更新 > 最新の削除なら存続、さもなくば削除」へ決定論的に収束する。
+ * 比較はフォーマット差（ISO-T vs スペース形式）を吸収する {@link isLaterTimestamp} で行う。
+ * @internal
+ */
+function applyTombstoneDelete(
+  localDb: Database.Database,
+  tableName: string,
+  primaryKey: string,
+  timestampColumn: string,
+  recordId: string,
+  deletedAt: string,
+  result: SyncResult
+): void {
+  const hasTombstone = localDb
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get();
+  if (hasTombstone) {
+    localDb
+      .prepare(
+        `INSERT INTO _tombstone (tableName, recordId, deletedAt) VALUES (?, ?, ?)
+         ON CONFLICT(tableName, recordId) DO UPDATE SET deletedAt = excluded.deletedAt
+         WHERE excluded.deletedAt > _tombstone.deletedAt`
+      )
+      .run(tableName, recordId, deletedAt);
+  }
+
+  const escapedTable = escapeIdentifier(tableName);
+  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedTs = escapeIdentifier(timestampColumn);
+
+  const localRecord = localDb
+    .prepare(
+      `SELECT ${escapedTs} AS ts FROM ${escapedTable} WHERE ${escapedPk} = ?`
+    )
+    .get(recordId) as { ts: unknown } | undefined;
+  if (!localRecord) return;
+
+  const localUpdatedAt = String(localRecord.ts ?? '');
+  if (isLaterTimestamp(localDb, deletedAt, localUpdatedAt)) {
+    localDb
+      .prepare(`DELETE FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+      .run(recordId);
+    result.deleted++;
+  }
+}
+
+/**
  * changelogエントリをローカルDBに適用する。
  *
  * 各エントリのoperationに応じてINSERT/UPDATE/DELETEを実行し、
@@ -163,13 +243,20 @@ function processChangelogEntries(
       // deleteProtected の場合はスキップ
       if (tableConfig.deleteProtected) continue;
 
-      const { action } = applyDelete(
+      // 無条件削除は処理順により「削除 vs より新しい更新」の勝敗が変わる（非決定的）。
+      // 削除時刻（_tombstone優先・無ければchangelogのchangedAt）を用いたLWWで適用する。
+      const deletedAt =
+        getRemoteDeletedAt(remoteDb, entry.tableName, entry.recordId) ??
+        entry.changedAt;
+      applyTombstoneDelete(
         localDb,
         entry.tableName,
         primaryKey,
-        entry.recordId
+        timestampColumn,
+        entry.recordId,
+        deletedAt,
+        result
       );
-      if (action === 'deleted') result.deleted++;
     } else {
       // INSERT or UPDATE: リモートからレコード取得
       const escapedTable = escapeIdentifier(entry.tableName);
@@ -311,36 +398,26 @@ function applyTombstones(
     if (!tableConfig) continue;
     if (tableConfig.deleteProtected) continue;
 
-    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+    // リモートにレコードが現存する場合は再作成されたものとみなし、tombstoneを無視する。
+    // （削除後に同一ソースで再INSERTされたケース。削除時刻との大小に依らず存続させる）
     const escapedTable = escapeIdentifier(ts.tableName);
     const escapedPk = escapeIdentifier(primaryKey);
-    const escapedTimestamp = escapeIdentifier(timestampColumn);
-
-    // リモートにレコードが再作成されている場合はtombstoneを無視
-    // （削除後に再INSERTされたケース）
     const remoteRecord = remoteDb
       .prepare(`SELECT ${escapedPk} FROM ${escapedTable} WHERE ${escapedPk} = ?`)
       .get(ts.recordId);
     if (remoteRecord) continue;
 
-    // ローカルにレコードが存在し、deletedAt > updatedAt の場合のみ削除
-    const localRecord = localDb
-      .prepare(`SELECT ${escapedPk}, ${escapedTimestamp} FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-      .get(ts.recordId) as Record<string, unknown> | undefined;
-
-    if (!localRecord) continue;
-
-    const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
-    if (ts.deletedAt > localUpdatedAt) {
-      localDb
-        .prepare(`DELETE FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-        .run(ts.recordId);
-      // tombstone をローカルにもコピー
-      localDb
-        .prepare(`INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt) VALUES (?, ?, ?)`)
-        .run(ts.tableName, ts.recordId, ts.deletedAt);
-      result.deleted++;
-    }
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+    // フォーマット差(ISO-T vs スペース形式)を吸収したLWWで削除を適用する。
+    applyTombstoneDelete(
+      localDb,
+      ts.tableName,
+      primaryKey,
+      timestampColumn,
+      ts.recordId,
+      ts.deletedAt,
+      result
+    );
   }
 }
 
