@@ -172,6 +172,20 @@ function getRemoteTombstone(
 }
 
 /**
+ * tombstone の `mergedInto` を「畳み先」として使える値に正規化する。
+ *
+ * 自分自身を指す値は畳みではない（畳む向きが反転したときの後始末で生まれうる）。
+ * @internal
+ */
+function resolveFoldTarget(
+  recordId: string,
+  mergedInto: string | null | undefined
+): string | null {
+  if (mergedInto === null || mergedInto === undefined) return null;
+  return mergedInto === recordId ? null : mergedInto;
+}
+
+/**
  * リモートDBから畳み先の行を読む。リモートにも無ければ undefined。
  * @internal
  */
@@ -201,8 +215,8 @@ function readRemoteRecord(
  * - **畳み先（`mergedInto`）がある場合**は、消す前に子を畳み先へ付け替える
  *   （{@link applyMergedDelete}）。この分岐が無いと、競合を経験していないクライアントが
  *   敗者行をただ消し、自分の子をカスケードで失い、その削除がさらに他クライアントの
- *   付け替え済みの子まで殺す。畳みは削除時刻のLWWを見ずに適用する（畳まれた行は
- *   どの端末でも永久に死んでいるため）。
+ *   付け替え済みの子まで殺す。畳みは「衝突していた版より新しい行には及ばせない」という
+ *   LWWだけを見る（削除ではなくユニーク制約が強制する統合なので、削除保護の対象外）。
  * - 畳み先が無い（＝利用者操作による普通の削除）場合は、ローカル行が存在し
  *   `deletedAt` がその `updatedAt` より新しいときだけ削除する。
  *
@@ -238,7 +252,11 @@ function applyTombstoneDelete(
          VALUES (?, ?, ?, ?)
          ON CONFLICT(tableName, recordId) DO UPDATE SET
            deletedAt = CASE
-             WHEN excluded.deletedAt > _tombstone.deletedAt THEN excluded.deletedAt
+             WHEN COALESCE(
+                    julianday(excluded.deletedAt) > julianday(_tombstone.deletedAt),
+                    excluded.deletedAt > _tombstone.deletedAt
+                  )
+             THEN excluded.deletedAt
              ELSE _tombstone.deletedAt
            END,
            mergedInto = COALESCE(excluded.mergedInto, _tombstone.mergedInto)`
@@ -248,6 +266,8 @@ function applyTombstoneDelete(
 
   if (mergedInto !== null && mergedInto !== recordId) {
     // 畳み先が分かっている削除。消す前に子を引き取る。
+    // `deletedAt` を渡すのは、畳みより後に更新された行にまで及ばせないため
+    // （判断は {@link applyMergedDelete} 側で行う）。
     const { action } = applyMergedDelete(
       localDb,
       tableName,
@@ -256,7 +276,8 @@ function applyTombstoneDelete(
       mergedInto,
       readRemoteRecord(remoteDb, tableName, primaryKey, mergedInto),
       columns,
-      timestampColumn
+      timestampColumn,
+      deletedAt
     );
     if (action === 'folded') result.deleted++;
     return;
@@ -336,9 +357,6 @@ function processChangelogEntries(
     }
 
     if (entry.operation === 'DELETE') {
-      // deleteProtected の場合はスキップ
-      if (tableConfig.deleteProtected) continue;
-
       // 無条件削除は処理順により「削除 vs より新しい更新」の勝敗が変わる（非決定的）。
       // 削除時刻（_tombstone優先・無ければchangelogのchangedAt）を用いたLWWで適用する。
       // tombstoneに畳み先が載っていれば、削除ではなく畳みとして適用される。
@@ -347,6 +365,17 @@ function processChangelogEntries(
         entry.tableName,
         entry.recordId
       );
+      const mergedInto = resolveFoldTarget(
+        entry.recordId,
+        remoteTombstone?.mergedInto
+      );
+
+      // deleteProtected は「利用者操作による削除を適用しない」ための設定。
+      // 畳みはユニーク制約が強制する統合であって削除ではないので、その対象外とする。
+      // 見送っても行は救えない — 勝者行が届いた時点で applyInsert が同じ畳みを行うだけで、
+      // それまでのあいだ子が宙に浮き、両者が同じユニークキーを送り合い続ける。
+      if (tableConfig.deleteProtected && mergedInto === null) continue;
+
       applyTombstoneDelete(
         localDb,
         remoteDb,
@@ -356,7 +385,7 @@ function processChangelogEntries(
         columns,
         entry.recordId,
         remoteTombstone?.deletedAt ?? entry.changedAt,
-        remoteTombstone?.mergedInto ?? null,
+        mergedInto,
         result
       );
     } else {
@@ -503,10 +532,15 @@ function applyTombstones(
     )
     .all() as TombstoneEntry[];
 
+  const columnCache = new Map<string, string[]>();
+
   for (const ts of tombstones) {
     const tableConfig = tableConfigMap.get(ts.tableName);
     if (!tableConfig) continue;
-    if (tableConfig.deleteProtected) continue;
+
+    // 畳みは deleteProtected でも適用する（processChangelogEntries と同じ理由）
+    const mergedInto = resolveFoldTarget(ts.recordId, ts.mergedInto);
+    if (tableConfig.deleteProtected && mergedInto === null) continue;
 
     // リモートにレコードが現存する場合は再作成されたものとみなし、tombstoneを無視する。
     // （削除後に同一ソースで再INSERTされたケース。削除時刻との大小に依らず存続させる）
@@ -518,6 +552,13 @@ function applyTombstones(
     if (remoteRecord) continue;
 
     const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+
+    let columns = columnCache.get(ts.tableName);
+    if (!columns) {
+      columns = getTableColumns(localDb, ts.tableName);
+      columnCache.set(ts.tableName, columns);
+    }
+
     // フォーマット差(ISO-T vs スペース形式)を吸収したLWWで削除を適用する。
     applyTombstoneDelete(
       localDb,
@@ -525,10 +566,10 @@ function applyTombstones(
       ts.tableName,
       primaryKey,
       timestampColumn,
-      getTableColumns(localDb, ts.tableName),
+      columns,
       ts.recordId,
       ts.deletedAt,
-      ts.mergedInto ?? null,
+      mergedInto,
       result
     );
   }
