@@ -1,0 +1,16 @@
+{
+  // テストコードの型チェック専用の設定。
+  //
+  // vitest は esbuild で変換するだけで型を見ないため、`tsconfig.json`（`__tests__` を
+  // exclude、`dist/` を出力する本番用）だけではテストの型エラーが誰にも検出されない。
+  // `npm run typecheck` からこちらを使い、src とテストをまとめて検査する。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "rootDir": ".",
+    // vitest.config.mts の `globals: true` で生える describe/it/expect などを認識させる
+    "types": ["vitest/globals", "node"]
+  },
+  "include": ["src/**/*", "__tests__/**/*", "vitest.config.mts"]
+}
