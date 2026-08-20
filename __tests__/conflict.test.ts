@@ -103,6 +103,127 @@ describe('conflict', () => {
     });
   });
 
+  describe('applyInsert: 敗者行の子の引き取り', () => {
+    const orderColumns = ['id', 'userId', 'label', 'updatedAt'];
+
+    beforeEach(() => {
+      db.exec(`
+        CREATE TABLE orders (
+          id        TEXT PRIMARY KEY,
+          userId    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          label     TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+    });
+
+    it('トランザクションの外から呼んでも、敗者の子が勝者へ付け替えられる', () => {
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+      db.prepare(
+        `INSERT INTO orders (id, userId, label, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('o1', 'u1', '注文1', '2024-01-01T00:00:00Z');
+
+      const result = applyInsert(
+        db,
+        'users',
+        'id',
+        {
+          id: 'u2',
+          name: 'Alice Clone',
+          email: 'alice@example.com',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+        columns
+      );
+
+      expect(result.conflict?.resolution).toBe('remote_wins');
+      const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
+      expect(order.userId).toBe('u2');
+    });
+
+    it('親と主キーを共有する子（1:1）では、子のidが動いても孫が付いてくる', () => {
+      db.exec(`
+        CREATE TABLE profiles (
+          id        TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          bio       TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE TABLE profile_notes (
+          id        TEXT PRIMARY KEY,
+          profileId TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+          body      TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+      db.prepare(
+        `INSERT INTO profiles (id, bio, updatedAt) VALUES (?, ?, ?)`
+      ).run('u1', '自己紹介', '2024-01-01T00:00:00Z');
+      db.prepare(
+        `INSERT INTO profile_notes (id, profileId, body, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('n1', 'u1', 'メモ', '2024-01-01T00:00:00Z');
+
+      applyInsert(
+        db,
+        'users',
+        'id',
+        {
+          id: 'u2',
+          name: 'Alice Clone',
+          email: 'alice@example.com',
+          updatedAt: '2024-06-01T00:00:00Z',
+        },
+        columns
+      );
+
+      const profile = db.prepare(`SELECT * FROM profiles`).all() as any[];
+      expect(profile).toHaveLength(1);
+      expect(profile[0].id).toBe('u2');
+      const note = db.prepare(`SELECT * FROM profile_notes WHERE id = ?`).get('n1') as any;
+      expect(note.profileId).toBe('u2');
+    });
+
+    it('ローカルが勝った場合、あとから届く敗者の子は勝者へ向け直して挿入される', () => {
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z');
+
+      // リモートのu2は古いので採用されない（が、対応は記録される）
+      applyInsert(
+        db,
+        'users',
+        'id',
+        {
+          id: 'u2',
+          name: 'Alice Clone',
+          email: 'alice@example.com',
+          updatedAt: '2024-01-01T00:00:00Z',
+        },
+        columns
+      );
+
+      // 存在しないu2を指す子が遅れて届く
+      const result = applyInsert(
+        db,
+        'orders',
+        'id',
+        { id: 'o2', userId: 'u2', label: '注文2', updatedAt: '2024-01-01T00:00:00Z' },
+        orderColumns
+      );
+
+      expect(result.action).toBe('inserted');
+      const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o2') as any;
+      expect(order.userId).toBe('u1');
+    });
+  });
+
   describe('applyUpdate', () => {
     it('ローカルにPKが無くセカンダリUNIQUE違反になる場合も競合解決される', () => {
       db.prepare(
