@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { applyInsert, applyUpdate, applyDelete } from '../src/conflict';
+import { setupChangelog } from '../src/setup';
 
 describe('conflict', () => {
   let db: Database.Database;
@@ -221,6 +222,106 @@ describe('conflict', () => {
       expect(result.action).toBe('inserted');
       const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o2') as any;
       expect(order.userId).toBe('u1');
+    });
+  });
+
+  describe('畳み先の記録', () => {
+    const orderColumns = ['id', 'userId', 'label', 'updatedAt'];
+
+    beforeEach(() => {
+      db.exec(`
+        CREATE TABLE orders (
+          id        TEXT PRIMARY KEY,
+          userId    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          label     TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      // _tombstone / _changelog / トリガーを実際の形で用意する
+      setupChangelog(db, [{ name: 'users' }, { name: 'orders' }], 'id');
+    });
+
+    function insertUser(id: string, updatedAt: string): void {
+      db.prepare(
+        `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
+      ).run(id, id, 'alice@example.com', updatedAt);
+    }
+
+    function foldIn(id: string, updatedAt: string): void {
+      applyInsert(
+        db,
+        'users',
+        'id',
+        { id, name: id, email: 'alice@example.com', updatedAt },
+        columns
+      );
+    }
+
+    function idMerges(): string[] {
+      return (
+        db
+          .prepare(`SELECT losingId, winningId FROM _id_merge ORDER BY losingId`)
+          .all() as { losingId: string; winningId: string }[]
+      ).map((merge) => `${merge.losingId}->${merge.winningId}`);
+    }
+
+    function tombstoneMerges(): string[] {
+      return (
+        db
+          .prepare(
+            `SELECT recordId, mergedInto FROM _tombstone ORDER BY recordId`
+          )
+          .all() as { recordId: string; mergedInto: string | null }[]
+      ).map((tombstone) => `${tombstone.recordId}->${tombstone.mergedInto ?? 'null'}`);
+    }
+
+    it('畳み先が更に畳まれたら、記録は終端へ張り替えられる（鎖にしない）', () => {
+      insertUser('u-bbb', '2024-01-01T00:00:00Z');
+      foldIn('u-aaa', '2024-06-01T00:00:00Z'); // bbb → aaa
+      foldIn('u-ccc', '2024-12-01T00:00:00Z'); // aaa → ccc
+
+      // u-bbb → u-aaa の鎖が残らず、どちらも終端の u-ccc を指す
+      expect(idMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc']);
+      expect(tombstoneMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc']);
+
+      // 最初の敗者を指す子も、1段で終端へ届く
+      applyInsert(
+        db,
+        'orders',
+        'id',
+        { id: 'o1', userId: 'u-bbb', label: '注文1', updatedAt: '2024-01-01T00:00:00Z' },
+        orderColumns
+      );
+      const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
+      expect(order.userId).toBe('u-ccc');
+    });
+
+    it('畳む向きが反転しても、自分自身を指す記録が残らない', () => {
+      insertUser('u-aaa', '2024-06-01T00:00:00Z');
+      // 古い u-bbb が届く → ローカルが勝ち、u-bbb → u-aaa を記録する
+      foldIn('u-bbb', '2024-01-01T00:00:00Z');
+      expect(idMerges()).toEqual(['u-bbb->u-aaa']);
+
+      // その後 u-bbb に、畳みより新しい更新が届く → 向きが反転して u-aaa が畳まれる
+      foldIn('u-bbb', '2099-01-01T00:00:00Z');
+
+      expect(
+        db.prepare(`SELECT id FROM users`).all() as { id: string }[]
+      ).toEqual([{ id: 'u-bbb' }]);
+      // u-bbb->u-bbb のような自分自身を指す記録は残さない
+      expect(idMerges()).toEqual(['u-aaa->u-bbb']);
+      expect(tombstoneMerges()).toEqual(['u-aaa->u-bbb', 'u-bbb->null']);
+
+      // 反転後の敗者を指す子も、生き残った側へ向く
+      applyInsert(
+        db,
+        'orders',
+        'id',
+        { id: 'o1', userId: 'u-aaa', label: '注文1', updatedAt: '2024-06-01T00:00:00Z' },
+        orderColumns
+      );
+      const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
+      expect(order.userId).toBe('u-bbb');
     });
   });
 

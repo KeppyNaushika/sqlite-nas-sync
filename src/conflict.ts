@@ -280,6 +280,58 @@ function recordTombstoneMerge(
 }
 
 /**
+ * 敗者行をローカルに持っていない側（`local_wins`）で畳みを記録する。
+ *
+ * この側では敗者行のDELETEが起きないため、DELETEトリガーによる `_changelog` の記録も
+ * 生まれない。それでは畳み先が**フルマージ経路でしか**他クライアントに渡らないが、
+ * 隙間（{@link hasChangelogGap}）ができるのは保持期間を超えて同期しなかった端末だけなので、
+ * **行儀よく毎日同期している端末ほど受け取れない**という逆転になる。
+ * そこで `_changelog` へ DELETE を1行だけ手書きし、通常の差分経路にも乗せる。
+ *
+ * `_changelog` は既に「自分が自分の行に行った操作の記録」ではない
+ * （{@link mergeChangelog} が相手のエントリをそのまま自分の changelog へ複製する）ので、
+ * 持っていない行のエントリが載ること自体は元から起きている。
+ *
+ * `changedAt` は tombstone の `deletedAt` に揃える（受け取った側のLWWの判断がぶれないように）。
+ * 既に同じ畳みを知っていれば書かない（同じエントリが増え続けないように）。
+ * @internal
+ */
+function recordMergeWithoutLocalRow(
+  db: Database.Database,
+  tableName: string,
+  losingId: string,
+  winningId: string
+): void {
+  // 参照する前に用意する（`_id_merge` がまだ無いDBでも動くように）
+  ensureIdMergeTable(db);
+  const alreadyRecorded = lookupIdMerge(db, tableName, losingId) === winningId;
+  recordMerge(db, tableName, losingId, winningId);
+  if (alreadyRecorded) return;
+
+  const hasChangelog = db
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_changelog'`
+    )
+    .get();
+  if (!hasChangelog) return;
+
+  // tombstone を書けていない場合は畳み先も伝わらないので、削除だけを伝えない
+  // （畳み先の無い削除として届くと、受け取った側で子が道連れになる）
+  const tombstone = db
+    .prepare(
+      `SELECT deletedAt FROM _tombstone
+       WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
+    )
+    .get(tableName, losingId) as { deletedAt: string } | undefined;
+  if (!tombstone) return;
+
+  db.prepare(
+    `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+     VALUES (?, ?, 'DELETE', ?)`
+  ).run(tableName, losingId, String(tombstone.deletedAt));
+}
+
+/**
  * `_id_merge` に1件でも記録があるか。
  *
  * 競合が一度も起きていないDB（大多数）ではここで打ち切り、外部キーの走査をしない。
@@ -990,10 +1042,12 @@ export function applyInsert(
       }
 
       // ローカルが新しい → リモート行は採用しない。
-      // ただし「リモートの敗者idはローカルのこの行に畳まれた」ことを記録する。
-      // 記録しないと、あとから届くリモート側の子が存在しない親を指したままになり、
-      // 外部キー違反でその相手ぶんの取り込みが丸ごと巻き戻る（同期が止まる）。
-      recordMerge(
+      // ただし「リモートの敗者idはローカルのこの行に畳まれた」ことを記録し、
+      // 他クライアントへも伝わるようにする（この側では敗者行のDELETEが起きないため、
+      // tombstone と changelog を手で書く）。記録しないと、あとから届くリモート側の子が
+      // 存在しない親を指したままになり、外部キー違反でその相手ぶんの取り込みが
+      // 丸ごと巻き戻る（同期が止まる）。
+      recordMergeWithoutLocalRow(
         localDb,
         tableName,
         String(pkValue),

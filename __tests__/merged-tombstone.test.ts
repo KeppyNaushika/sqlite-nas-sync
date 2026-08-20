@@ -201,6 +201,71 @@ describe('畳み先つきtombstoneの伝播', () => {
     [dbB, dbC, dbD, dbZ].forEach((db) => db.close());
   });
 
+  it('畳んだ側のDBが共有フォルダに無くても、勝った側の記録から畳み先が通常経路で届く', async () => {
+    // B: 敗者になる bbb（古い）とその子。このあと二度と現れない
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+    dbB.prepare(`INSERT INTO parents (id, ukey, updatedAt) VALUES (?, ?, ?)`).run(
+      'bbb',
+      'k1',
+      '2024-01-01T00:00:00Z'
+    );
+    dbB.prepare(
+      `INSERT INTO children (id, parentId, label, updatedAt) VALUES (?, ?, ?, ?)`
+    ).run('ch-b', 'bbb', 'Bの子', '2024-01-01T00:00:00Z');
+    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+
+    // D: bbb を持ったまま遅れる端末
+    const { db: dbD, dbPath: pathD } = createClientDb('client-d');
+    await performSync(dbD, makeConfig(pathD, 'client-d'), TABLES);
+
+    // A: 勝者 aaa（新しい）。B の bbb を受け取って local_wins で畳む。
+    // A は敗者行を一度も持たないので、A では DELETE が起きない
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+    dbA.prepare(`INSERT INTO parents (id, ukey, updatedAt) VALUES (?, ?, ?)`).run(
+      'aaa',
+      'k1',
+      '2024-06-01T00:00:00Z'
+    );
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+    // アップロードはpullより前に起きるので、畳んだ記録がNASに載るのは次の同期
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+
+    // B の共有ファイルを取り除く（DELETEトリガーによる記録はどこにも存在しない）
+    fs.rmSync(path.join(nasDir, 'client-client-b.sqlite'));
+    dbB.close();
+
+    // D は離脱中に bbb の子と無関係なメモを作る。
+    // bbb の作成記録は保持期間を過ぎて消えている（誰も bbb の存在を語らない）
+    dbD.prepare(
+      `INSERT INTO children (id, parentId, label, updatedAt) VALUES (?, ?, ?, ?)`
+    ).run('ch-d', 'bbb', 'Dの子', '2024-03-01T00:00:00Z');
+    dbD.prepare(`INSERT INTO memos (id, body, updatedAt) VALUES (?, ?, ?)`).run(
+      'memo-d',
+      '競合とは無関係な変更',
+      '2024-03-01T00:00:00Z'
+    );
+    dbD.prepare(`DELETE FROM _changelog WHERE recordId = ?`).run('bbb');
+    await performSync(dbD, makeConfig(pathD, 'client-d'), TABLES);
+
+    // C: あとから参加する端末。読める相手は A と D だけ
+    const { db: dbC, dbPath: pathC } = createClientDb('client-c');
+    const result = await performSync(dbC, makeConfig(pathC, 'client-c'), TABLES);
+
+    expect(result.warnings.filter((warning) => warning.includes('FOREIGN KEY'))).toEqual(
+      []
+    );
+    expect(result.clientsSynced).toBe(2);
+    expect(parentIdsOf(dbC)).toEqual(['aaa']);
+    expect(childrenOf(dbC)).toEqual(['ch-b->aaa', 'ch-d->aaa']);
+    expect(
+      (dbC.prepare(`SELECT id FROM memos`).all() as { id: string }[]).map((memo) => memo.id)
+    ).toEqual(['memo-d']);
+
+    dbA.close();
+    dbC.close();
+    dbD.close();
+  });
+
   it('mergedInto列を持たない旧クライアントのtombstoneも従来どおり適用できる', async () => {
     const { db: dbOld, dbPath: pathOld } = createClientDb('client-old');
     dbOld.prepare(`INSERT INTO parents (id, ukey, updatedAt) VALUES (?, ?, ?)`).run(
