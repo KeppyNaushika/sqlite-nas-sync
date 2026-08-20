@@ -32,11 +32,11 @@
     }
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
-    "@types/node": "^20.14.0",
-    "typedoc": "^0.28.16",
-    "typescript": "^5.4.5",
-    "vitest": "^3.0.0"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.2.0",
+    "typedoc": "^0.28.20",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
   },
   "files": [
     "dist",
