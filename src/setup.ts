@@ -76,6 +76,19 @@ export function setupChangelog(
     )
   `);
 
+  // _id_merge テーブル（セカンダリUNIQUE違反を畳んだ「敗者id → 勝者id」の記録）。
+  // 自分が勝った側のクライアントには敗者行が入らないため、あとから届く相手の子が
+  // 存在しない親を指す。この記録を使って外部キーを勝者へ向け直す。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _id_merge (
+      tableName TEXT NOT NULL,
+      losingId  TEXT NOT NULL,
+      winningId TEXT NOT NULL,
+      mergedAt  TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (tableName, losingId)
+    )
+  `);
+
   // _heartbeat テーブル（changelog延命用）
   db.exec(`
     CREATE TABLE IF NOT EXISTS _heartbeat (

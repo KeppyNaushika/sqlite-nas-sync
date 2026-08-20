@@ -630,6 +630,14 @@ function pullNormal(
       // 適用と lastSeenId 更新を 1 つのトランザクションで原子的に。
       // ここで例外が出れば全てロールバックされ、次回 sync で同じ差分を再試行できる。
       const transaction = localDb.transaction(() => {
+        // 外部キーの検査をトランザクション終端まで遅らせる。
+        // changelogのエントリは「変更が起きた順」に並ぶが、レコードの中身はリモートの
+        // 「現在の姿」を読むため、親より先に子が現れることがある（競合解決で子が
+        // 別の親へ付け替えられた場合など）。1文ずつ検査すると、その順序だけで
+        // 取り込み全体が巻き戻り、その相手からの同期が永久に止まる。
+        // 制約を切るのではなく検査を遅らせるだけなので、COMMIT時に矛盾が残っていれば
+        // 通常どおり失敗する。この pragma はCOMMIT/ROLLBACKで自動的に戻る。
+        localDb.pragma('defer_foreign_keys = ON');
         processChangelogEntries(
           localDb,
           remoteDb,
@@ -714,6 +722,10 @@ function pullFullMerge(
         // 次回 sync で同じギャップが再検出されてやり直せる。
         // これがないと、changelogが膨張したまま lastSeenId が更新されず、毎回ループする。
         const transaction = localDb.transaction(() => {
+          // 外部キーの検査をトランザクション終端まで遅らせる（pullNormal と同じ理由。
+          // フルマージはテーブル名順に全行を流し込むため、親より先に子を入れる場面が
+          // 通常フローよりさらに多い）。
+          localDb.pragma('defer_foreign_keys = ON');
           performFullMergeData(localDb, remoteDb, tables, primaryKey, result);
           applyTombstones(localDb, remoteDb, tables, primaryKey, result);
           mergeChangelog(localDb, remoteDb, retentionDays);
