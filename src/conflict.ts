@@ -85,6 +85,64 @@ function isSameIdentifier(a: string, b: string): boolean {
 }
 
 /**
+ * DB接続ごとに「スキーマから導かれる情報」を覚えておく（`PRAGMA` の往復を減らす）。
+ *
+ * 畳みが一度でも起きたDBでは {@link remapMergedForeignKeys} が毎回の
+ * {@link applyInsert}/{@link applyUpdate} から外部キーを走査し、
+ * {@link findReferencingForeignKeys} に至っては畳み1回ごとにDB内の全テーブルへ
+ * `PRAGMA` を投げる。同期の最中にスキーマは変わらないので使い回せる。
+ *
+ * 世代の判定には `PRAGMA schema_version`（SQLiteがスキーマ変更のたびに進める値）を使う。
+ * 利用者側のマイグレーションでもフルマージ中のトリガー付け外しでも進むため、
+ * 古い形のまま答え続けることはない。
+ * @internal
+ */
+const schemaCache = new WeakMap<
+  Database.Database,
+  { schemaVersion: number; entries: Map<string, unknown> }
+>();
+
+/**
+ * スキーマが変わっていない間だけ結果を使い回す。
+ * @internal
+ */
+function cachedBySchema<T>(
+  db: Database.Database,
+  key: string,
+  compute: () => T
+): T {
+  const schemaVersion = db.pragma('schema_version', {
+    simple: true,
+  }) as number;
+
+  let cache = schemaCache.get(db);
+  if (!cache || cache.schemaVersion !== schemaVersion) {
+    cache = { schemaVersion, entries: new Map<string, unknown>() };
+    schemaCache.set(db, cache);
+  }
+
+  if (cache.entries.has(key)) return cache.entries.get(key) as T;
+  const value = compute();
+  cache.entries.set(key, value);
+  return value;
+}
+
+/**
+ * テーブルが存在するか。
+ *
+ * 同期用の内部テーブル（`_changelog` / `_tombstone` など）は、利用者のDBが
+ * `setupChangelog` を通していない場合や、旧バージョン由来の場合に無い。触る前に確かめる。
+ * @internal
+ */
+function hasTable(db: Database.Database, tableName: string): boolean {
+  return (
+    db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?`)
+      .get(tableName) !== undefined
+  );
+}
+
+/**
  * 指定テーブルが宣言している外部キー（＝このテーブルから他テーブルへの参照）を返す。
  * @internal
  */
@@ -93,29 +151,35 @@ function readForeignKeys(
   childTable: string,
   primaryKey: string
 ): ForeignKeyRef[] {
-  const rows = db
-    .prepare(`PRAGMA foreign_key_list(${escapeIdentifier(childTable)})`)
-    .all() as ForeignKeyListRow[];
+  return cachedBySchema(
+    db,
+    `fk:${childTable.toLowerCase()}:${primaryKey}`,
+    () => {
+      const rows = db
+        .prepare(`PRAGMA foreign_key_list(${escapeIdentifier(childTable)})`)
+        .all() as ForeignKeyListRow[];
 
-  const byId = new Map<number, ForeignKeyRef>();
-  for (const row of rows) {
-    const existing = byId.get(row.id);
-    const column = {
-      childColumn: row.from,
-      // `to` が null のときは親の主キーを指す
-      parentColumn: row.to ?? primaryKey,
-    };
-    if (existing) {
-      existing.columns.push(column);
-    } else {
-      byId.set(row.id, {
-        childTable,
-        parentTable: row.table,
-        columns: [column],
-      });
+      const byId = new Map<number, ForeignKeyRef>();
+      for (const row of rows) {
+        const existing = byId.get(row.id);
+        const column = {
+          childColumn: row.from,
+          // `to` が null のときは親の主キーを指す
+          parentColumn: row.to ?? primaryKey,
+        };
+        if (existing) {
+          existing.columns.push(column);
+        } else {
+          byId.set(row.id, {
+            childTable,
+            parentTable: row.table,
+            columns: [column],
+          });
+        }
+      }
+      return Array.from(byId.values());
     }
-  }
-  return Array.from(byId.values());
+  );
 }
 
 /**
@@ -130,21 +194,27 @@ function findReferencingForeignKeys(
   parentTable: string,
   primaryKey: string
 ): ForeignKeyRef[] {
-  const tables = db
-    .prepare(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
-    )
-    .all() as { name: string }[];
+  return cachedBySchema(
+    db,
+    `refs:${parentTable.toLowerCase()}:${primaryKey}`,
+    () => {
+      const tables = db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+        )
+        .all() as { name: string }[];
 
-  const refs: ForeignKeyRef[] = [];
-  for (const { name } of tables) {
-    for (const foreignKey of readForeignKeys(db, name, primaryKey)) {
-      if (isSameIdentifier(foreignKey.parentTable, parentTable)) {
-        refs.push(foreignKey);
+      const refs: ForeignKeyRef[] = [];
+      for (const { name } of tables) {
+        for (const foreignKey of readForeignKeys(db, name, primaryKey)) {
+          if (isSameIdentifier(foreignKey.parentTable, parentTable)) {
+            refs.push(foreignKey);
+          }
+        }
       }
+      return refs;
     }
-  }
-  return refs;
+  );
 }
 
 /**
@@ -152,10 +222,12 @@ function findReferencingForeignKeys(
  * @internal
  */
 function getTableColumns(db: Database.Database, tableName: string): string[] {
-  const columns = db
-    .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-    .all() as ColumnInfo[];
-  return columns.map((column) => column.name);
+  return cachedBySchema(db, `cols:${tableName.toLowerCase()}`, () => {
+    const columns = db
+      .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
+      .all() as ColumnInfo[];
+    return columns.map((column) => column.name);
+  });
 }
 
 /**
@@ -201,13 +273,18 @@ function ensureIdMergeTable(db: Database.Database): void {
  *
  * 既存の記録が今回の敗者を勝者として指していた場合は、その記録も終端（今回の勝者）へ
  * 張り替える。こうすることで参照は常に1段で解決でき、鎖をたどる必要が無い。
+ *
+ * @param foldedAt - 畳みが決まった時刻。`_tombstone.deletedAt` に使う。
+ *   敗者行の削除が実際には起きていない経路では**勝者行のタイムスタンプ**を渡すこと
+ *   （理由は {@link recordTombstoneMerge}）。省略時は現在時刻。
  * @internal
  */
 function recordMerge(
   db: Database.Database,
   tableName: string,
   losingId: string,
-  winningId: string
+  winningId: string,
+  foldedAt?: string
 ): void {
   if (losingId === winningId) return;
   ensureIdMergeTable(db);
@@ -229,7 +306,7 @@ function recordMerge(
     `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = winningId`
   ).run(tableName);
 
-  recordTombstoneMerge(db, tableName, losingId, winningId);
+  recordTombstoneMerge(db, tableName, losingId, winningId, foldedAt);
 }
 
 /**
@@ -239,10 +316,18 @@ function recordMerge(
  *   トリガーは `INSERT OR REPLACE` なので、**削除より後に**呼ぶこと。
  * - `local_wins`（敗者行を持っていない側）— 削除が起きないので行ごと新しく書く。
  *   敗者idは全クライアントで永久に死んでいるため、tombstoneとして正しい。
- *   結果として {@link isShadowedByTombstone} がその id の復活を止めるが、
- *   復活しても同じユニークキーで再び衝突するだけなので意図した振る舞いである。
  *
- * `deletedAt` には触れない（削除時刻の判定は既存のLWWのまま）。
+ * `foldedAt` には「畳みが決まった時刻」を入れる（省略時は現在時刻）。
+ * **敗者行の削除が実際には起きていない経路では、勝者行のタイムスタンプを渡すこと。**
+ * 現在時刻を刻むと、実データの `updatedAt` は必ずそれより過去なので
+ * {@link isShadowedByTombstone} がその id の到着を無条件に止め、ユニークキーが変わって
+ * もう衝突しなくなった行まで黙って捨てることになる。勝者のタイムスタンプなら
+ * 「畳みに負けた版より新しいものだけ通す」というLWWそのものの意味になる。
+ *
+ * 既存の行があれば `deletedAt` は**新しい方へ進める**。畳みは今下した判断なので、
+ * 昔の削除記録（消えたあと再作成された行など）の古い時刻が残っていると、
+ * 受け取った側のLWWがこの畳みを「古い決定」として捨ててしまう。
+ *
  * `_tombstone` を持たないDBでは何もしない。
  * @internal
  */
@@ -250,14 +335,10 @@ function recordTombstoneMerge(
   db: Database.Database,
   tableName: string,
   losingId: string,
-  winningId: string
+  winningId: string,
+  foldedAt?: string
 ): void {
-  const hasTombstone = db
-    .prepare(
-      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
-    )
-    .get();
-  if (!hasTombstone) return;
+  if (!hasTable(db, '_tombstone')) return;
   ensureTombstoneMergedIntoColumn(db);
 
   // 畳み先の鎖を作らない（`_id_merge` と同じ扱い）
@@ -266,11 +347,22 @@ function recordTombstoneMerge(
      WHERE tableName = ? COLLATE NOCASE AND mergedInto = ?`
   ).run(winningId, tableName, losingId);
 
+  // 時刻の大小はフォーマット差（ISO-T vs スペース形式）を吸収するため julianday で見る。
+  // 解析できない値のときだけ文字列比較へ落とす（{@link isLaterTimestamp} と同じ方針）。
   db.prepare(
     `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
-     VALUES (?, ?, datetime('now'), ?)
-     ON CONFLICT(tableName, recordId) DO UPDATE SET mergedInto = excluded.mergedInto`
-  ).run(tableName, losingId, winningId);
+     VALUES (?, ?, COALESCE(?, datetime('now')), ?)
+     ON CONFLICT(tableName, recordId) DO UPDATE SET
+       mergedInto = excluded.mergedInto,
+       deletedAt = CASE
+         WHEN COALESCE(
+                julianday(excluded.deletedAt) > julianday(_tombstone.deletedAt),
+                excluded.deletedAt > _tombstone.deletedAt
+              )
+         THEN excluded.deletedAt
+         ELSE _tombstone.deletedAt
+       END`
+  ).run(tableName, losingId, foldedAt ? foldedAt : null, winningId);
 
   // 自分自身を指す畳み先は意味を持たない（畳む向きが反転したときに生まれる）
   db.prepare(
@@ -280,55 +372,112 @@ function recordTombstoneMerge(
 }
 
 /**
+ * `_changelog` の現在の最大id。`_changelog` を持たないDBでは null。
+ * @internal
+ */
+function maxChangelogId(db: Database.Database): number | null {
+  if (!hasTable(db, '_changelog')) return null;
+  const row = db.prepare(`SELECT MAX(id) AS maxId FROM _changelog`).get() as {
+    maxId: number | null;
+  };
+  return row.maxId ?? 0;
+}
+
+/**
+ * `_changelog` に、そのレコードのDELETEが載っているか。
+ *
+ * @param sinceId - 指定するとそのidより後のエントリだけを数える。「今起こした削除で
+ *   トリガーが記録したか」を見るときに使う（ずっと前の削除と取り違えないように）。
+ * @internal
+ */
+function hasChangelogDelete(
+  db: Database.Database,
+  tableName: string,
+  recordId: string,
+  sinceId: number = 0
+): boolean {
+  if (!hasTable(db, '_changelog')) return false;
+  const row = db
+    .prepare(
+      `SELECT 1 FROM _changelog
+       WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+         AND operation = 'DELETE' AND id > ?`
+    )
+    .get(tableName, recordId, sinceId);
+  return row !== undefined;
+}
+
+/**
+ * 畳んで消えたidのDELETEを `_changelog` へ手で書く。
+ *
+ * 畳みは**通常の差分経路にも乗せる**必要がある。フルマージ（changelogの隙間を検出した
+ * ときの経路）でしか渡らないと、隙間ができるのは保持期間を超えて同期しなかった端末だけ
+ * なので、**行儀よく毎日同期している端末ほど受け取れない**という逆転になる。
+ *
+ * `_changelog` は既に「自分が自分の行に行った操作の記録」ではない
+ * （フルマージが相手のエントリをそのまま自分の changelog へ複製する）ので、
+ * 自分が持っていない行のエントリが載ること自体は元から起きている。
+ *
+ * `changedAt` は「記録した今」にする（トリガーと同じ）。畳みの時刻を入れると、それが
+ * 保持期間より古いときに**生まれた直後の掃除で消え、二度と載らない**。受け取る側のLWWは
+ * `_changelog.changedAt` ではなく `_tombstone.deletedAt` を見るので、判断はぶれない。
+ *
+ * tombstone を書けていない場合は書かない（畳み先の無い削除として届くと、
+ * 受け取った側で子が道連れになる）。
+ * @internal
+ */
+function writeFoldDeletion(
+  db: Database.Database,
+  tableName: string,
+  losingId: string
+): void {
+  if (!hasTable(db, '_changelog')) return;
+  if (!hasTable(db, '_tombstone')) return;
+
+  const tombstone = db
+    .prepare(
+      `SELECT 1 FROM _tombstone
+       WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
+    )
+    .get(tableName, losingId);
+  if (!tombstone) return;
+
+  db.prepare(
+    `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+     VALUES (?, ?, 'DELETE', datetime('now'))`
+  ).run(tableName, losingId);
+}
+
+/**
  * 敗者行をローカルに持っていない側（`local_wins`）で畳みを記録する。
  *
  * この側では敗者行のDELETEが起きないため、DELETEトリガーによる `_changelog` の記録も
- * 生まれない。それでは畳み先が**フルマージ経路でしか**他クライアントに渡らないが、
- * 隙間（{@link hasChangelogGap}）ができるのは保持期間を超えて同期しなかった端末だけなので、
- * **行儀よく毎日同期している端末ほど受け取れない**という逆転になる。
- * そこで `_changelog` へ DELETE を1行だけ手書きし、通常の差分経路にも乗せる。
+ * 生まれない。{@link writeFoldDeletion} で1行だけ手書きし、通常の差分経路にも乗せる。
  *
- * `_changelog` は既に「自分が自分の行に行った操作の記録」ではない
- * （{@link mergeChangelog} が相手のエントリをそのまま自分の changelog へ複製する）ので、
- * 持っていない行のエントリが載ること自体は元から起きている。
- *
- * `changedAt` は tombstone の `deletedAt` に揃える（受け取った側のLWWの判断がぶれないように）。
- * 既に同じ畳みを知っていれば書かない（同じエントリが増え続けないように）。
+ * @param winningTimestamp - 勝ち残ったローカル行のタイムスタンプ。tombstone の
+ *   `deletedAt` に使う（理由は {@link recordTombstoneMerge}）。
  * @internal
  */
 function recordMergeWithoutLocalRow(
   db: Database.Database,
   tableName: string,
   losingId: string,
-  winningId: string
+  winningId: string,
+  winningTimestamp?: string
 ): void {
   // 参照する前に用意する（`_id_merge` がまだ無いDBでも動くように）
   ensureIdMergeTable(db);
   const alreadyRecorded = lookupIdMerge(db, tableName, losingId) === winningId;
-  recordMerge(db, tableName, losingId, winningId);
-  if (alreadyRecorded) return;
 
-  const hasChangelog = db
-    .prepare(
-      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_changelog'`
-    )
-    .get();
-  if (!hasChangelog) return;
+  recordMerge(db, tableName, losingId, winningId, winningTimestamp);
 
-  // tombstone を書けていない場合は畳み先も伝わらないので、削除だけを伝えない
-  // （畳み先の無い削除として届くと、受け取った側で子が道連れになる）
-  const tombstone = db
-    .prepare(
-      `SELECT deletedAt FROM _tombstone
-       WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
-    )
-    .get(tableName, losingId) as { deletedAt: string } | undefined;
-  if (!tombstone) return;
+  // 同じエントリが増え続けないように、既に公開済みなら書かない。
+  // 「`_id_merge` に記録済み」だけを根拠にはしない — 記録が残ったまま `_changelog` の側が
+  // 掃除で消えていたり、`_changelog` がまだ無いDBで記録だけ先に入っていたりして、
+  // それだと畳みが二度と差分経路に載らなくなる。
+  if (alreadyRecorded && hasChangelogDelete(db, tableName, losingId)) return;
 
-  db.prepare(
-    `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
-     VALUES (?, ?, 'DELETE', ?)`
-  ).run(tableName, losingId, String(tombstone.deletedAt));
+  writeFoldDeletion(db, tableName, losingId);
 }
 
 /**
@@ -338,12 +487,7 @@ function recordMergeWithoutLocalRow(
  * @internal
  */
 function hasIdMerges(db: Database.Database): boolean {
-  const exists = db
-    .prepare(
-      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_id_merge'`
-    )
-    .get();
-  if (!exists) return false;
+  if (!hasTable(db, '_id_merge')) return false;
   return db.prepare(`SELECT 1 FROM _id_merge LIMIT 1`).get() !== undefined;
 }
 
@@ -526,6 +670,7 @@ function repointChild(
   });
 
   const runRepoint = (): void => {
+    const changelogIdBefore = maxChangelogId(db) ?? 0;
     updateStatement.run(...winningValues, childRow[primaryKey]);
 
     // 親と主キーを共有する1:1のテーブルでは、外部キーが主キーそのものなので
@@ -543,6 +688,19 @@ function repointChild(
         folded
       );
       recordMerge(db, foreignKey.childTable, previousId, nextId);
+
+      // idが動いた＝古いidの行はもうどこにも無い。UPDATEトリガーが残すのは新しいidの
+      // UPDATEだけなので、「古いid → 新しいid」の畳みは自分で差分経路へ載せる。
+      if (
+        !hasChangelogDelete(
+          db,
+          foreignKey.childTable,
+          previousId,
+          changelogIdBefore
+        )
+      ) {
+        writeFoldDeletion(db, foreignKey.childTable, previousId);
+      }
     }
   };
 
@@ -622,7 +780,9 @@ function repointChild(
  *
  * 1. 敗者を指している子を勝者へ付け替える（先に消すとカスケードで道連れになる）
  * 2. 敗者行を削除する
- * 3. 「敗者id → 勝者id」を `_id_merge` に記録する
+ * 3. 「敗者id → 勝者id」を `_id_merge` と `_tombstone.mergedInto` に記録する
+ * 4. 畳みが `_changelog` に載っていなければ載せる（フルマージ中はトリガーが外れていて、
+ *    2. のDELETEが何も記録しないため）
  *
  * **勝者行はこの時点でまだ存在していなくてよい。** 呼び出し元が外部キーの検査を
  * トランザクション終端まで遅延させているため（{@link foldAndReplace} を参照）。
@@ -648,26 +808,40 @@ function foldRowInto(
   const winningId = String(winningRow[primaryKey]);
   if (losingId === winningId) return;
 
-  // 自己参照する外部キーがあると同じ行へ戻ってくる可能性があるため、一度畳んだ行は畳まない
+  // 自己参照する外部キーがあると同じ行へ戻ってくる可能性があるため、
+  // **子の付け替えだけ**は繰り返さない（無限再帰になる）。
+  // 削除と記録は再入のたびに行う — ここへ再入するのは「この行は消える」と二度決まった
+  // ときであり、何もせず戻ると、畳まれて消える親を指したままの子が残って
+  // COMMIT時に外部キー違反になる（その相手ぶんの取り込みが丸ごと巻き戻る）。
   const marker = `${tableName.toLowerCase()}:${losingId}`;
-  if (folded.has(marker)) return;
+  const revisited = folded.has(marker);
   folded.add(marker);
 
-  repointChildren(
-    db,
-    tableName,
-    primaryKey,
-    losingRow,
-    winningRow,
-    timestampColumn,
-    folded
-  );
+  if (!revisited) {
+    repointChildren(
+      db,
+      tableName,
+      primaryKey,
+      losingRow,
+      winningRow,
+      timestampColumn,
+      folded
+    );
+  }
+
+  const changelogIdBefore = maxChangelogId(db) ?? 0;
 
   db.prepare(
     `DELETE FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
   ).run(losingRow[primaryKey]);
 
   recordMerge(db, tableName, losingId, winningId);
+
+  // 通常はいま起こしたDELETEでトリガーが `_changelog` に記録している。フルマージは
+  // トリガーを外して走るのでそれが無く、畳みが差分経路に載らないまま埋もれる。手で書く。
+  if (!hasChangelogDelete(db, tableName, losingId, changelogIdBefore)) {
+    writeFoldDeletion(db, tableName, losingId);
+  }
 }
 
 /**
@@ -742,14 +916,18 @@ function runDeferringForeignKeys(
  * 入れ替える。それも無い場合は**敗者行を消さない** — 消すと子が道連れになるためで、
  * 勝者行が届いた時点でセカンダリUNIQUE違反の解決が同じ畳みを行う。
  *
+ * 敗者行に後から入った属性は勝者に取り込まれない（「勝者が総取り」の既知の穴のまま）。
+ *
  * @param losingId - 畳まれて消えた側のid（`_tombstone.recordId`）
  * @param winningId - 畳み先のid（`_tombstone.mergedInto`）
  * @param winningRow - リモートから読んだ畳み先の行。読めなければ undefined
- * 削除時刻のLWW（`deletedAt` vs `updatedAt`）は**見ない**。畳まれた行はどの端末でも
- * 永久に死んでおり、蘇らせても同じユニークキーで再び衝突するだけだからである。
- * 敗者行に後から入った属性は勝者に取り込まれない（「勝者が総取り」の既知の穴のまま）。
- *
  * @param columns - ローカルテーブルのカラム名配列
+ * @param foldedAt - 畳みが決まった時刻（`_tombstone.deletedAt`）。渡すと、ローカルの
+ *   敗者行がそれより後に更新されている場合はこの畳みを適用しない。畳みは削除ではなく
+ *   ユニーク制約が強制する統合なので、**衝突していた版**より新しい行にまで及ばせては
+ *   いけない（例: 敗者行のユニークキーがその後変更され、もう衝突しない場合）。
+ *   見送ってもデータは失われず、その行を送り返した時点で相手側が同じLWWを
+ *   今度は逆向きに適用して収束する。
  * @returns 畳んだか（`folded`）、何もしなかったか（`skipped`）
  * @internal
  */
@@ -761,18 +939,34 @@ export function applyMergedDelete(
   winningId: string,
   winningRow: Record<string, unknown> | undefined,
   columns: string[],
-  timestampColumn: string = 'updatedAt'
+  timestampColumn: string = 'updatedAt',
+  foldedAt?: string
 ): { action: 'folded' | 'skipped' } {
-  // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
-  // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
-  recordMerge(localDb, tableName, losingId, winningId);
-
   const escapedTable = escapeIdentifier(tableName);
   const escapedPk = escapeIdentifier(primaryKey);
 
   const losingRow = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
     .get(losingId) as Record<string, unknown> | undefined;
+
+  // 敗者行がこの畳みより後に更新されていれば、畳みは既に古い判断である。
+  // `_id_merge` にも書かない（行が生きているので、その子は今のままで正しい）。
+  if (
+    losingRow &&
+    foldedAt &&
+    isLaterTimestamp(
+      localDb,
+      String(losingRow[timestampColumn] ?? ''),
+      foldedAt
+    )
+  ) {
+    return { action: 'skipped' };
+  }
+
+  // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
+  // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
+  recordMerge(localDb, tableName, losingId, winningId, foldedAt);
+
   if (!losingRow) return { action: 'skipped' };
 
   const localWinningRow = localDb
@@ -854,12 +1048,7 @@ export function isShadowedByTombstone(
   recordId: string,
   recordTimestamp: string
 ): boolean {
-  const hasTombstone = localDb
-    .prepare(
-      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
-    )
-    .get();
-  if (!hasTombstone) return false;
+  if (!hasTable(localDb, '_tombstone')) return false;
 
   const ts = localDb
     .prepare(
@@ -887,7 +1076,7 @@ export function isShadowedByTombstone(
  * @param localDb - ローカルSQLiteデータベース接続
  * @param tableName - 対象テーブル名
  * @param primaryKey - 主キーカラム名
- * @param record - 挿入するリモートレコード
+ * @param remoteRecord - 挿入するリモートレコード
  * @param columns - テーブルのカラム名配列
  * @returns 実行されたアクション（`inserted` / `upserted` / `skipped`）と競合情報
  * @throws UNIQUE制約以外のSQLiteエラー
@@ -1051,7 +1240,8 @@ export function applyInsert(
         localDb,
         tableName,
         String(pkValue),
-        String(conflictRow[primaryKey])
+        String(conflictRow[primaryKey]),
+        localUpdatedAt
       );
 
       return {

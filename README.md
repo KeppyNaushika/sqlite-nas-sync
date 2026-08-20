@@ -132,7 +132,7 @@ model Post {
 | オプション | 型 | デフォルト | 説明 |
 |----------|-----|----------|------|
 | `timestampColumn` | `string` | `'updatedAt'` | LWW比較に使うタイムスタンプカラム名 |
-| `deleteProtected` | `boolean` | `false` | trueの場合、DELETE操作を適用しない |
+| `deleteProtected` | `boolean` | `false` | trueの場合、DELETE操作を適用しない（※ユニーク制約の競合で行が1行に統合される「畳み」は対象外） |
 
 ### `discoverTables(db, options?): TableConfig[]`
 
