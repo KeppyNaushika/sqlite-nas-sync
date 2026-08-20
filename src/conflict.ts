@@ -7,6 +7,7 @@
  */
 import Database from 'better-sqlite3';
 import { ConflictInfo } from './types';
+import { ensureTombstoneMergedIntoColumn } from './setup';
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
@@ -195,13 +196,14 @@ function ensureIdMergeTable(db: Database.Database): void {
 }
 
 /**
- * 「敗者id → 勝者id」を `_id_merge` に記録する。
+ * 「敗者id → 勝者id」を、ローカル索引 `_id_merge` と、他クライアントへ伝わる
+ * `_tombstone.mergedInto` の両方に記録する。
  *
  * 既存の記録が今回の敗者を勝者として指していた場合は、その記録も終端（今回の勝者）へ
  * 張り替える。こうすることで参照は常に1段で解決でき、鎖をたどる必要が無い。
  * @internal
  */
-function recordIdMerge(
+function recordMerge(
   db: Database.Database,
   tableName: string,
   losingId: string,
@@ -220,6 +222,61 @@ function recordIdMerge(
      ON CONFLICT(tableName, losingId)
      DO UPDATE SET winningId = excluded.winningId, mergedAt = datetime('now')`
   ).run(tableName, losingId, winningId);
+
+  // 畳む向きが後から反転した場合（敗者idの方に新しい更新が届き、勝者を畳んだ場合）、
+  // 上の張り替えで自分自身を指す記録が生まれる。意味を持たないので捨てる。
+  db.prepare(
+    `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = winningId`
+  ).run(tableName);
+
+  recordTombstoneMerge(db, tableName, losingId, winningId);
+}
+
+/**
+ * 畳み先を `_tombstone` に載せる（他クライアントへはこの列で伝わる）。
+ *
+ * - `remote_wins`（敗者行を削除した側）— DELETEトリガーが作った行に畳み先を書き込む。
+ *   トリガーは `INSERT OR REPLACE` なので、**削除より後に**呼ぶこと。
+ * - `local_wins`（敗者行を持っていない側）— 削除が起きないので行ごと新しく書く。
+ *   敗者idは全クライアントで永久に死んでいるため、tombstoneとして正しい。
+ *   結果として {@link isShadowedByTombstone} がその id の復活を止めるが、
+ *   復活しても同じユニークキーで再び衝突するだけなので意図した振る舞いである。
+ *
+ * `deletedAt` には触れない（削除時刻の判定は既存のLWWのまま）。
+ * `_tombstone` を持たないDBでは何もしない。
+ * @internal
+ */
+function recordTombstoneMerge(
+  db: Database.Database,
+  tableName: string,
+  losingId: string,
+  winningId: string
+): void {
+  const hasTombstone = db
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get();
+  if (!hasTombstone) return;
+  ensureTombstoneMergedIntoColumn(db);
+
+  // 畳み先の鎖を作らない（`_id_merge` と同じ扱い）
+  db.prepare(
+    `UPDATE _tombstone SET mergedInto = ?
+     WHERE tableName = ? COLLATE NOCASE AND mergedInto = ?`
+  ).run(winningId, tableName, losingId);
+
+  db.prepare(
+    `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+     VALUES (?, ?, datetime('now'), ?)
+     ON CONFLICT(tableName, recordId) DO UPDATE SET mergedInto = excluded.mergedInto`
+  ).run(tableName, losingId, winningId);
+
+  // 自分自身を指す畳み先は意味を持たない（畳む向きが反転したときに生まれる）
+  db.prepare(
+    `UPDATE _tombstone SET mergedInto = NULL
+     WHERE tableName = ? COLLATE NOCASE AND recordId = mergedInto`
+  ).run(tableName);
 }
 
 /**
@@ -433,7 +490,7 @@ function repointChild(
         timestampColumn,
         folded
       );
-      recordIdMerge(db, foreignKey.childTable, previousId, nextId);
+      recordMerge(db, foreignKey.childTable, previousId, nextId);
     }
   };
 
@@ -558,7 +615,7 @@ function foldRowInto(
     `DELETE FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
   ).run(losingRow[primaryKey]);
 
-  recordIdMerge(db, tableName, losingId, winningId);
+  recordMerge(db, tableName, losingId, winningId);
 }
 
 /**
@@ -581,8 +638,7 @@ function foldAndReplace(
   columns: string[],
   timestampColumn: string
 ): void {
-  const apply = (): void => {
-    db.pragma('defer_foreign_keys = ON');
+  runDeferringForeignKeys(db, () => {
     foldRowInto(
       db,
       tableName,
@@ -597,13 +653,112 @@ function foldAndReplace(
         .map((column) => escapeIdentifier(column))
         .join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
     ).run(...columns.map((column) => record[column]));
+  });
+}
+
+/**
+ * 外部キーの検査をトランザクション終端まで遅らせて処理を実行する。
+ *
+ * 既にトランザクションの中ならそこへ相乗りする（pragmaは外側のCOMMITまで効く）。
+ * トランザクションの外では pragma が効かない（文ごとに暗黙のCOMMITが起きる）ため、
+ * ここで張る。
+ * @internal
+ */
+function runDeferringForeignKeys(
+  db: Database.Database,
+  apply: () => void
+): void {
+  const run = (): void => {
+    db.pragma('defer_foreign_keys = ON');
+    apply();
   };
 
   if (db.inTransaction) {
-    apply();
+    run();
   } else {
-    db.transaction(apply)();
+    db.transaction(run)();
   }
+}
+
+/**
+ * 「この行は消えたのではなく、あの行へ畳まれた」という削除をローカルへ適用する。
+ *
+ * リモートの `_tombstone.mergedInto` から呼ばれる。敗者行を消す前に、敗者を指している
+ * 子を畳み先へ付け替えるため、**自分では競合を経験していないクライアントでも子を失わない**。
+ *
+ * 畳み先の行がローカルに無ければ `winningRow`（リモートから読んだ勝者行）を使って
+ * 入れ替える。それも無い場合は**敗者行を消さない** — 消すと子が道連れになるためで、
+ * 勝者行が届いた時点でセカンダリUNIQUE違反の解決が同じ畳みを行う。
+ *
+ * @param losingId - 畳まれて消えた側のid（`_tombstone.recordId`）
+ * @param winningId - 畳み先のid（`_tombstone.mergedInto`）
+ * @param winningRow - リモートから読んだ畳み先の行。読めなければ undefined
+ * 削除時刻のLWW（`deletedAt` vs `updatedAt`）は**見ない**。畳まれた行はどの端末でも
+ * 永久に死んでおり、蘇らせても同じユニークキーで再び衝突するだけだからである。
+ * 敗者行に後から入った属性は勝者に取り込まれない（「勝者が総取り」の既知の穴のまま）。
+ *
+ * @param columns - ローカルテーブルのカラム名配列
+ * @returns 畳んだか（`folded`）、何もしなかったか（`skipped`）
+ * @internal
+ */
+export function applyMergedDelete(
+  localDb: Database.Database,
+  tableName: string,
+  primaryKey: string,
+  losingId: string,
+  winningId: string,
+  winningRow: Record<string, unknown> | undefined,
+  columns: string[],
+  timestampColumn: string = 'updatedAt'
+): { action: 'folded' | 'skipped' } {
+  // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
+  // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
+  recordMerge(localDb, tableName, losingId, winningId);
+
+  const escapedTable = escapeIdentifier(tableName);
+  const escapedPk = escapeIdentifier(primaryKey);
+
+  const losingRow = localDb
+    .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+    .get(losingId) as Record<string, unknown> | undefined;
+  if (!losingRow) return { action: 'skipped' };
+
+  const localWinningRow = localDb
+    .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+    .get(winningId) as Record<string, unknown> | undefined;
+
+  if (localWinningRow) {
+    runDeferringForeignKeys(localDb, () => {
+      foldRowInto(
+        localDb,
+        tableName,
+        primaryKey,
+        losingRow,
+        localWinningRow,
+        timestampColumn,
+        new Set()
+      );
+    });
+    return { action: 'folded' };
+  }
+
+  if (winningRow) {
+    // 勝者行もローカルに無い → 敗者を畳んでから勝者を入れる。
+    // 勝者行の外部キーも、既に畳まれた行を指しているかもしれないので読み替える。
+    foldAndReplace(
+      localDb,
+      tableName,
+      primaryKey,
+      losingRow,
+      remapMergedForeignKeys(localDb, tableName, primaryKey, winningRow),
+      columns,
+      timestampColumn
+    );
+    return { action: 'folded' };
+  }
+
+  // 畳み先がどこにも無い → 敗者行はそのまま残す（消すと子が道連れになる）
+  return { action: 'skipped' };
 }
 
 /**
@@ -838,7 +993,7 @@ export function applyInsert(
       // ただし「リモートの敗者idはローカルのこの行に畳まれた」ことを記録する。
       // 記録しないと、あとから届くリモート側の子が存在しない親を指したままになり、
       // 外部キー違反でその相手ぶんの取り込みが丸ごと巻き戻る（同期が止まる）。
-      recordIdMerge(
+      recordMerge(
         localDb,
         tableName,
         String(pkValue),

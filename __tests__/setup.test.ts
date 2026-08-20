@@ -27,6 +27,37 @@ describe('setupChangelog', () => {
     db.close();
   });
 
+  it('v0.14.0以前のDBの _tombstone に mergedInto 列を足す（記録は保つ）', () => {
+    // 旧バージョンが作った _tombstone（mergedInto 列が無い）
+    db.exec(`
+      CREATE TABLE _tombstone (
+        tableName TEXT NOT NULL,
+        recordId  TEXT NOT NULL,
+        deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (tableName, recordId)
+      )
+    `);
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt) VALUES (?, ?, ?)`
+    ).run('users', 'u1', '2024-01-01 00:00:00');
+
+    setupChangelog(db, [{ name: 'users' }], 'id');
+
+    const columns = db.prepare(`PRAGMA table_info(_tombstone)`).all() as {
+      name: string;
+    }[];
+    expect(columns.map((column) => column.name)).toContain('mergedInto');
+
+    const row = db
+      .prepare(`SELECT * FROM _tombstone WHERE recordId = 'u1'`)
+      .get() as { deletedAt: string; mergedInto: string | null };
+    expect(row.deletedAt).toBe('2024-01-01 00:00:00');
+    expect(row.mergedInto).toBeNull();
+
+    // 二度目の呼び出しでも壊れない（冪等）
+    expect(() => setupChangelog(db, [{ name: 'users' }], 'id')).not.toThrow();
+  });
+
   it('_changelog テーブルを作成する', () => {
     setupChangelog(db, [{ name: 'users' }], 'id');
 

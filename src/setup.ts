@@ -19,6 +19,31 @@ function escapeIdentifier(identifier: string): string {
 }
 
 /**
+ * `_tombstone` に `mergedInto` 列が無ければ追加する（冪等）。
+ *
+ * `CREATE TABLE IF NOT EXISTS` は既存テーブルには列を足さないため、
+ * v0.14.0以前に作られたDBはこの経路で移行する。
+ * `_tombstone` そのものが無いDB（{@link setupChangelog} を通していない場合）では何もしない。
+ *
+ * @internal
+ */
+export function ensureTombstoneMergedIntoColumn(db: Database.Database): void {
+  const exists = db
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get();
+  if (!exists) return;
+
+  const columns = db
+    .prepare(`PRAGMA table_info(_tombstone)`)
+    .all() as ColumnInfo[];
+  if (columns.some((column) => column.name === 'mergedInto')) return;
+
+  db.exec(`ALTER TABLE _tombstone ADD COLUMN mergedInto TEXT`);
+}
+
+/**
  * changelog追跡に必要なテーブルとトリガーをセットアップする。
  *
  * 以下を冪等に（`IF NOT EXISTS`で）作成する:
@@ -66,19 +91,28 @@ export function setupChangelog(
     )
   `);
 
-  // _tombstone テーブル（DELETE記録の長期保持）
+  // _tombstone テーブル（DELETE記録の長期保持）。
+  // `mergedInto` は「この行は消えたのではなく、この行へ畳まれた」ことを表す。
+  // 削除の事実と畳み先が同じ1行に載るので、削除を適用する側は**消すと決めるその場で
+  // 畳み先を必ず見る**ことになり、「畳まれた行を、子を付け替えないまま消す」ことが
+  // 構造的に起こらなくなる（別テーブルで配ると、届く順によっては見ずに消せてしまう）。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _tombstone (
-      tableName TEXT NOT NULL,
-      recordId  TEXT NOT NULL,
-      deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      tableName  TEXT NOT NULL,
+      recordId   TEXT NOT NULL,
+      deletedAt  TEXT NOT NULL DEFAULT (datetime('now')),
+      mergedInto TEXT,
       PRIMARY KEY (tableName, recordId)
     )
   `);
+  // 既存DBには CREATE TABLE IF NOT EXISTS では列が増えないため、明示的に足す
+  ensureTombstoneMergedIntoColumn(db);
 
-  // _id_merge テーブル（セカンダリUNIQUE違反を畳んだ「敗者id → 勝者id」の記録）。
+  // _id_merge テーブル（畳んだ「敗者id → 勝者id」のローカル索引）。
   // 自分が勝った側のクライアントには敗者行が入らないため、あとから届く相手の子が
   // 存在しない親を指す。この記録を使って外部キーを勝者へ向け直す。
+  // 自分で畳んだぶんも、リモートの `_tombstone.mergedInto` から受け取ったぶんも
+  // ここへ入る。同期対象にはしない（`_` 始まりなので自動検出から外れる）。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _id_merge (
       tableName TEXT NOT NULL,
