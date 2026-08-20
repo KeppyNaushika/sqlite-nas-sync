@@ -2,11 +2,20 @@
   "name": "sqlite-nas-sync",
   "version": "0.15.0",
   "description": "Sync SQLite databases across multiple clients via NAS with changelog-based conflict resolution",
+  "type": "commonjs",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test:watch": "vitest",
     "docs": "typedoc",
     "docs:serve": "typedoc && npx serve docs/api -l 3333",
