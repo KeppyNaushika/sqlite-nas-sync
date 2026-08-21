@@ -30,8 +30,16 @@
     "multi-client",
     "changelog"
   ],
-  "author": "",
+  "author": "KeppyNaushika",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KeppyNaushika/sqlite-nas-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KeppyNaushika/sqlite-nas-sync/issues"
+  },
+  "homepage": "https://github.com/KeppyNaushika/sqlite-nas-sync#readme",
   "peerDependencies": {
     "better-sqlite3": ">=11.0.0"
   },
