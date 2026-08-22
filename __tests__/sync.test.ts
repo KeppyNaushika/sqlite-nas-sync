@@ -16,6 +16,7 @@ describe('performSync', () => {
     { name: 'decisions' },
     { name: 'tags' },
     { name: 'tag_notes' },
+    { name: 'tag_profiles' },
     { name: 'accounts' },
   ];
 
@@ -63,6 +64,15 @@ describe('performSync', () => {
         id        TEXT PRIMARY KEY,
         tagId     TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
         body      TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    // 親と主キーを共有する 1:1 の表。親が畳まれると子のidそのものが動くため、
+    // 動いた先の席が既に埋まっている形を作れる。
+    db.exec(`
+      CREATE TABLE tag_profiles (
+        id        TEXT PRIMARY KEY REFERENCES tags(id) ON DELETE CASCADE,
+        memo      TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
     `);
@@ -411,6 +421,25 @@ describe('performSync', () => {
       ).run(id, tagId, `${id}の本文`, updatedAt);
     }
 
+    function insertProfile(
+      db: Database.Database,
+      tagId: string,
+      memo: string,
+      updatedAt: string
+    ): void {
+      db.prepare(
+        `INSERT INTO tag_profiles (id, memo, updatedAt) VALUES (?, ?, ?)`
+      ).run(tagId, memo, updatedAt);
+    }
+
+    function profileRows(
+      db: Database.Database
+    ): { id: string; memo: string }[] {
+      return db
+        .prepare(`SELECT id, memo FROM tag_profiles ORDER BY id`)
+        .all() as { id: string; memo: string }[];
+    }
+
     function uniqueWarnings(warnings: string[]): string[] {
       return warnings.filter(
         (warning) =>
@@ -481,6 +510,45 @@ describe('performSync', () => {
         expect(noteRows(db), `client-${label}`).toEqual([
           { id: 'note-t1', tagId: 't1' },
           { id: 'note-t2', tagId: 't1' },
+        ]);
+      }
+
+      dbA.close();
+      dbB.close();
+    });
+
+    it('畳みで動く 1:1 の子の席が埋まっていても、同期が止まらない', async () => {
+      // A の改名(2024-06-01) > B の t2(2024-03-01) → 届いた更新が勝ち、t2 が畳まれる。
+      // t2 に紐づく 1:1 の行は t1 の席へ動こうとするが、そこには t1 の行が既に居る。
+      // 席の先客を「畳む相手」として扱うと、敗者idと勝者idが同じ畳みになって
+      // 何も起きず、同じ付け替えをもう一度走らせて主キー違反を投げる
+      // （どの catch にも捕まらず、その相手からの取り込みが毎回巻き戻る）。
+      const { dbA, pathA, dbB, pathB } = await seedRenameCollision(
+        '2024-06-01T00:00:00Z',
+        '2024-03-01T00:00:00Z'
+      );
+      insertProfile(dbB, 't1', 'ふるい', '2024-02-01T00:00:00Z');
+      insertProfile(dbB, 't2', 'あたらしい', '2024-09-01T00:00:00Z');
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+        expect(uniqueWarnings(result.warnings), `B ${attempt}回目`).toEqual([]);
+        expect(result.clientsSynced, `B ${attempt}回目`).toBe(1);
+      }
+
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+
+      for (const [label, db] of [
+        ['A', dbA],
+        ['B', dbB],
+      ] as const) {
+        expect(tagRows(db), `client-${label}`).toEqual([
+          { id: 't1', name: '国語' },
+        ]);
+        // 席は1つ。中身は新しい方（t2 に付いていた行）が残る
+        expect(profileRows(db), `client-${label}`).toEqual([
+          { id: 't1', memo: 'あたらしい' },
         ]);
       }
 
@@ -810,6 +878,9 @@ describe('performSync', () => {
           losingId: 't2',
           winningId: 't1',
           removedLocalRow: true,
+          // t2 に付いていたメモ1件が t1 へ移った
+          movedChildren: 1,
+          lostChildren: 0,
         },
       ]);
       expect(result.deleted).toBe(1);
@@ -834,6 +905,9 @@ describe('performSync', () => {
           losingId: 't1',
           winningId: 't2',
           removedLocalRow: true,
+          // t1 に付いていたメモ1件が t2 へ移った
+          movedChildren: 1,
+          lostChildren: 0,
         },
       ]);
       expect(result.deleted).toBe(1);
@@ -964,6 +1038,124 @@ describe('performSync', () => {
       dbB.close();
     });
 
+    it('ユニークが2本ある表で、届いた作成が2本目で拒まれても同期は止まらない', async () => {
+      // 更新ではなく**作成**が索引ごとに別々の相手へぶつかる形。
+      // SQLite が最初に告げるのは email の違反なので、エラー文からしか相手を知れない
+      // うちは「先に r1 を畳んでから r2 に負ける」ことになり、挿入し直せずに例外が抜けて
+      // その相手ぶんの取り込みが丸ごと巻き戻る（＝同期がそこで止まる）。
+      interface AccountRow {
+        id: string;
+        username: string;
+        email: string;
+      }
+      function accountRows(db: Database.Database): AccountRow[] {
+        return db
+          .prepare(`SELECT id, username, email FROM accounts ORDER BY id`)
+          .all() as AccountRow[];
+      }
+      function insertAccount(
+        db: Database.Database,
+        id: string,
+        username: string,
+        email: string,
+        updatedAt: string
+      ): void {
+        db.prepare(
+          `INSERT INTO accounts (id, username, email, updatedAt) VALUES (?, ?, ?, ?)`
+        ).run(id, username, email, updatedAt);
+      }
+
+      // A: 1行だけ作る
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      insertAccount(dbA, 'r0', 'nameX', 'mailX', '2024-06-01T00:00:00Z');
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+
+      // B: 独立に2行作る。片方は email が、もう片方は username が、A の r0 とぶつかる。
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+      insertAccount(dbB, 'r1', 'name1', 'mailX', '2024-01-01T00:00:00Z');
+      insertAccount(dbB, 'r2', 'nameX', 'mail2', '2024-12-01T00:00:00Z');
+
+      // 届いた作成は r2 に負ける。負けたのだから、先に見えた r1 を巻き添えにしない。
+      const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+      expect(uniqueWarnings(result.warnings)).toEqual([]);
+      expect(result.clientsSynced).toBe(1);
+      expect(accountRows(dbB)).toEqual([
+        { id: 'r1', username: 'name1', email: 'mailX' },
+        { id: 'r2', username: 'nameX', email: 'mail2' },
+      ]);
+
+      // 何周回しても同じ所で落ち続けない（＝相手からの取り込みが止まらない）
+      for (let round = 0; round < 3; round++) {
+        for (const [clientId, db, dbPath] of [
+          ['client-a', dbA, pathA],
+          ['client-b', dbB, pathB],
+        ] as const) {
+          const roundResult = await performSync(
+            db,
+            makeConfig(dbPath, clientId),
+            TABLES
+          );
+          expect(
+            uniqueWarnings(roundResult.warnings),
+            `${clientId} round${round}`
+          ).toEqual([]);
+        }
+      }
+
+      // 両端末が同じ1行へ収束する
+      expect(accountRows(dbA)).toEqual([
+        { id: 'r2', username: 'nameX', email: 'mail2' },
+      ]);
+      expect(accountRows(dbB)).toEqual(accountRows(dbA));
+
+      dbA.close();
+      dbB.close();
+    });
+
+    it('畳みで付け替えた子の行数が RecordFold に出る', async () => {
+      // 「1つにまとめました」だけでは影響範囲が分からない。何行が付け替わったかを返す。
+      const { db: dbA, dbPath: pathA } = createClientDb('client-a');
+      insertTag(dbA, 't1', '数学', '2024-01-01T00:00:00Z');
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+
+      const { db: dbB, dbPath: pathB } = createClientDb('client-b');
+      await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+
+      // B は独立に「国語」の t2 を作り、そこへメモを3件ぶら下げる
+      insertTag(dbB, 't2', '国語', '2024-03-01T00:00:00Z');
+      insertNote(dbB, 'note-1', 't2', '2024-03-01T00:00:00Z');
+      insertNote(dbB, 'note-2', 't2', '2024-03-01T00:00:00Z');
+      insertNote(dbB, 'note-3', 't2', '2024-03-01T00:00:00Z');
+
+      // A: t1 を「国語」へ改名。B の t2 より新しいので、届いた改名が勝つ
+      dbA
+        .prepare(`UPDATE tags SET name = ?, updatedAt = ? WHERE id = ?`)
+        .run('国語', '2024-06-01T00:00:00Z', 't1');
+      await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES);
+
+      const result = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES);
+
+      expect(result.folds).toEqual([
+        {
+          tableName: 'tags',
+          losingId: 't2',
+          winningId: 't1',
+          removedLocalRow: true,
+          movedChildren: 3,
+          lostChildren: 0,
+        },
+      ]);
+      // 返した数は、実際に付け替わった行と一致すること
+      expect(noteRows(dbB)).toEqual([
+        { id: 'note-1', tagId: 't1' },
+        { id: 'note-2', tagId: 't1' },
+        { id: 'note-3', tagId: 't1' },
+      ]);
+
+      dbA.close();
+      dbB.close();
+    });
+
     it('相手の作成を自分の行へ吸収した場合は、行は消えていないと出る', async () => {
       // A と B が独立に同じ名前のタグを作る。B のものが新しいので B 側は自分を残す。
       const { db: dbA, dbPath: pathA } = createClientDb('client-a');
@@ -980,6 +1172,8 @@ describe('performSync', () => {
           losingId: 't1',
           winningId: 't2',
           removedLocalRow: false,
+          movedChildren: 0,
+          lostChildren: 0,
         },
       ]);
       // B は t1 を一度も持っていないので、消えた行はない
