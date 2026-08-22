@@ -214,7 +214,7 @@ console.log(result);
 //   deleted: 1,
 //   skipped: 10,
 //   conflictsResolved: 1,
-//   folds: [{ tableName: 'Tag', losingId: 't2', winningId: 't1', removedLocalRow: true }],
+//   folds: [{ tableName: 'Tag', losingId: 't2', winningId: 't1', removedLocalRow: true, movedChildren: 3 }],
 //   warnings: []
 // }
 ```
@@ -360,11 +360,24 @@ UPDATE → UNIQUE制約違反（ローカルの別の行と同一ユニークキ
 ```
 
 ユニークが**2本以上**ある表（`User(username UNIQUE, email UNIQUE)` など）では、1回の
-書き込みが索引ごとに別々の相手へぶつかります。ぶつかった相手はSQLiteのエラー文からしか
-分からず**1本ずつしか見えない**ため、先に見えた相手を畳んでから次の相手に負けることが
-あります。畳みは区切り（SAVEPOINT）の中で行い、負けが分かった時点で**そこまでの畳みごと
-巻き戻します**（そうしないと、更新は拒まれたのに先に畳んだ行だけが消えたままになります）。
-巻き戻したうえで、更新対象の行だけを勝った相手へ畳んで収束させます。
+書き込みが索引ごとに別々の相手へぶつかります。ぶつかった相手は `PRAGMA index_list` /
+`PRAGMA index_xinfo` で**索引から先に全部引ける**ので、**1つも畳む前に全員ぶんの勝敗を
+決めます**。1人でも勝てない相手が居れば何も畳まずに拒み、更新対象の行だけを勝った相手へ
+畳んで収束させます（「先に見えた相手を畳んでから次の相手に負け、更新は拒まれたのに
+畳んだ行だけが消えたまま」という穴が、そもそも開かない形です）。
+
+ユニークの宣言はスキーマそのものから読むので、**設定で重ねて教える必要はありません**。
+索引の一覧は `PRAGMA schema_version` が変わるまで使い回します（`CREATE INDEX` /
+`DROP INDEX` / `ALTER TABLE` はいずれもこの値を進めるため、索引が変わったまま古い答えを
+返し続けることはありません）。
+
+ただし次の2種は「先に数える」対象から外れます。列の値だけでは相手を引けないためで、
+残った違反は畳まずにそのまま例外として返します（誤った相手を畳んで行を失うより、
+止まって知らせる方を採ります）。
+
+- **部分索引**（`CREATE UNIQUE INDEX … WHERE …`）— どの行が索引に載っているかは述語を
+  評価しないと決められない
+- **式索引**（`CREATE UNIQUE INDEX … ON t(lower(name))`）— 引くべき値が列に無い
 
 畳んだ結果は **`_tombstone.mergedInto`（畳み先のid）として他クライアントへ伝わります**。
 これが無いと、**その競合を経験しなかったクライアント**には「敗者行が消えた」という事実だけが
@@ -406,20 +419,40 @@ mergedInto が無い（＝利用者操作による普通の削除）：
 ### 畳んだことを利用者へ伝える
 
 「ぶつかったら黙って畳む」以上、**何と何が1つになったのかを利用者へ伝えられる**必要が
-あります。`SyncResult.folds` に畳みの一覧（表名・消えたid・残ったid）が載るので、
-アプリ側で「小計『知識・技能』が2つあったので1つにまとめました」のように通知できます。
+あります。`SyncResult.folds` に畳みの一覧（表名・消えたid・残ったid・付け替えた子の数）が
+載るので、アプリ側で「小計『知識・技能』が2つあったので1つにまとめ、設問 47 件を
+付け替えました」のように通知できます。
 
 ```typescript
 const result = await sync.syncNow();
 for (const fold of result.folds) {
-  // { tableName: 'SubtotalGroup', losingId: '…', winningId: '…', removedLocalRow: true }
-  console.log(`${fold.tableName}: ${fold.losingId} を ${fold.winningId} へまとめました`);
+  // { tableName: 'SubtotalGroup', losingId: '…', winningId: '…',
+  //   removedLocalRow: true, movedChildren: 47 }
+  console.log(
+    `${fold.tableName}: ${fold.losingId} を ${fold.winningId} へまとめ、` +
+      `子 ${fold.movedChildren} 行を付け替えました`
+  );
 }
 ```
 
 同じ三つ組は `_id_merge` テーブルにも永続化されるので、**あとから見返す口**も同じデータから
 作れます。`removedLocalRow` は「この端末で実際に行が消えたか」で、`false` は敗者行を
 そもそも持っていなかった場合（届いた行が負けたとき）です。
+
+`movedChildren` は、その畳みで消えた行から残った行へ**付け替えた子行の数**です。
+数えるのは**直接の子だけ**で、孫は入りません。子自身も畳まれて消えた場合（子どうしも
+ユニークでぶつかった場合）は、その子ぶんの `RecordFold` が別に1件出て、孫の数はそちらに
+載ります。つまり**一覧を合計してよい**（同じ行を二度数えません）。
+
+`lostChildren` は、残った行へ**引き継げずに失われた**子行の数です。ふつうは0で、0で
+なくなるのは子が親を**主キー以外のユニーク列の値**で握っている場合（`REFERENCES
+parent(code)` の形）だけです。この形では消える行と残る行がその値を受け渡すので子の列を
+書き換えようが無く、消える行の `ON DELETE CASCADE` が子に及んでしまいます
+（**`PRAGMA defer_foreign_keys` が遅らせるのは制約の検査であって、カスケードの動作では
+ありません**）。ライブラリは子の参照列を一旦NULLにして消える行から外し、削除のあとに
+元の値へ戻すことでこれを避けますが、**外せない形**（参照列が `NOT NULL` / 子自身の主キーを
+兼ねている / `CHECK` でNULLを禁じている）では守り切れません。数は削除の前後を実測した
+差です。0でない値を受け取ったら、利用者へ知らせてください。
 
 ## 使用例
 

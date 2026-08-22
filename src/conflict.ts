@@ -18,57 +18,6 @@ function escapeIdentifier(identifier: string): string {
 }
 
 /**
- * UNIQUE制約エラーのメッセージから違反したカラム名を抽出する。
- *
- * better-sqlite3のエラーメッセージ形式:
- * `UNIQUE constraint failed: Table.colA, Table.colB`
- *
- * @returns 違反したカラム名の配列。解析できない場合は空配列。
- * @internal
- */
-function parseUniqueConflictColumns(
-  err: unknown,
-  tableName: string
-): string[] {
-  const message = err instanceof Error ? err.message : String(err);
-  const match = /UNIQUE constraint failed: (.+)$/.exec(message);
-  if (!match) return [];
-  return match[1]
-    .split(',')
-    .map((part) => part.trim())
-    .filter((part) => part.startsWith(`${tableName}.`))
-    .map((part) => part.slice(tableName.length + 1));
-}
-
-/**
- * UNIQUE違反を起こしたエラーから、ローカルで衝突している相手の行を引く。
- *
- * 違反したカラムをエラーメッセージから特定できない場合や、その値を持つ行が
- * 見つからない場合は undefined。呼び出し元は**握りつぶさずエラーを投げ直す**こと
- * （相手が分からないまま畳むと、どちらを消したのか説明できない）。
- * @internal
- */
-function findUniqueRival(
-  db: Database.Database,
-  tableName: string,
-  record: Record<string, unknown>,
-  err: unknown
-): Record<string, unknown> | undefined {
-  const uniqueColumns = parseUniqueConflictColumns(err, tableName);
-  if (uniqueColumns.length === 0) return undefined;
-
-  return db
-    .prepare(
-      `SELECT * FROM ${escapeIdentifier(tableName)} WHERE ${uniqueColumns
-        .map((column) => `${escapeIdentifier(column)} = ?`)
-        .join(' AND ')}`
-    )
-    .get(...uniqueColumns.map((column) => record[column])) as
-    | Record<string, unknown>
-    | undefined;
-}
-
-/**
  * 外部キー1本ぶんの参照関係。
  *
  * SQLiteの `PRAGMA foreign_key_list` が返す行を、複合外部キー（同一 `id` の複数行）
@@ -82,6 +31,14 @@ interface ForeignKeyRef {
   parentTable: string;
   /** 子の列と、それが指す親の列の対応 */
   columns: { childColumn: string; parentColumn: string }[];
+  /**
+   * 親の行が消えたときに子へ及ぶ動作。
+   * `NO ACTION` / `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`。
+   *
+   * **`PRAGMA defer_foreign_keys` はこの動作を遅らせない**（遅れるのは検査だけ）。
+   * 畳みで敗者行を消す前に、これを見て子を守る必要がある（{@link carryChildrenThroughDelete}）。
+   */
+  onDelete: string;
 }
 
 /** @internal SQLiteの `PRAGMA foreign_key_list` が返す行 */
@@ -92,6 +49,8 @@ interface ForeignKeyListRow {
   from: string;
   /** 親の列。`REFERENCES parent` のように省略された場合は null（＝親の主キー） */
   to: string | null;
+  /** 親の行が消えたときの動作（`NO ACTION` / `CASCADE` / `SET NULL` 等） */
+  on_delete: string;
 }
 
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
@@ -202,6 +161,7 @@ function readForeignKeys(
             childTable,
             parentTable: row.table,
             columns: [column],
+            onDelete: row.on_delete.toUpperCase(),
           });
         }
       }
@@ -246,16 +206,272 @@ function findReferencingForeignKeys(
 }
 
 /**
+ * テーブルのカラム定義（`PRAGMA table_info`）を返す。
+ * @internal
+ */
+function readColumnInfo(
+  db: Database.Database,
+  tableName: string
+): ColumnInfo[] {
+  return cachedBySchema(db, `colinfo:${tableName.toLowerCase()}`, () => {
+    return db
+      .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
+      .all() as ColumnInfo[];
+  });
+}
+
+/**
  * テーブルのカラム名一覧を返す。
  * @internal
  */
 function getTableColumns(db: Database.Database, tableName: string): string[] {
-  return cachedBySchema(db, `cols:${tableName.toLowerCase()}`, () => {
-    const columns = db
-      .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-      .all() as ColumnInfo[];
-    return columns.map((column) => column.name);
+  return cachedBySchema(db, `cols:${tableName.toLowerCase()}`, () =>
+    readColumnInfo(db, tableName).map((column) => column.name)
+  );
+}
+
+/**
+ * 指定した列がすべて NULL を取れるか。
+ *
+ * `NOT NULL` 宣言だけを見る。`CHECK (column IS NOT NULL)` のように別の書き方で
+ * NULL を禁じている表は見分けられないため、実際に NULL を入れる側（
+ * {@link carryChildrenThroughDelete}）が失敗を拾えるようにしてある。
+ * @internal
+ */
+function areColumnsNullable(
+  db: Database.Database,
+  tableName: string,
+  columnNames: string[]
+): boolean {
+  const columnInfo = readColumnInfo(db, tableName);
+  return columnNames.every((columnName) => {
+    const column = columnInfo.find((candidate) =>
+      isSameIdentifier(candidate.name, columnName)
+    );
+    return column !== undefined && column.notnull === 0;
   });
+}
+
+/**
+ * この接続で外部キーが実際に効いているか（`PRAGMA foreign_keys`）。
+ *
+ * 切られていれば `ON DELETE` の動作も起きないので、子を守る細工は要らない。
+ * スキーマではなく接続ごとの設定なので {@link cachedBySchema} には載せない。
+ * @internal
+ */
+function foreignKeysEnforced(db: Database.Database): boolean {
+  return db.pragma('foreign_keys', { simple: true }) === 1;
+}
+
+/** @internal SQLiteの `PRAGMA index_list` が返す行 */
+interface IndexListRow {
+  seq: number;
+  name: string;
+  /** ユニーク索引なら 1 */
+  unique: number;
+  /**
+   * 索引の出どころ。
+   * `pk` = 主キー由来 / `u` = `UNIQUE` 宣言由来 / `c` = `CREATE UNIQUE INDEX` 由来。
+   */
+  origin: string;
+  /** `WHERE` 付きの部分索引なら 1 */
+  partial: number;
+}
+
+/**
+ * @internal SQLiteの `PRAGMA index_xinfo` が返す行
+ *
+ * `index_info` ではなく `xinfo` を使うのは、照合順序（`coll`）まで返すため。
+ * `name COLLATE NOCASE` で張られた索引を、列の既定照合順序で引くと相手を取り逃がす。
+ */
+interface IndexXInfoRow {
+  seqno: number;
+  /** 列番号。式で張られた索引の列は -2、末尾に付く rowid は -1 */
+  cid: number;
+  /** 列名。式で張られた索引の列は null */
+  name: string | null;
+  desc: number;
+  /** その列の照合順序（`BINARY` / `NOCASE` / `RTRIM` / 利用者定義） */
+  coll: string;
+  /** 索引のキー列なら 1、参照用に付随しているだけなら 0 */
+  key: number;
+}
+
+/**
+ * ユニークキー1本ぶん。「この列の組が同じ行は、DB全体で1行しか居られない」という宣言。
+ * @internal
+ */
+interface UniqueKey {
+  /** 列名と、その列を索引が使っている照合順序 */
+  columns: { name: string; collation: string }[];
+}
+
+/**
+ * テーブルが宣言しているセカンダリUNIQUE（主キー以外のユニークキー）を列挙する。
+ *
+ * **スキーマのUNIQUE宣言がそのまま宣言**であり、設定ファイルや引数で重ねて教える必要は無い。
+ * `PRAGMA index_list` で索引を数え、`unique` が立っていて `origin` が `pk` でないものについて
+ * `PRAGMA index_xinfo` で列の組を引く。
+ *
+ * 主キー由来の索引（`origin = 'pk'`）は**外す**。主キーの衝突は同一行のLWWであって、
+ * 別idの行を1つへ畳むセカンダリUNIQUEの衝突とは扱いが違う
+ * （主キーの組が要る場面では {@link primaryKeyAsUniqueKey} を明示的に足すこと）。
+ *
+ * 次の2種は列の値から相手を引けないので**先に数える対象から外す**:
+ *
+ * - **部分索引**（`CREATE UNIQUE INDEX ... WHERE ...`）— どの行が索引に載っているかは
+ *   述語を評価しないと分からない。列の値だけで引くと、実際にはぶつからない行を
+ *   相手だと思い込んで畳んでしまう
+ * - **式索引**（`CREATE UNIQUE INDEX ... ON t(lower(name))`）— 引くべき値が列に無い
+ *
+ * どちらも、残った違反はそのまま例外として呼び出し元へ抜ける（畳まずに投げる）。
+ *
+ * **キャッシュの寿命**: `PRAGMA schema_version` が変わるまで（{@link cachedBySchema}）。
+ * `CREATE INDEX` / `DROP INDEX` / `ALTER TABLE` はいずれもこの値を進めるため、
+ * 索引が変わったまま古い答えを返し続けることはない。
+ * @internal
+ */
+function readSecondaryUniqueKeys(
+  db: Database.Database,
+  tableName: string
+): UniqueKey[] {
+  return cachedBySchema(db, `uniq:${tableName.toLowerCase()}`, () => {
+    const indexes = db
+      .prepare(`PRAGMA index_list(${escapeIdentifier(tableName)})`)
+      .all() as IndexListRow[];
+
+    const uniqueKeys: UniqueKey[] = [];
+    for (const index of indexes) {
+      if (index.unique !== 1) continue;
+      if (index.origin === 'pk') continue;
+      if (index.partial !== 0) continue;
+
+      const indexColumns = (
+        db
+          .prepare(`PRAGMA index_xinfo(${escapeIdentifier(index.name)})`)
+          .all() as IndexXInfoRow[]
+      ).filter((indexColumn) => indexColumn.key === 1);
+
+      // 式で張られた索引は列の値から引けない
+      if (indexColumns.some((indexColumn) => indexColumn.name === null)) {
+        continue;
+      }
+
+      uniqueKeys.push({
+        columns: indexColumns.map((indexColumn) => ({
+          name: String(indexColumn.name),
+          collation: indexColumn.coll,
+        })),
+      });
+    }
+    return uniqueKeys;
+  });
+}
+
+/**
+ * 主キーの列を、ユニークキー1本として表す。
+ *
+ * `PRAGMA index_list` は rowid別名（`INTEGER PRIMARY KEY`）の主キーを索引として返さないので、
+ * 主キーの占有相手まで引きたい場面（付け替えで行のidそのものが動く
+ * {@link repointChild}）では、これを明示的に足す。
+ * @internal
+ */
+function primaryKeyAsUniqueKey(primaryKey: string): UniqueKey {
+  return { columns: [{ name: primaryKey, collation: 'BINARY' }] };
+}
+
+/**
+ * 書き込もうとしている行が、ローカルのどの行とユニークキーでぶつかるかを**先に全部引く**。
+ *
+ * 例外を待たずに索引から数えるので、**1本目を畳んでから2本目の相手が見える**という
+ * 順序が無くなる。呼び出し元は、相手を全部並べたうえで畳むかどうかを一度に決められる
+ * （途中まで畳んでから拒否が決まる穴が塞がる）。
+ *
+ * - 値が NULL の列を含むキーは飛ばす（SQLiteのUNIQUEはNULL同士を衝突させない）
+ * - `selfId` の行は相手に数えない（自分自身とは畳めない）
+ * - 同じ行が複数のキーで挙がっても1件にまとめる
+ *
+ * @param selfId - 書き込む対象そのものの主キー値。UPDATE では更新される行のid、
+ *   INSERT では入れようとしている行のid。付け替えでidが動く場合は**動く前のid**を渡す
+ *   （動いた先のidを占めている行は、畳むべき相手だから）。
+ * @param uniqueKeys - 照合するユニークキー。ふつうは
+ *   {@link readSecondaryUniqueKeys} の結果をそのまま渡す。
+ * @internal
+ */
+function findUniqueRivals(
+  db: Database.Database,
+  tableName: string,
+  primaryKey: string,
+  record: Record<string, unknown>,
+  selfId: unknown,
+  uniqueKeys: UniqueKey[]
+): Record<string, unknown>[] {
+  const escapedTable = escapeIdentifier(tableName);
+  const escapedPk = escapeIdentifier(primaryKey);
+  const rivalsById = new Map<string, Record<string, unknown>>();
+
+  for (const uniqueKey of uniqueKeys) {
+    const values = uniqueKey.columns.map((column) => record[column.name]);
+    if (values.some((value) => value === null || value === undefined)) continue;
+
+    const matchClause = uniqueKey.columns
+      .map(
+        (column) =>
+          `${escapeIdentifier(column.name)} = ? COLLATE ${escapeIdentifier(column.collation)}`
+      )
+      .join(' AND ');
+
+    const rows = db
+      .prepare(
+        `SELECT * FROM ${escapedTable} WHERE ${matchClause} AND ${escapedPk} IS NOT ?`
+      )
+      .all(...values, selfId) as Record<string, unknown>[];
+
+    for (const row of rows) {
+      rivalsById.set(String(row[primaryKey]), row);
+    }
+  }
+
+  return Array.from(rivalsById.values());
+}
+
+/**
+ * 衝突している相手のうち、生き残る1行を選ぶ。
+ *
+ * {@link isPreferredOverRival} は「時刻が新しい方、同時刻なら主キーの辞書順で小さい方」
+ * という全順序なので、畳み込む順番によらず同じ行に決まる。
+ * @internal
+ */
+function selectSurvivingRival(
+  db: Database.Database,
+  rivalRows: Record<string, unknown>[],
+  timestampColumn: string | null,
+  primaryKey: string
+): Record<string, unknown> {
+  return rivalRows.reduce((survivor, rivalRow) =>
+    isPreferredOverRival(db, rivalRow, survivor, timestampColumn, primaryKey)
+      ? rivalRow
+      : survivor
+  );
+}
+
+/**
+ * 書き込もうとしている行が、衝突相手**全員**に勝つか。
+ *
+ * 1人でも勝てない相手が居れば、その書き込みは通せない。**1つも畳む前に**これを見るので、
+ * 「先に見えた相手を畳んでから、次の相手に負ける」ことが起きない。
+ * @internal
+ */
+function outranksAllRivals(
+  db: Database.Database,
+  record: Record<string, unknown>,
+  rivalRows: Record<string, unknown>[],
+  timestampColumn: string | null,
+  primaryKey: string
+): boolean {
+  return rivalRows.every((rivalRow) =>
+    isPreferredOverRival(db, record, rivalRow, timestampColumn, primaryKey)
+  );
 }
 
 /**
@@ -344,6 +560,12 @@ function recordMerge(
  * 記録は、今回の勝者へ張り替える。同じ敗者が二度畳まれた場合も、記録は1件のまま
  * 終端の勝者を指す（呼び出し元は行が消えた件数をこの一覧から数えるため、
  * 同じ行を二度数えてはいけない）。
+ *
+ * @param movedChildren - この畳みで付け替えた**直接の子**の行数。同じ敗者へ二度目の
+ *   記録が来た場合は足し合わせる（子の付け替えは再入のたびには起きないので、
+ *   ふつう二度目は 0）。
+ * @param lostChildren - この畳みで**引き継げずに失われた**直接の子の行数
+ *   （{@link RecordFold.lostChildren}）。
  * @internal
  */
 function recordFold(
@@ -351,7 +573,9 @@ function recordFold(
   tableName: string,
   losingId: string,
   winningId: string,
-  removedLocalRow: boolean
+  removedLocalRow: boolean,
+  movedChildren: number,
+  lostChildren: number
 ): void {
   if (losingId === winningId) return;
 
@@ -367,10 +591,19 @@ function recordFold(
   if (existing) {
     existing.winningId = winningId;
     existing.removedLocalRow = existing.removedLocalRow || removedLocalRow;
+    existing.movedChildren += movedChildren;
+    existing.lostChildren += lostChildren;
     return;
   }
 
-  folds.push({ tableName, losingId, winningId, removedLocalRow });
+  folds.push({
+    tableName,
+    losingId,
+    winningId,
+    removedLocalRow,
+    movedChildren,
+    lostChildren,
+  });
 }
 
 /**
@@ -645,11 +878,40 @@ function isPreferredOverRival(
 }
 
 /**
+ * 敗者の子をどう引き取ったかの集計。
+ *
+ * 一部の子は**敗者行を消したあとでないと結末が決まらない**ため、`afterDelete` に
+ * その後始末を積む。積んだ関数は {@link foldRowInto} が DELETE の直後に走らせ、
+ * そのとき `movedChildren` / `lostChildren` を確定させる。
+ * @internal
+ */
+interface ChildCarry {
+  /** 敗者から勝者へ引き継げた直接の子の行数 */
+  movedChildren: number;
+  /** 引き継げずに失われた直接の子の行数（{@link RecordFold.lostChildren}） */
+  lostChildren: number;
+  /** 敗者行の DELETE 直後に走らせる後始末 */
+  afterDelete: (() => void)[];
+}
+
+/** @internal */
+function emptyChildCarry(): ChildCarry {
+  return { movedChildren: 0, lostChildren: 0, afterDelete: [] };
+}
+
+/**
  * 敗者行を指している子を勝者行へ付け替える。
  *
  * 付け替えが子自身のユニーク制約にぶつかった場合（勝者側に「同じもの」が既にある場合）は、
  * 子どうしを同じLWWで1行に畳む。畳んで消える側の子には、その子の子（孫）が
  * ぶら下がっている可能性があるため、{@link foldRowInto} を再帰的に使う。
+ *
+ * @param deletesLosingRow - 呼び出し元がこのあと敗者行を **DELETE する** なら true。
+ *   主キー以外のユニーク列を指す外部キーでは、敗者と勝者で参照先の値が同じになることが
+ *   あり（勝者はまだその値を持っていない＝書き込みは畳みの後）、そのとき子は付け替え
+ *   ようが無い。値が同じでも敗者の削除は子に及ぶので、削除する場合だけ子を守る
+ *   （{@link carryChildrenThroughDelete}）。付け替えで敗者行のidが動くだけの経路
+ *   （{@link repointChild} の再入）では削除が起きないため false。
  * @internal
  */
 function repointChildren(
@@ -660,8 +922,10 @@ function repointChildren(
   winningRow: Record<string, unknown>,
   timestampColumn: string,
   folded: Set<string>,
-  folds: RecordFold[]
-): void {
+  folds: RecordFold[],
+  deletesLosingRow: boolean
+): ChildCarry {
+  const carry = emptyChildCarry();
   for (const foreignKey of findReferencingForeignKeys(
     db,
     parentTable,
@@ -682,10 +946,28 @@ function repointChildren(
     // 衝突したユニーク列の値はNULLになり得ない（SQLiteのUNIQUEはNULL同士を衝突させない）ので、
     // 主キー以外を指す外部キーの、さらに限られた形でしか起こらない。
     if (winningValues.some((value) => value === null || value === undefined)) {
+      if (deletesLosingRow) {
+        // 付け替え先が無いまま敗者を消すので、`ON DELETE` の動作がそのまま子に及ぶ。
+        // 黙らせず、実際に失われた数を数えて伝える。
+        countChildrenLostToDelete(
+          db,
+          foreignKey,
+          losingValues,
+          countChildrenReferencing(db, foreignKey, losingValues),
+          carry
+        );
+      }
       continue;
     }
-    // 参照先の値が同じなら、子は既に勝者を指していることになる
+    // 参照先の値が同じ。**「子は既に勝者を指している」とは限らない。**
+    // 主キーを指す外部キーならその通りだが（敗者と勝者で主キーは必ず違うので、
+    // そもそもここへ来ない）、主キー以外のユニーク列を指す外部キーでは、
+    // 勝者はまだその値を持っていない — 書き込み（UPDATE / INSERT）は畳みの**あと**に
+    // 走るため。子は敗者の行に繋がったままで、敗者を消せば道連れになる。
     if (losingValues.every((value, index) => value === winningValues[index])) {
+      if (deletesLosingRow) {
+        carryChildrenThroughDelete(db, foreignKey, losingValues, carry);
+      }
       continue;
     }
 
@@ -699,7 +981,7 @@ function repointChildren(
       .all(...losingValues) as Record<string, unknown>[];
 
     for (const childRow of childRows) {
-      repointChild(
+      carry.movedChildren += repointChild(
         db,
         foreignKey,
         primaryKey,
@@ -711,10 +993,229 @@ function repointChildren(
       );
     }
   }
+  return carry;
+}
+
+/**
+ * 敗者と勝者で参照先の値が同じ子を、敗者の DELETE を越えて勝者へ引き継ぐ。
+ *
+ * この形は**主キー以外のユニーク列を指す外部キー**でだけ起きる。値そのものが勝者へ
+ * 移るので子の列は書き換えなくてよく、危ないのは敗者行の DELETE だけ:
+ *
+ * - `NO ACTION` — 何も起きない。外部キーの**検査**は
+ *   {@link runDeferringForeignKeys} が終端まで遅らせてあり、そのときには勝者が
+ *   この値を持っているので通る。子はそのまま勝者の子になる
+ * - `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` — **子に及ぶ**。
+ *   `PRAGMA defer_foreign_keys` が遅らせるのは検査であって動作ではない。
+ *   参照列を一旦 NULL にして敗者から外し、削除後に元の値へ戻す（この間の
+ *   宙ぶらりんは、遅延された検査が終端で見るときには解消している）
+ *
+ * 参照列が `NOT NULL` の場合は外せない。そのときは黙って消させず、**実際に何行
+ * 失われたかを数えて** {@link RecordFold.lostChildren} で呼び出し元へ伝える。
+ * @internal
+ */
+function carryChildrenThroughDelete(
+  db: Database.Database,
+  foreignKey: ForeignKeyRef,
+  referencedValues: unknown[],
+  carry: ChildCarry
+): void {
+  const childCount = countChildrenReferencing(db, foreignKey, referencedValues);
+  if (childCount === 0) return;
+
+  // 外部キーが効いていない接続、または削除が子に及ばない宣言なら、子は放っておいてよい
+  // （検査は終端まで遅れており、そのときには勝者がこの値を持っている）
+  if (foreignKey.onDelete === 'NO ACTION' || !foreignKeysEnforced(db)) {
+    carry.movedChildren += childCount;
+    return;
+  }
+
+  const detached = detachChildren(db, foreignKey, referencedValues);
+  if (!detached) {
+    countChildrenLostToDelete(db, foreignKey, referencedValues, childCount, carry);
+    return;
+  }
+
+  carry.afterDelete.push(() => {
+    detached.reattach();
+    carry.movedChildren += childCount;
+  });
+}
+
+/**
+ * 子の参照列を一旦 NULL にして敗者から外す（`ON DELETE` の動作を空振りさせる）。
+ *
+ * 外せた場合は、敗者の削除後に元の値へ戻す手続きを返す。外せない形なら null を返す:
+ *
+ * - 参照列が `NOT NULL`
+ * - 参照列が子自身の主キーを兼ねている（NULL にすると戻す行を指せなくなる）
+ * - `CHECK (column IS NOT NULL)` のように、`NOT NULL` 以外の書き方で NULL を
+ *   禁じている（実際に NULL を入れてみるまで分からないので、失敗を拾って null を返す）
+ *
+ * NULL にしても子のユニーク制約は壊れない（SQLiteのUNIQUEはNULL同士を衝突させない）。
+ * @internal
+ */
+function detachChildren(
+  db: Database.Database,
+  foreignKey: ForeignKeyRef,
+  referencedValues: unknown[]
+): { reattach: () => void } | null {
+  const childColumns = foreignKey.columns.map((column) => column.childColumn);
+  if (!areColumnsNullable(db, foreignKey.childTable, childColumns)) return null;
+
+  const keyColumns = rowKeyColumns(db, foreignKey.childTable);
+  if (
+    childColumns.some((childColumn) =>
+      keyColumns.some((keyColumn) => isSameIdentifier(keyColumn, childColumn))
+    )
+  ) {
+    return null;
+  }
+
+  const escapedChildTable = escapeIdentifier(foreignKey.childTable);
+  const matchClause = foreignKey.columns
+    .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
+    .join(' AND ');
+  const escapedKeyColumns = keyColumns.map((keyColumn) =>
+    escapeIdentifier(keyColumn)
+  );
+
+  // 戻す行を指すための鍵を、外す前に控える
+  const keyRows = db
+    .prepare(
+      `SELECT ${escapedKeyColumns.join(', ')} FROM ${escapedChildTable} WHERE ${matchClause}`
+    )
+    .all(...referencedValues) as Record<string, unknown>[];
+
+  try {
+    db.prepare(
+      `UPDATE ${escapedChildTable} SET ${childColumns
+        .map((childColumn) => `${escapeIdentifier(childColumn)} = NULL`)
+        .join(', ')} WHERE ${matchClause}`
+    ).run(...referencedValues);
+  } catch {
+    // 外せないと分かっただけ。ここで投げて取り込みを止めてしまわない
+    // （止めるとその相手からの同期が永久に止まる）。数えて伝える方へ落とす。
+    return null;
+  }
+
+  const keyMatchClause = escapedKeyColumns
+    .map((escapedKeyColumn) => `${escapedKeyColumn} = ?`)
+    .join(' AND ');
+  const reattachStatement = db.prepare(
+    `UPDATE ${escapedChildTable} SET ${foreignKey.columns
+      .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
+      .join(', ')} WHERE ${keyMatchClause}`
+  );
+
+  return {
+    reattach: (): void => {
+      for (const keyRow of keyRows) {
+        reattachStatement.run(
+          ...referencedValues,
+          ...keyColumns.map((keyColumn) => keyRow[keyColumn])
+        );
+      }
+    },
+  };
+}
+
+/**
+ * 敗者の DELETE で子が実際に何行消えた（外された）かを、削除のあとに数える。
+ *
+ * `ON DELETE` の動作が本当に及ぶかを憶測で決めず、**削除の前後で数えて差を取る**。
+ * まだ在って、まだ同じ値を指している子だけを引き継げたものとして数え、残りを
+ * {@link RecordFold.lostChildren} に載せる。黙って消えるのがいちばん悪い。
+ * @internal
+ */
+function countChildrenLostToDelete(
+  db: Database.Database,
+  foreignKey: ForeignKeyRef,
+  referencedValues: unknown[],
+  childCountBefore: number,
+  carry: ChildCarry
+): void {
+  if (childCountBefore === 0) return;
+
+  carry.afterDelete.push(() => {
+    const after = countChildrenReferencing(db, foreignKey, referencedValues);
+    carry.movedChildren += Math.min(after, childCountBefore);
+    carry.lostChildren += Math.max(childCountBefore - after, 0);
+  });
+}
+
+/**
+ * その参照先の値を指している子の行数。
+ * @internal
+ */
+function countChildrenReferencing(
+  db: Database.Database,
+  foreignKey: ForeignKeyRef,
+  referencedValues: unknown[]
+): number {
+  const matchClause = foreignKey.columns
+    .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
+    .join(' AND ');
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS childCount FROM ${escapeIdentifier(foreignKey.childTable)}
+       WHERE ${matchClause}`
+    )
+    .get(...referencedValues) as { childCount: number };
+  return row.childCount;
+}
+
+/**
+ * その表で1行を指すための列。宣言された主キー、無ければ `rowid`。
+ *
+ * 同期の主キー（`id`）とは別に引くのは、外部キーの子が同期対象テーブルとは
+ * 限らないため（複合主キーの中間テーブルなど）。
+ * @internal
+ */
+function rowKeyColumns(db: Database.Database, tableName: string): string[] {
+  return cachedBySchema(db, `rowkey:${tableName.toLowerCase()}`, () => {
+    const keyColumns = readColumnInfo(db, tableName)
+      .filter((column) => column.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((column) => column.name);
+    return keyColumns.length > 0 ? keyColumns : ['rowid'];
+  });
+}
+
+/**
+ * 既にある行の中身を、渡した行の値で上書きする（主キーは触らない）。
+ *
+ * 「席は1つしか無いが、そこに座るべき中身は別の行が持っている」場面で使う
+ * （{@link repointChild} で、付け替え先の主キーを別の行が占めている場合）。
+ * 行を消して入れ直すのではなく上書きするのは、消すとその行の子が
+ * `ON DELETE` の動作で道連れになるため。
+ *
+ * 主キー以外に列が無い表では何もしない。
+ * @internal
+ */
+function overwriteRow(
+  db: Database.Database,
+  tableName: string,
+  primaryKey: string,
+  row: Record<string, unknown>
+): void {
+  const updateColumns = getTableColumns(db, tableName).filter(
+    (column) => !isSameIdentifier(column, primaryKey)
+  );
+  if (updateColumns.length === 0) return;
+
+  db.prepare(
+    `UPDATE ${escapeIdentifier(tableName)} SET ${updateColumns
+      .map((column) => `${escapeIdentifier(column)} = ?`)
+      .join(', ')} WHERE ${escapeIdentifier(primaryKey)} = ?`
+  ).run(...updateColumns.map((column) => row[column]), row[primaryKey]);
 }
 
 /**
  * 子1行の外部キーを勝者へ向け直す。
+ *
+ * @returns 書き換えた行数（0 または 1）。この子自身が畳まれて消えた場合は 0
+ *   （付け替えたのではないため。その子ぶんの {@link RecordFold} が別に出る）。
  * @internal
  */
 function repointChild(
@@ -726,7 +1227,7 @@ function repointChild(
   timestampColumn: string,
   folded: Set<string>,
   folds: RecordFold[]
-): void {
+): number {
   const escapedChildTable = escapeIdentifier(foreignKey.childTable);
   const escapedPk = escapeIdentifier(primaryKey);
   const setClause = foreignKey.columns
@@ -742,15 +1243,21 @@ function repointChild(
     repointedRow[column.childColumn] = winningValues[index];
   });
 
-  const runRepoint = (): void => {
+  const runRepoint = (): number => {
     const changelogIdBefore = maxChangelogId(db) ?? 0;
-    updateStatement.run(...winningValues, childRow[primaryKey]);
+    const { changes } = updateStatement.run(
+      ...winningValues,
+      childRow[primaryKey]
+    );
 
     // 親と主キーを共有する1:1のテーブルでは、外部キーが主キーそのものなので
     // 付け替えで子のidが動く。孫は古いidを指したままになるため、ここで引き取る。
     const previousId = String(childRow[primaryKey]);
     const nextId = String(repointedRow[primaryKey]);
     if (previousId !== nextId) {
+      // 孫がここで動いた数は、どの `RecordFold` にも載らない（行が消えたのではなく
+      // 1行のidが動いただけなので、畳みとして記録されないため）。
+      // この子1行を付け替えたことだけを数える（{@link RecordFold.movedChildren}）。
       repointChildren(
         db,
         foreignKey.childTable,
@@ -759,7 +1266,10 @@ function repointChild(
         repointedRow,
         timestampColumn,
         folded,
-        folds
+        folds,
+        // この経路は行を消さない（1行のidが動くだけ）ので、
+        // 子を削除から守る細工は要らないし、してはいけない
+        false
       );
       // ここは行が1つ消えたのではなく、1行のidが動いただけなので `folds` には載せない
       // （利用者へ「2つを1つにまとめた」と伝える対象ではない）。
@@ -778,11 +1288,12 @@ function repointChild(
         writeFoldDeletion(db, foreignKey.childTable, previousId);
       }
     }
+
+    return changes;
   };
 
   try {
-    runRepoint();
-    return;
+    return runRepoint();
   } catch (err: unknown) {
     const sqliteErr = err as { code?: string };
     if (
@@ -793,15 +1304,23 @@ function repointChild(
     }
 
     // 勝者側に「同じもの」が既にある。子どうしを親と同じLWWで1行へ畳む。
-    const rivalRow = findUniqueRival(
+    // 相手は索引から**先に全部**引く（1本目を畳んでから2本目が見える、が起きないように）。
+    // 付け替えで子のidそのものが動く形（外部キーが主キーを兼ねる1:1）では、
+    // 動いた先のidを占めている行も相手なので、主キーの組も足して引く。
+    const rivalRows = findUniqueRivals(
       db,
       foreignKey.childTable,
+      primaryKey,
       repointedRow,
-      err
+      childRow[primaryKey],
+      [
+        primaryKeyAsUniqueKey(primaryKey),
+        ...readSecondaryUniqueKeys(db, foreignKey.childTable),
+      ]
     );
 
     // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
-    if (!rivalRow) throw err;
+    if (rivalRows.length === 0) throw err;
 
     const childTimestampColumn = resolveTimestampColumn(
       db,
@@ -809,28 +1328,74 @@ function repointChild(
       timestampColumn
     );
 
+    // 付け替え先の主キーを既に占めている行（外部キーが子の主キーを兼ねる1:1で、
+    // 付け替えによって子のidが動く場合にだけ現れる）。
+    //
+    // **これは畳みの候補にできない。** 畳みは「敗者idの行を消して勝者idへ寄せる」
+    // ことだが、この相手のidは付け替え後の自分のidそのものなので、敗者idと勝者idが
+    // 同じになる。{@link foldRowInto} は何もせずに戻り、そのあと同じ付け替えを
+    // もう一度走らせて主キー違反を投げる（どの catch にも捕まらない）。
+    //
+    // 席は1つしか無いのだから、**どちらが勝っても残る行はこの席の行1つ**。
+    // 勝敗が決めるのは中身であって、どちらの行が消えるかではない。
+    const nextId = String(repointedRow[primaryKey]);
+    const slotOccupant = rivalRows.find(
+      (rivalRow) => String(rivalRow[primaryKey]) === nextId
+    );
+    const foldableRivals = rivalRows.filter(
+      (rivalRow) => rivalRow !== slotOccupant
+    );
+
     if (
-      isPreferredOverRival(
+      outranksAllRivals(
         db,
         repointedRow,
-        rivalRow,
+        rivalRows,
         childTimestampColumn,
         primaryKey
       )
     ) {
-      // 付け替える側が残る → 先に衝突相手を畳んでから、もう一度付け替える
+      // 付け替える側の中身が残る → 先に衝突相手を全員畳む
+      const allFolded = foldableRivals
+        .map((rivalRow) =>
+          foldRowInto(
+            db,
+            foreignKey.childTable,
+            primaryKey,
+            rivalRow,
+            repointedRow,
+            timestampColumn,
+            folded,
+            folds
+          )
+        )
+        .every((didFold) => didFold);
+
+      // 畳めなかった相手が居るのに付け替えを走らせると、同じ違反をもう一度、
+      // 今度は誰も受け取らない形で投げることになる。握りつぶさず呼び出し元へ渡す。
+      if (!allFolded) throw err;
+
+      if (!slotOccupant) return runRepoint();
+
+      // 席が埋まっているので行そのものは動かせない。動かす側の行を席へ畳んでから、
+      // 中身だけ席へ移す（孫は席の行へ引き取られる）。
+      //
+      // **この順序を逆にしてはいけない。** 明け渡す側の行がまだ在るうちに中身を席へ
+      // 書くと、その行が握っているユニークな値（子自身のセカンダリUNIQUE）と衝突して
+      // 投げる。畳んで消したあとなら、その値は空いている。
       foldRowInto(
         db,
         foreignKey.childTable,
         primaryKey,
-        rivalRow,
+        childRow,
         repointedRow,
         timestampColumn,
         folded,
         folds
       );
-      runRepoint();
-      return;
+      overwriteRow(db, foreignKey.childTable, primaryKey, repointedRow);
+      // 付け替えたのではなく畳まれて消えた（この子ぶんの `RecordFold` が別に1件出る）
+      return 0;
     }
 
     // 衝突相手が残る → 付け替える側を衝突相手へ畳む（孫は衝突相手へ引き取られる）
@@ -839,11 +1404,20 @@ function repointChild(
       foreignKey.childTable,
       primaryKey,
       childRow,
-      rivalRow,
+      selectSurvivingRival(
+        db,
+        rivalRows,
+        childTimestampColumn,
+        primaryKey
+      ),
       timestampColumn,
       folded,
       folds
     );
+
+    // この子は付け替えたのではなく畳まれて消えた。数えるのは付け替えた行だけなので 0
+    // （この子ぶんの `RecordFold` が別に1件出ており、孫の数はそちらに載る）。
+    return 0;
   }
 }
 
@@ -868,6 +1442,9 @@ function repointChild(
  *
  * @param folded - 同じ行を二度たどらないための印（子の付け替えの再入防止）
  * @param folds - 畳んだ記録の集め先。呼び出し元を通って {@link SyncResult.folds} へ出る
+ * @returns 畳んだか。**敗者idと勝者idが同じなら何もせず false**（畳みは
+ *   「敗者idの行を消して勝者idへ寄せる」ことなので、同じidでは成り立たない）。
+ *   呼び出し元は、畳めたつもりで先へ進まないためにこれを見ること。
  * @internal
  */
 function foldRowInto(
@@ -879,10 +1456,10 @@ function foldRowInto(
   timestampColumn: string,
   folded: Set<string>,
   folds: RecordFold[]
-): void {
+): boolean {
   const losingId = String(losingRow[primaryKey]);
   const winningId = String(winningRow[primaryKey]);
-  if (losingId === winningId) return;
+  if (losingId === winningId) return false;
 
   // 自己参照する外部キーがあると同じ行へ戻ってくる可能性があるため、
   // **子の付け替えだけ**は繰り返さない（無限再帰になる）。
@@ -893,18 +1470,22 @@ function foldRowInto(
   const revisited = folded.has(marker);
   folded.add(marker);
 
-  if (!revisited) {
-    repointChildren(
-      db,
-      tableName,
-      primaryKey,
-      losingRow,
-      winningRow,
-      timestampColumn,
-      folded,
-      folds
-    );
-  }
+  // 付け替えた子の数は利用者へ返す（{@link RecordFold.movedChildren}）。
+  // 再入したときは付け替えを繰り返さないので 0。
+  const carry = revisited
+    ? emptyChildCarry()
+    : repointChildren(
+        db,
+        tableName,
+        primaryKey,
+        losingRow,
+        winningRow,
+        timestampColumn,
+        folded,
+        folds,
+        // このあと敗者行を消す。値で繋がっている子は削除から守る必要がある
+        true
+      );
 
   const changelogIdBefore = maxChangelogId(db) ?? 0;
 
@@ -912,51 +1493,71 @@ function foldRowInto(
     `DELETE FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
   ).run(losingRow[primaryKey]);
 
+  // 削除を越えて子を引き継ぐ後始末（外した参照を戻す・失われた数を数える）。
+  // ここで `carry` の数が確定する。
+  for (const finishCarry of carry.afterDelete) finishCarry();
+
   recordMerge(db, tableName, losingId, winningId);
 
   // 「この行とこの行が1つになった」を呼び出し元へ伝える（利用者への説明に使われる）。
   // この経路は行を消しているので removedLocalRow は true。
-  recordFold(folds, tableName, losingId, winningId, true);
+  recordFold(
+    folds,
+    tableName,
+    losingId,
+    winningId,
+    true,
+    carry.movedChildren,
+    carry.lostChildren
+  );
 
   // 通常はいま起こしたDELETEでトリガーが `_changelog` に記録している。フルマージは
   // トリガーを外して走るのでそれが無く、畳みが差分経路に載らないまま埋もれる。手で書く。
   if (!hasChangelogDelete(db, tableName, losingId, changelogIdBefore)) {
     writeFoldDeletion(db, tableName, losingId);
   }
+
+  return true;
 }
 
 /**
- * 敗者行を勝者行へ畳み、勝者行を挿入する。
+ * 敗者行（複数可）を勝者行へ畳み、勝者行を挿入する。
+ *
+ * 1回の挿入がユニーク索引ごとに別々の行にぶつかることがあるため、敗者は**組で**受け取る。
+ * 呼び出し元は全員ぶんの勝敗を先に決めてから渡すこと（途中で拒否が決まる形にしない）。
  *
  * 付け替えの時点では勝者行がまだ存在しないため、外部キーの**検査**をトランザクション
  * 終端まで遅らせる（`PRAGMA defer_foreign_keys`）。制約を切るのではなく検査を遅らせる
  * だけなので、COMMIT時に矛盾が残っていれば通常どおり失敗する。
  *
- * この pragma はCOMMIT/ROLLBACKで自動的に戻る。トランザクションの外では効かない
- * （文ごとに暗黙のCOMMITが起きるため）ので、外から呼ばれた場合はここで張る。
+ * 畳みと挿入は1つの区切り（SAVEPOINT）で行う。想定していない制約で挿入が失敗したときに、
+ * **畳んだぶんだけが残る**のを避けるため。
  * @internal
  */
 function foldAndReplace(
   db: Database.Database,
   tableName: string,
   primaryKey: string,
-  losingRow: Record<string, unknown>,
+  losingRows: Record<string, unknown>[],
   record: Record<string, unknown>,
   columns: string[],
   timestampColumn: string,
   folds: RecordFold[]
 ): void {
-  runDeferringForeignKeys(db, () => {
-    foldRowInto(
-      db,
-      tableName,
-      primaryKey,
-      losingRow,
-      record,
-      timestampColumn,
-      new Set(),
-      folds
-    );
+  runInSavepoint(db, () => {
+    const folded = new Set<string>();
+    for (const losingRow of losingRows) {
+      foldRowInto(
+        db,
+        tableName,
+        primaryKey,
+        losingRow,
+        record,
+        timestampColumn,
+        folded,
+        folds
+      );
+    }
     db.prepare(
       `INSERT INTO ${escapeIdentifier(tableName)} (${columns
         .map((column) => escapeIdentifier(column))
@@ -1094,7 +1695,7 @@ export function applyMergedDelete(
       localDb,
       tableName,
       primaryKey,
-      losingRow,
+      [losingRow],
       remapMergedForeignKeys(localDb, tableName, primaryKey, winningRow),
       columns,
       timestampColumn,
@@ -1296,29 +1897,42 @@ export function applyInsert(
 
       // ケース2: 別PK・同一ユニークキーの行が存在する（セカンダリUNIQUE違反）。
       // 各クライアントが独立に同じ論理エンティティの行を作成した場合に発生する。
-      // 違反したカラムからローカルの競合行を特定し、LWWで一方に収束させる。
-      const conflictRow = findUniqueRival(localDb, tableName, record, err);
+      // ローカルの競合行を**索引から先に全部**引き、全員ぶんの勝敗を決めてから畳む。
+      const rivalRows = findUniqueRivals(
+        localDb,
+        tableName,
+        primaryKey,
+        record,
+        pkValue,
+        readSecondaryUniqueKeys(localDb, tableName)
+      );
 
-      if (!conflictRow) {
+      if (rivalRows.length === 0) {
         // 競合行を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
         throw err;
       }
 
-      const localUpdatedAt = String(conflictRow[timestampColumn] ?? '');
+      const survivingRival = selectSurvivingRival(
+        localDb,
+        rivalRows,
+        timestampColumn,
+        primaryKey
+      );
+      const localUpdatedAt = String(survivingRival[timestampColumn] ?? '');
 
       // 同時刻は主キーの辞書順で決める（{@link isPreferredOverRival}）。ここを
       // 「同点ならローカルが勝つ」にすると、相手側の {@link applyUpdate} が同じ2行を
       // 逆向きに畳み、生き残るidが毎周入れ替わって永久に収束しない。
       if (
-        isPreferredOverRival(
+        outranksAllRivals(
           localDb,
           record,
-          conflictRow,
+          rivalRows,
           timestampColumn,
           primaryKey
         )
       ) {
-        // リモートが新しい → ローカルの競合行を勝者（リモート行）へ畳んで置き換える。
+        // リモートが新しい → ローカルの競合行を全て勝者（リモート行）へ畳んで置き換える。
         // 敗者を指している子は勝者へ付け替えてから削除する。
         // DELETEトリガーが発火するため、敗者行の削除はchangelog/tombstone経由で
         // 他クライアントにも伝播し、全体が勝者行に収束する。
@@ -1326,7 +1940,7 @@ export function applyInsert(
           localDb,
           tableName,
           primaryKey,
-          conflictRow,
+          rivalRows,
           record,
           columns,
           timestampColumn,
@@ -1356,7 +1970,7 @@ export function applyInsert(
         localDb,
         tableName,
         String(pkValue),
-        String(conflictRow[primaryKey]),
+        String(survivingRival[primaryKey]),
         localUpdatedAt
       );
 
@@ -1366,15 +1980,18 @@ export function applyInsert(
         folds,
         tableName,
         String(pkValue),
-        String(conflictRow[primaryKey]),
-        false
+        String(survivingRival[primaryKey]),
+        false,
+        // 敗者行をローカルに持っていないので、付け替える子も失う子も居ない
+        0,
+        0
       );
 
       return {
         action: 'upserted',
         conflict: {
           table: tableName,
-          recordId: String(conflictRow[primaryKey]),
+          recordId: String(survivingRival[primaryKey]),
           localUpdatedAt,
           remoteUpdatedAt,
           resolution: 'local_wins',
@@ -1399,26 +2016,6 @@ interface ApplyUpdateResult {
 }
 
 /**
- * 「畳みかけたが、届いた更新は結局採用しない」と決まったことを表す。
- *
- * ユニークが2本以上ある表では、1回の書き込みが索引ごとに別々の相手へぶつかる。
- * 相手はエラー文からしか分からず**1本ずつしか見えない**ため、先に見えた相手を
- * 畳んでから、次の相手に負けることがある。そのまま `skipped` を返すと
- * **更新は拒まれたのに、先に畳んだ行だけが消えたまま**になる。
- *
- * そこで畳みはセーブポイントの中で行い、負けが分かった時点でこれを投げて
- * **それまでの畳みごと巻き戻す**。呼び出し元（{@link applyUpdate}）が必ず受け止めるので、
- * 同期を止める側へは抜けない。
- * @internal
- */
-class UpdateRejectedByRival extends Error {
-  constructor(readonly rivalRow: Record<string, unknown>) {
-    super('update rejected by a rival row on another unique index');
-    this.name = 'UpdateRejectedByRival';
-  }
-}
-
-/**
  * リモートのUPDATE操作をローカルDBに適用する。
  *
  * LWW（Last-Write-Wins）方式で `updatedAt` を比較し、
@@ -1437,10 +2034,10 @@ class UpdateRejectedByRival extends Error {
  * どちらの向きでも、消える行の子は先に生き残る行へ付け替えられる。
  *
  * ユニークが2本以上ある表では、1回の書き込みが索引ごとに別々の相手へぶつかる。
- * 相手はエラー文からしか分からず1本ずつしか見えないため、**先に見えた相手を畳んでから、
- * 次の相手に負ける**ことがある。畳みは区切り（SAVEPOINT）の中で行い、負けが分かった
- * 時点で {@link UpdateRejectedByRival} を投げてそこまでの畳みごと巻き戻す
- * （そうしないと、更新は拒まれたのに先に畳んだ行だけが消えたままになる）。
+ * 相手は {@link readSecondaryUniqueKeys} で**索引から先に全部引ける**ので、
+ * 1つも畳む前に全員ぶんの勝敗を決める。1人でも勝てない相手が居れば何も畳まずに拒む
+ * （「先に見えた相手を畳んでから次の相手に負け、更新は拒まれたのに畳んだ行だけが
+ * 消えたまま」という穴が、そもそも開かない形にしてある）。
  *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param tableName - 対象テーブル名
@@ -1537,7 +2134,7 @@ export function applyUpdate(
       folds,
     });
 
-    let rejectingRival: Record<string, unknown>;
+    let rivalRows: Record<string, unknown>[];
     try {
       updateStatement.run(...values);
       return remoteWins([]);
@@ -1547,71 +2144,45 @@ export function applyUpdate(
 
       // 書き込みがローカルの**別の行**のセカンダリUNIQUEに当たった
       // （利用者が編集できる名前の列で、両端末が独立に同じ名前へ辿り着いた場合）。
+      // 相手は索引から先に全部引ける。1本ずつ畳んで確かめる必要はもう無い。
+      rivalRows = findUniqueRivals(
+        localDb,
+        tableName,
+        primaryKey,
+        record,
+        pkValue,
+        readSecondaryUniqueKeys(localDb, tableName)
+      );
+
+      // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
+      // （部分索引・式索引で張られたユニークなど、列の値から相手を引けない形）。
+      if (rivalRows.length === 0) throw err;
+    }
+
+    if (
+      outranksAllRivals(localDb, record, rivalRows, timestampColumn, primaryKey)
+    ) {
+      // 届いた更新が全員に勝つ → 邪魔なローカル行を全て、更新される行へ畳んでから書き直す。
+      // 敗者の子は先に勝者へ付け替わるので、カスケードで道連れにならない。
       // 畳みと書き直しは1つの区切りで行う（片方だけ残さない）。
-      try {
-        return runInSavepoint(localDb, (): ApplyUpdateResult => {
-          const folds: RecordFold[] = [];
-          // 1回の更新が別々のユニーク索引で別々の行にぶつかることがあるため、
-          // 畳み切るまで繰り返す。畳みは必ず1行を消すので、この繰り返しは必ず止まる。
-          let uniqueError: unknown = err;
-          for (;;) {
-            const rivalRow = findUniqueRival(
-              localDb,
-              tableName,
-              record,
-              uniqueError
-            );
-            // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる。
-            // 相手が自分自身なら畳んでも1行も減らず、同じ所を回り続ける。
-            if (!rivalRow || String(rivalRow[primaryKey]) === String(pkValue)) {
-              throw uniqueError;
-            }
-
-            if (
-              !isPreferredOverRival(
-                localDb,
-                record,
-                rivalRow,
-                timestampColumn,
-                primaryKey
-              )
-            ) {
-              // 相手が勝つ → 届いた更新は採用しない。ここまでの畳みは
-              // 「この更新を通すため」に行ったものなので、区切りごと巻き戻す。
-              throw new UpdateRejectedByRival(rivalRow);
-            }
-
-            // 届いた更新が勝つ → 邪魔なローカル行を、更新される行へ畳んでから書き直す。
-            // 敗者の子は先に勝者へ付け替わるので、カスケードで道連れにならない。
-            foldRowInto(
-              localDb,
-              tableName,
-              primaryKey,
-              rivalRow,
-              record,
-              timestampColumn,
-              new Set(),
-              folds
-            );
-
-            try {
-              updateStatement.run(...values);
-              return remoteWins(folds);
-            } catch (retryErr: unknown) {
-              const retrySqliteErr = retryErr as { code?: string };
-              if (retrySqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE') {
-                throw retryErr;
-              }
-              uniqueError = retryErr;
-            }
-          }
-        });
-      } catch (thrown: unknown) {
-        // 畳みかけたぶんは巻き戻り済み。この1本だけは投げた側で受け止める
-        // （同期を止める側へ抜かさない）。
-        if (!(thrown instanceof UpdateRejectedByRival)) throw thrown;
-        rejectingRival = thrown.rivalRow;
-      }
+      const folds: RecordFold[] = [];
+      runInSavepoint(localDb, () => {
+        const folded = new Set<string>();
+        for (const rivalRow of rivalRows) {
+          foldRowInto(
+            localDb,
+            tableName,
+            primaryKey,
+            rivalRow,
+            record,
+            timestampColumn,
+            folded,
+            folds
+          );
+        }
+        updateStatement.run(...values);
+      });
+      return remoteWins(folds);
     }
 
     // ローカル行が勝った → 届いた更新は採用しない。ただし**黙って捨てない**。
@@ -1619,6 +2190,9 @@ export function applyUpdate(
     // 収束しない。ユニークキーが同じ以上この2行は同じものなので、更新対象の行の方を
     // 勝者へ畳み、その事実（`_tombstone.mergedInto`）を相手にも伝える。
     // 相手はそれを受けて同じ畳みを行い、両者が1行へ揃う。
+    //
+    // 畳むのは**更新対象の行だけ**にする。勝てなかった相手が複数居ても、それらは
+    // 「採用しないと決めた版」を通してしか結び付いていないので、まとめて畳まない。
     const folds: RecordFold[] = [];
     runDeferringForeignKeys(localDb, () => {
       foldRowInto(
@@ -1626,7 +2200,7 @@ export function applyUpdate(
         tableName,
         primaryKey,
         localRecord,
-        rejectingRival,
+        selectSurvivingRival(localDb, rivalRows, timestampColumn, primaryKey),
         timestampColumn,
         new Set(),
         folds
