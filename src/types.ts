@@ -40,6 +40,10 @@ export type TableOptions = Omit<TableConfig, 'name'>;
 export interface DiscoverOptions {
   /**
    * 主キーカラム名。このカラムが存在するテーブルだけが検出対象になる。
+   *
+   * 値は端末をまたいで一意（uuid / cuid 等）であること
+   * — 理由は {@link SyncConfig.primaryKey}。
+   *
    * @defaultValue `'id'`
    */
   primaryKey?: string;
@@ -122,6 +126,16 @@ export interface SyncConfig {
   tableOptions?: Record<string, TableOptions>;
   /**
    * 主キーカラム名。全対象テーブルで共通。
+   *
+   * **主キーの値は端末をまたいで一意でなければならない（uuid / cuid 等）。**
+   * 連番（AUTOINCREMENT）は使えない — 別々の端末が同じ値を作るため、
+   * 別物どうしが同じ行と見なされる。
+   *
+   * この前提は同期の同定だけでなく、**タイムスタンプが同点になったときの
+   * 勝敗判定**にも効く。同点は主キーの辞書順で決めるため、両端末が同じ2つの
+   * idを見て**同じ答え**に達する必要がある（違う答えに達すると、互いに相手を
+   * 畳んで生き残るidが毎周入れ替わり、永久に収束しない）。
+   *
    * @defaultValue `'id'`
    */
   primaryKey?: string;
@@ -246,6 +260,31 @@ export interface SkippedRemote {
 }
 
 /**
+ * 別id・同一ユニークキーの行を1つへ畳んだ記録。
+ *
+ * このライブラリは「ぶつかったら黙って畳む」ため、**何と何が1つになったのかを
+ * 利用者へ伝えられる必要がある**（例:「小計『知識・技能』が2つあったので1つにまとめました」）。
+ *
+ * 三つ組（表名・消えた id・残った id）は `_id_merge` テーブルに永続化されるものと
+ * 同じ形なので、あとから見返す口も同じデータから作れる。
+ */
+export interface RecordFold {
+  /** 畳みが起きたテーブル名 */
+  tableName: string;
+  /** 吸収されて消えた側のid */
+  losingId: string;
+  /** 残った側のid */
+  winningId: string;
+  /**
+   * この端末で実際に行が消えたかどうか。
+   *
+   * `false` は「敗者行をそもそもローカルに持っていなかった」場合
+   * （届いた行が負けたとき）。畳みの事実は記録されるが、ローカルの行数は変わらない。
+   */
+  removedLocalRow: boolean;
+}
+
+/**
  * 同期実行の結果統計。
  *
  * {@link SyncInstance.syncNow} の戻り値として返される。
@@ -257,12 +296,31 @@ export interface SyncResult {
   inserted: number;
   /** LWW比較でリモートが新しかったため更新したレコード数 */
   updated: number;
-  /** リモートのDELETE操作により削除したレコード数 */
+  /**
+   * ローカルから消えたレコード数。
+   *
+   * リモートのDELETE操作によるものと、ユニークキーの衝突で別の行へ**畳まれた**
+   * ぶんの両方を数える（畳みも行が1つ消える）。畳んだ相手をローカルに
+   * 持っていなかった場合は行が消えないので数えない。
+   */
   deleted: number;
   /** LWW比較でローカルが新しかったためスキップしたレコード数 */
   skipped: number;
-  /** UNIQUE制約違反をUPSERTで解決したレコード数 */
+  /**
+   * UNIQUE制約違反をLWWで解決して取り込んだレコード数。
+   *
+   * 同一idのUPSERTと、別id・同一ユニークキーの行を1つへ畳んだぶんの両方を、
+   * **届いたレコード1件につき1** 数える（1件の取り込みが連鎖的に複数の行を
+   * 畳むことがあるが、その内訳は {@link folds} を見ること）。
+   */
   conflictsResolved: number;
+  /**
+   * 別id・同一ユニークキーの行を1つへ畳んだ一覧。
+   *
+   * 件数だけでは「何と何が1つになったか」を利用者へ説明できないため、
+   * 畳みの中身をそのまま載せる。同じ内容は `_id_merge` にも永続化される。
+   */
+  folds: RecordFold[];
   /** 致命的でない警告メッセージの配列 */
   warnings: string[];
   /**

@@ -8,7 +8,14 @@
  * @module sync
  */
 import Database from 'better-sqlite3';
-import { SyncConfig, SyncResult, ChangelogEntry, TableConfig, DEFAULTS } from './types';
+import {
+  SyncConfig,
+  SyncResult,
+  ChangelogEntry,
+  RecordFold,
+  TableConfig,
+  DEFAULTS,
+} from './types';
 import {
   readChangelog,
   getMaxChangelogId,
@@ -208,6 +215,21 @@ function readRemoteRecord(
 }
 
 /**
+ * 畳みの記録を同期結果へ写す。
+ *
+ * 畳みは**行が1つ消える**ので、削除として数える（畳んだ相手をそもそも持っていなかった
+ * 場合は行が消えないため数えない）。件数だけでは「何と何が1つになったか」を利用者へ
+ * 説明できないので、中身もそのまま載せる。
+ * @internal
+ */
+function recordFolds(result: SyncResult, folds: RecordFold[]): void {
+  for (const fold of folds) {
+    result.folds.push(fold);
+    if (fold.removedLocalRow) result.deleted++;
+  }
+}
+
+/**
  * tombstoneに基づく削除をローカルに適用する。
  *
  * - ローカル `_tombstone` に max(deletedAt) と畳み先を記録する（以降の挿入/更新による
@@ -268,7 +290,7 @@ function applyTombstoneDelete(
     // 畳み先が分かっている削除。消す前に子を引き取る。
     // `deletedAt` を渡すのは、畳みより後に更新された行にまで及ばせないため
     // （判断は {@link applyMergedDelete} 側で行う）。
-    const { action } = applyMergedDelete(
+    const { folds } = applyMergedDelete(
       localDb,
       tableName,
       primaryKey,
@@ -279,7 +301,7 @@ function applyTombstoneDelete(
       timestampColumn,
       deletedAt
     );
-    if (action === 'folded') result.deleted++;
+    recordFolds(result, folds);
     return;
   }
 
@@ -399,7 +421,7 @@ function processChangelogEntries(
       if (!remoteRecord) continue; // レコードがリモートに存在しない（後続のDELETEで消えた等）
 
       if (entry.operation === 'INSERT') {
-        const { action, conflict } = applyInsert(
+        const { action, conflict, folds } = applyInsert(
           localDb,
           entry.tableName,
           primaryKey,
@@ -409,6 +431,7 @@ function processChangelogEntries(
         );
         if (action === 'inserted') result.inserted++;
         if (action === 'upserted') result.conflictsResolved++;
+        recordFolds(result, folds);
         if (conflict) {
           result.warnings.push(
             `Conflict on ${entry.tableName}:${entry.recordId} resolved as ${conflict.resolution}`
@@ -416,7 +439,7 @@ function processChangelogEntries(
         }
       } else {
         // UPDATE
-        const { action, conflict } = applyUpdate(
+        const { action, conflict, folds } = applyUpdate(
           localDb,
           entry.tableName,
           primaryKey,
@@ -427,6 +450,10 @@ function processChangelogEntries(
         if (action === 'updated') result.updated++;
         if (action === 'inserted') result.inserted++;
         if (action === 'skipped') result.skipped++;
+        // 畳みは「消えた行」でもある。届いた更新を採用しなかった場合でも、
+        // 更新対象の行が畳まれて消えていることがある（skipped だけでは実態に合わない）。
+        if (folds.length > 0) result.conflictsResolved++;
+        recordFolds(result, folds);
         if (conflict) {
           result.warnings.push(
             `Conflict on ${entry.tableName}:${entry.recordId} resolved as ${conflict.resolution}`
@@ -481,7 +508,7 @@ function performFullMergeData(
       .all() as Record<string, unknown>[];
 
     for (const remoteRecord of remoteRecords) {
-      const { action } = applyUpdate(
+      const { action, folds } = applyUpdate(
         localDb,
         table,
         primaryKey,
@@ -492,6 +519,8 @@ function performFullMergeData(
       if (action === 'updated') result.updated++;
       if (action === 'inserted') result.inserted++;
       if (action === 'skipped') result.skipped++;
+      if (folds.length > 0) result.conflictsResolved++;
+      recordFolds(result, folds);
     }
   }
 }
@@ -946,6 +975,7 @@ export async function performSync(
     deleted: 0,
     skipped: 0,
     conflictsResolved: 0,
+    folds: [],
     warnings: [],
     skippedRemotes: [],
     hadChangelogGap: false,

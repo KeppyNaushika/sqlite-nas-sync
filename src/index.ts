@@ -228,6 +228,7 @@ export type {
   SyncInstance,
   SyncResult,
   SkippedRemote,
+  RecordFold,
   SyncStatus,
   SyncEvent,
   SyncEventCallback,

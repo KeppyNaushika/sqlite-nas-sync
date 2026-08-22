@@ -6,7 +6,7 @@
  * @module conflict
  */
 import Database from 'better-sqlite3';
-import { ConflictInfo } from './types';
+import { ConflictInfo, RecordFold } from './types';
 import { ensureTombstoneMergedIntoColumn } from './setup';
 
 /**
@@ -38,6 +38,34 @@ function parseUniqueConflictColumns(
     .map((part) => part.trim())
     .filter((part) => part.startsWith(`${tableName}.`))
     .map((part) => part.slice(tableName.length + 1));
+}
+
+/**
+ * UNIQUE違反を起こしたエラーから、ローカルで衝突している相手の行を引く。
+ *
+ * 違反したカラムをエラーメッセージから特定できない場合や、その値を持つ行が
+ * 見つからない場合は undefined。呼び出し元は**握りつぶさずエラーを投げ直す**こと
+ * （相手が分からないまま畳むと、どちらを消したのか説明できない）。
+ * @internal
+ */
+function findUniqueRival(
+  db: Database.Database,
+  tableName: string,
+  record: Record<string, unknown>,
+  err: unknown
+): Record<string, unknown> | undefined {
+  const uniqueColumns = parseUniqueConflictColumns(err, tableName);
+  if (uniqueColumns.length === 0) return undefined;
+
+  return db
+    .prepare(
+      `SELECT * FROM ${escapeIdentifier(tableName)} WHERE ${uniqueColumns
+        .map((column) => `${escapeIdentifier(column)} = ?`)
+        .join(' AND ')}`
+    )
+    .get(...uniqueColumns.map((column) => record[column])) as
+    | Record<string, unknown>
+    | undefined;
 }
 
 /**
@@ -310,6 +338,42 @@ function recordMerge(
 }
 
 /**
+ * 呼び出し元へ返す畳みの一覧へ1件足す（`_id_merge` への記録と対になる）。
+ *
+ * `_id_merge` と同じく**畳み先の鎖を作らない**: 今回の敗者を勝者として持っていた
+ * 記録は、今回の勝者へ張り替える。同じ敗者が二度畳まれた場合も、記録は1件のまま
+ * 終端の勝者を指す（呼び出し元は行が消えた件数をこの一覧から数えるため、
+ * 同じ行を二度数えてはいけない）。
+ * @internal
+ */
+function recordFold(
+  folds: RecordFold[],
+  tableName: string,
+  losingId: string,
+  winningId: string,
+  removedLocalRow: boolean
+): void {
+  if (losingId === winningId) return;
+
+  for (const fold of folds) {
+    if (fold.tableName === tableName && fold.winningId === losingId) {
+      fold.winningId = winningId;
+    }
+  }
+
+  const existing = folds.find(
+    (fold) => fold.tableName === tableName && fold.losingId === losingId
+  );
+  if (existing) {
+    existing.winningId = winningId;
+    existing.removedLocalRow = existing.removedLocalRow || removedLocalRow;
+    return;
+  }
+
+  folds.push({ tableName, losingId, winningId, removedLocalRow });
+}
+
+/**
  * 畳み先を `_tombstone` に載せる（他クライアントへはこの列で伝わる）。
  *
  * - `remote_wins`（敗者行を削除した側）— DELETEトリガーが作った行に畳み先を書き込む。
@@ -555,6 +619,12 @@ function remapMergedForeignKeys(
  *
  * タイムスタンプ列が無い（または同時刻の）場合は主キーの辞書順で決める。
  * どの端末で解決しても同じ側が残るように、端末ごとに異なる情報は使わない。
+ *
+ * **同点を主キーで決められるのは、主キーが端末をまたいで一意（uuid等）だから。**
+ * 両端末が同じ2つのidを見て同じ答えに達するので、判定は対称で決定的になる
+ * （前提そのものは {@link SyncConfig.primaryKey} に書いてある）。時刻で決まらない
+ * ぶんを端末ごとに違う向きで決めると、互いに相手を畳んで生き残るidが毎周入れ替わり、
+ * 永久に収束しない。**親（この行）と子（付け替えた先）で同じ規則を使うこと。**
  * @internal
  */
 function isPreferredOverRival(
@@ -589,7 +659,8 @@ function repointChildren(
   losingRow: Record<string, unknown>,
   winningRow: Record<string, unknown>,
   timestampColumn: string,
-  folded: Set<string>
+  folded: Set<string>,
+  folds: RecordFold[]
 ): void {
   for (const foreignKey of findReferencingForeignKeys(
     db,
@@ -635,7 +706,8 @@ function repointChildren(
         childRow,
         winningValues,
         timestampColumn,
-        folded
+        folded,
+        folds
       );
     }
   }
@@ -652,7 +724,8 @@ function repointChild(
   childRow: Record<string, unknown>,
   winningValues: unknown[],
   timestampColumn: string,
-  folded: Set<string>
+  folded: Set<string>,
+  folds: RecordFold[]
 ): void {
   const escapedChildTable = escapeIdentifier(foreignKey.childTable);
   const escapedPk = escapeIdentifier(primaryKey);
@@ -685,8 +758,11 @@ function repointChild(
         childRow,
         repointedRow,
         timestampColumn,
-        folded
+        folded,
+        folds
       );
+      // ここは行が1つ消えたのではなく、1行のidが動いただけなので `folds` には載せない
+      // （利用者へ「2つを1つにまとめた」と伝える対象ではない）。
       recordMerge(db, foreignKey.childTable, previousId, nextId);
 
       // idが動いた＝古いidの行はもうどこにも無い。UPDATEトリガーが残すのは新しいidの
@@ -717,18 +793,12 @@ function repointChild(
     }
 
     // 勝者側に「同じもの」が既にある。子どうしを親と同じLWWで1行へ畳む。
-    const uniqueColumns = parseUniqueConflictColumns(err, foreignKey.childTable);
-    if (uniqueColumns.length === 0) throw err;
-
-    const rivalRow = db
-      .prepare(
-        `SELECT * FROM ${escapedChildTable} WHERE ${uniqueColumns
-          .map((column) => `${escapeIdentifier(column)} = ?`)
-          .join(' AND ')}`
-      )
-      .get(...uniqueColumns.map((column) => repointedRow[column])) as
-      | Record<string, unknown>
-      | undefined;
+    const rivalRow = findUniqueRival(
+      db,
+      foreignKey.childTable,
+      repointedRow,
+      err
+    );
 
     // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
     if (!rivalRow) throw err;
@@ -756,7 +826,8 @@ function repointChild(
         rivalRow,
         repointedRow,
         timestampColumn,
-        folded
+        folded,
+        folds
       );
       runRepoint();
       return;
@@ -770,7 +841,8 @@ function repointChild(
       childRow,
       rivalRow,
       timestampColumn,
-      folded
+      folded,
+      folds
     );
   }
 }
@@ -793,6 +865,9 @@ function repointChild(
  *
  * **孫は動かさない。** 子の主キーは変わらないので、孫は子を指したままで正しい。
  * 子自身が畳まれて消える場合（ユニーク衝突）に限り、この関数が再帰して孫を引き取る。
+ *
+ * @param folded - 同じ行を二度たどらないための印（子の付け替えの再入防止）
+ * @param folds - 畳んだ記録の集め先。呼び出し元を通って {@link SyncResult.folds} へ出る
  * @internal
  */
 function foldRowInto(
@@ -802,7 +877,8 @@ function foldRowInto(
   losingRow: Record<string, unknown>,
   winningRow: Record<string, unknown>,
   timestampColumn: string,
-  folded: Set<string>
+  folded: Set<string>,
+  folds: RecordFold[]
 ): void {
   const losingId = String(losingRow[primaryKey]);
   const winningId = String(winningRow[primaryKey]);
@@ -825,7 +901,8 @@ function foldRowInto(
       losingRow,
       winningRow,
       timestampColumn,
-      folded
+      folded,
+      folds
     );
   }
 
@@ -836,6 +913,10 @@ function foldRowInto(
   ).run(losingRow[primaryKey]);
 
   recordMerge(db, tableName, losingId, winningId);
+
+  // 「この行とこの行が1つになった」を呼び出し元へ伝える（利用者への説明に使われる）。
+  // この経路は行を消しているので removedLocalRow は true。
+  recordFold(folds, tableName, losingId, winningId, true);
 
   // 通常はいま起こしたDELETEでトリガーが `_changelog` に記録している。フルマージは
   // トリガーを外して走るのでそれが無く、畳みが差分経路に載らないまま埋もれる。手で書く。
@@ -862,7 +943,8 @@ function foldAndReplace(
   losingRow: Record<string, unknown>,
   record: Record<string, unknown>,
   columns: string[],
-  timestampColumn: string
+  timestampColumn: string,
+  folds: RecordFold[]
 ): void {
   runDeferringForeignKeys(db, () => {
     foldRowInto(
@@ -872,7 +954,8 @@ function foldAndReplace(
       losingRow,
       record,
       timestampColumn,
-      new Set()
+      new Set(),
+      folds
     );
     db.prepare(
       `INSERT INTO ${escapeIdentifier(tableName)} (${columns
@@ -890,20 +973,34 @@ function foldAndReplace(
  * ここで張る。
  * @internal
  */
-function runDeferringForeignKeys(
+function runDeferringForeignKeys<T>(
   db: Database.Database,
-  apply: () => void
-): void {
-  const run = (): void => {
+  apply: () => T
+): T {
+  const run = (): T => {
     db.pragma('defer_foreign_keys = ON');
-    apply();
+    return apply();
   };
 
-  if (db.inTransaction) {
-    run();
-  } else {
-    db.transaction(run)();
-  }
+  if (db.inTransaction) return run();
+  return db.transaction(run)();
+}
+
+/**
+ * 自分だけの区切り（SAVEPOINT）を張って処理を実行する。外部キーの検査は終端まで遅らせる。
+ *
+ * {@link runDeferringForeignKeys} と違い、**既にトランザクションの中でも外側へ相乗り
+ * しない**（better-sqlite3 の入れ子トランザクションは SAVEPOINT になる）。途中で例外を
+ * 投げれば、この区切りで行ったぶんだけが巻き戻り、外側の取り込みはそのまま続けられる。
+ *
+ * 「畳んでから書き込む」ような、**途中でやめると片方だけ残る**処理に使う。
+ * @internal
+ */
+function runInSavepoint<T>(db: Database.Database, apply: () => T): T {
+  return db.transaction((): T => {
+    db.pragma('defer_foreign_keys = ON');
+    return apply();
+  })();
 }
 
 /**
@@ -928,7 +1025,7 @@ function runDeferringForeignKeys(
  *   いけない（例: 敗者行のユニークキーがその後変更され、もう衝突しない場合）。
  *   見送ってもデータは失われず、その行を送り返した時点で相手側が同じLWWを
  *   今度は逆向きに適用して収束する。
- * @returns 畳んだか（`folded`）、何もしなかったか（`skipped`）
+ * @returns 畳んだか（`folded`）、何もしなかったか（`skipped`）と、畳んだ記録
  * @internal
  */
 export function applyMergedDelete(
@@ -941,9 +1038,10 @@ export function applyMergedDelete(
   columns: string[],
   timestampColumn: string = 'updatedAt',
   foldedAt?: string
-): { action: 'folded' | 'skipped' } {
+): { action: 'folded' | 'skipped'; folds: RecordFold[] } {
   const escapedTable = escapeIdentifier(tableName);
   const escapedPk = escapeIdentifier(primaryKey);
+  const folds: RecordFold[] = [];
 
   const losingRow = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
@@ -960,14 +1058,14 @@ export function applyMergedDelete(
       foldedAt
     )
   ) {
-    return { action: 'skipped' };
+    return { action: 'skipped', folds };
   }
 
   // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
   // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
   recordMerge(localDb, tableName, losingId, winningId, foldedAt);
 
-  if (!losingRow) return { action: 'skipped' };
+  if (!losingRow) return { action: 'skipped', folds };
 
   const localWinningRow = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
@@ -982,10 +1080,11 @@ export function applyMergedDelete(
         losingRow,
         localWinningRow,
         timestampColumn,
-        new Set()
+        new Set(),
+        folds
       );
     });
-    return { action: 'folded' };
+    return { action: 'folded', folds };
   }
 
   if (winningRow) {
@@ -998,13 +1097,14 @@ export function applyMergedDelete(
       losingRow,
       remapMergedForeignKeys(localDb, tableName, primaryKey, winningRow),
       columns,
-      timestampColumn
+      timestampColumn,
+      folds
     );
-    return { action: 'folded' };
+    return { action: 'folded', folds };
   }
 
   // 畳み先がどこにも無い → 敗者行はそのまま残す（消すと子が道連れになる）
-  return { action: 'skipped' };
+  return { action: 'skipped', folds };
 }
 
 /**
@@ -1062,6 +1162,17 @@ export function isShadowedByTombstone(
 }
 
 /**
+ * {@link applyInsert} の返り値。
+ * @internal
+ */
+interface ApplyInsertResult {
+  action: 'inserted' | 'upserted' | 'skipped';
+  conflict?: ConflictInfo;
+  /** 別id・同一ユニークキーの行を1つへ畳んだ記録（畳んでいなければ空） */
+  folds: RecordFold[];
+}
+
+/**
  * リモートのINSERT操作をローカルDBに適用する。
  *
  * 通常のINSERTを試み、UNIQUE制約違反（PK重複やユニークカラム重複）が
@@ -1078,7 +1189,8 @@ export function isShadowedByTombstone(
  * @param primaryKey - 主キーカラム名
  * @param remoteRecord - 挿入するリモートレコード
  * @param columns - テーブルのカラム名配列
- * @returns 実行されたアクション（`inserted` / `upserted` / `skipped`）と競合情報
+ * @returns 実行されたアクション（`inserted` / `upserted` / `skipped`）と競合情報、
+ *   および畳んだ記録（{@link RecordFold}）
  * @throws UNIQUE制約以外のSQLiteエラー
  */
 export function applyInsert(
@@ -1088,10 +1200,11 @@ export function applyInsert(
   remoteRecord: Record<string, unknown>,
   columns: string[],
   timestampColumn: string = 'updatedAt'
-): { action: 'inserted' | 'upserted' | 'skipped'; conflict?: ConflictInfo } {
+): ApplyInsertResult {
   const escapedTable = escapeIdentifier(tableName);
   const escapedColumns = columns.map((c) => escapeIdentifier(c));
   const placeholders = columns.map(() => '?').join(', ');
+  const folds: RecordFold[] = [];
 
   // より新しい削除(tombstone)が記録済みのスロットには再挿入しない（決定論的LWW: 削除が勝つ）
   if (
@@ -1102,7 +1215,7 @@ export function applyInsert(
       String(remoteRecord[timestampColumn] ?? '')
     )
   ) {
-    return { action: 'skipped' };
+    return { action: 'skipped', folds };
   }
 
   // 既に畳まれて消えた行を指す外部キーを、吸収先へ向け直す
@@ -1120,7 +1233,7 @@ export function applyInsert(
         `INSERT INTO ${escapedTable} (${escapedColumns.join(', ')}) VALUES (${placeholders})`
       )
       .run(...values);
-    return { action: 'inserted' };
+    return { action: 'inserted', folds };
   } catch (err: unknown) {
     const sqliteErr = err as { code?: string };
     if (
@@ -1164,6 +1277,7 @@ export function applyInsert(
               remoteUpdatedAt,
               resolution: 'remote_wins',
             },
+            folds,
           };
         }
 
@@ -1176,25 +1290,14 @@ export function applyInsert(
             remoteUpdatedAt,
             resolution: 'local_wins',
           },
+          folds,
         };
       }
 
       // ケース2: 別PK・同一ユニークキーの行が存在する（セカンダリUNIQUE違反）。
       // 各クライアントが独立に同じ論理エンティティの行を作成した場合に発生する。
       // 違反したカラムからローカルの競合行を特定し、LWWで一方に収束させる。
-      const uniqueColumns = parseUniqueConflictColumns(err, tableName);
-      const conflictRow =
-        uniqueColumns.length > 0
-          ? (localDb
-              .prepare(
-                `SELECT * FROM ${escapedTable} WHERE ${uniqueColumns
-                  .map((c) => `${escapeIdentifier(c)} = ?`)
-                  .join(' AND ')}`
-              )
-              .get(...uniqueColumns.map((c) => record[c])) as
-              | Record<string, unknown>
-              | undefined)
-          : undefined;
+      const conflictRow = findUniqueRival(localDb, tableName, record, err);
 
       if (!conflictRow) {
         // 競合行を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
@@ -1203,7 +1306,18 @@ export function applyInsert(
 
       const localUpdatedAt = String(conflictRow[timestampColumn] ?? '');
 
-      if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
+      // 同時刻は主キーの辞書順で決める（{@link isPreferredOverRival}）。ここを
+      // 「同点ならローカルが勝つ」にすると、相手側の {@link applyUpdate} が同じ2行を
+      // 逆向きに畳み、生き残るidが毎周入れ替わって永久に収束しない。
+      if (
+        isPreferredOverRival(
+          localDb,
+          record,
+          conflictRow,
+          timestampColumn,
+          primaryKey
+        )
+      ) {
         // リモートが新しい → ローカルの競合行を勝者（リモート行）へ畳んで置き換える。
         // 敗者を指している子は勝者へ付け替えてから削除する。
         // DELETEトリガーが発火するため、敗者行の削除はchangelog/tombstone経由で
@@ -1215,7 +1329,8 @@ export function applyInsert(
           conflictRow,
           record,
           columns,
-          timestampColumn
+          timestampColumn,
+          folds
         );
 
         return {
@@ -1227,6 +1342,7 @@ export function applyInsert(
             remoteUpdatedAt,
             resolution: 'remote_wins',
           },
+          folds,
         };
       }
 
@@ -1244,6 +1360,16 @@ export function applyInsert(
         localUpdatedAt
       );
 
+      // 敗者行はそもそもローカルに無いので、行は消えていない（数には出さない）。
+      // それでも「2つが1つになった」ことは利用者へ伝える。
+      recordFold(
+        folds,
+        tableName,
+        String(pkValue),
+        String(conflictRow[primaryKey]),
+        false
+      );
+
       return {
         action: 'upserted',
         conflict: {
@@ -1253,10 +1379,42 @@ export function applyInsert(
           remoteUpdatedAt,
           resolution: 'local_wins',
         },
+        folds,
       };
     }
 
     throw err;
+  }
+}
+
+/**
+ * {@link applyUpdate} の返り値。
+ * @internal
+ */
+interface ApplyUpdateResult {
+  action: 'updated' | 'skipped' | 'inserted';
+  conflict?: ConflictInfo;
+  /** 別id・同一ユニークキーの行を1つへ畳んだ記録（畳んでいなければ空） */
+  folds: RecordFold[];
+}
+
+/**
+ * 「畳みかけたが、届いた更新は結局採用しない」と決まったことを表す。
+ *
+ * ユニークが2本以上ある表では、1回の書き込みが索引ごとに別々の相手へぶつかる。
+ * 相手はエラー文からしか分からず**1本ずつしか見えない**ため、先に見えた相手を
+ * 畳んでから、次の相手に負けることがある。そのまま `skipped` を返すと
+ * **更新は拒まれたのに、先に畳んだ行だけが消えたまま**になる。
+ *
+ * そこで畳みはセーブポイントの中で行い、負けが分かった時点でこれを投げて
+ * **それまでの畳みごと巻き戻す**。呼び出し元（{@link applyUpdate}）が必ず受け止めるので、
+ * 同期を止める側へは抜けない。
+ * @internal
+ */
+class UpdateRejectedByRival extends Error {
+  constructor(readonly rivalRow: Record<string, unknown>) {
+    super('update rejected by a rival row on another unique index');
+    this.name = 'UpdateRejectedByRival';
   }
 }
 
@@ -1267,12 +1425,30 @@ export function applyInsert(
  * リモートの方が新しい場合のみローカルを更新する。
  * ローカルにレコードが存在しない場合はINSERTする。
  *
+ * 書き込みがローカルの**別の行**のセカンダリUNIQUEに当たった場合は、
+ * {@link applyInsert} と同じ畳み（LWWで1行へ統合する）で解決する。作成の衝突と違い
+ * **更新対象の行はローカルに既に在る**ため、どちらが負けても実際に行が1つ消える:
+ *
+ * - 届いた更新が勝つ → 邪魔なローカル行を畳んでから書き込む
+ * - ローカル行が勝つ → 更新対象の行の方を勝者へ畳む。届いた更新を黙って捨てると、
+ *   相手は送り続けこちらは断り続けて**分岐したまま収束しない**。畳み先は
+ *   `_tombstone.mergedInto` に載って相手にも届き、相手が同じ畳みを行う
+ *
+ * どちらの向きでも、消える行の子は先に生き残る行へ付け替えられる。
+ *
+ * ユニークが2本以上ある表では、1回の書き込みが索引ごとに別々の相手へぶつかる。
+ * 相手はエラー文からしか分からず1本ずつしか見えないため、**先に見えた相手を畳んでから、
+ * 次の相手に負ける**ことがある。畳みは区切り（SAVEPOINT）の中で行い、負けが分かった
+ * 時点で {@link UpdateRejectedByRival} を投げてそこまでの畳みごと巻き戻す
+ * （そうしないと、更新は拒まれたのに先に畳んだ行だけが消えたままになる）。
+ *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param tableName - 対象テーブル名
  * @param primaryKey - 主キーカラム名
  * @param remoteRecord - リモート側のレコードデータ
  * @param columns - テーブルのカラム名配列
- * @returns 実行されたアクション（`updated` / `skipped` / `inserted`）と競合情報
+ * @returns 実行されたアクション（`updated` / `skipped` / `inserted`）と競合情報、
+ *   および畳んだ記録（{@link RecordFold}）
  */
 export function applyUpdate(
   localDb: Database.Database,
@@ -1281,7 +1457,7 @@ export function applyUpdate(
   remoteRecord: Record<string, unknown>,
   columns: string[],
   timestampColumn: string = 'updatedAt'
-): { action: 'updated' | 'skipped' | 'inserted'; conflict?: ConflictInfo } {
+): ApplyUpdateResult {
   const escapedTable = escapeIdentifier(tableName);
   const escapedPk = escapeIdentifier(primaryKey);
 
@@ -1311,7 +1487,7 @@ export function applyUpdate(
       timestampColumn
     );
     if (insertResult.action === 'inserted') {
-      return { action: 'inserted' };
+      return { action: 'inserted', folds: insertResult.folds };
     }
     return {
       action:
@@ -1319,6 +1495,7 @@ export function applyUpdate(
           ? 'updated'
           : 'skipped',
       conflict: insertResult.conflict,
+      folds: insertResult.folds,
     };
   }
 
@@ -1332,14 +1509,11 @@ export function applyUpdate(
       .map((c) => `${escapeIdentifier(c)} = ?`)
       .join(', ');
     const values = [...updateColumns.map((c) => record[c]), pkValue];
+    const updateStatement = localDb.prepare(
+      `UPDATE ${escapedTable} SET ${setClause} WHERE ${escapedPk} = ?`
+    );
 
-    localDb
-      .prepare(
-        `UPDATE ${escapedTable} SET ${setClause} WHERE ${escapedPk} = ?`
-      )
-      .run(...values);
-
-    return {
+    const remoteWins = (folds: RecordFold[]): ApplyUpdateResult => ({
       action: 'updated',
       conflict: {
         table: tableName,
@@ -1348,7 +1522,117 @@ export function applyUpdate(
         remoteUpdatedAt,
         resolution: 'remote_wins',
       },
-    };
+      folds,
+    });
+
+    const localWins = (folds: RecordFold[]): ApplyUpdateResult => ({
+      action: 'skipped',
+      conflict: {
+        table: tableName,
+        recordId: String(pkValue),
+        localUpdatedAt,
+        remoteUpdatedAt,
+        resolution: 'local_wins',
+      },
+      folds,
+    });
+
+    let rejectingRival: Record<string, unknown>;
+    try {
+      updateStatement.run(...values);
+      return remoteWins([]);
+    } catch (err: unknown) {
+      const sqliteErr = err as { code?: string };
+      if (sqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+
+      // 書き込みがローカルの**別の行**のセカンダリUNIQUEに当たった
+      // （利用者が編集できる名前の列で、両端末が独立に同じ名前へ辿り着いた場合）。
+      // 畳みと書き直しは1つの区切りで行う（片方だけ残さない）。
+      try {
+        return runInSavepoint(localDb, (): ApplyUpdateResult => {
+          const folds: RecordFold[] = [];
+          // 1回の更新が別々のユニーク索引で別々の行にぶつかることがあるため、
+          // 畳み切るまで繰り返す。畳みは必ず1行を消すので、この繰り返しは必ず止まる。
+          let uniqueError: unknown = err;
+          for (;;) {
+            const rivalRow = findUniqueRival(
+              localDb,
+              tableName,
+              record,
+              uniqueError
+            );
+            // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる。
+            // 相手が自分自身なら畳んでも1行も減らず、同じ所を回り続ける。
+            if (!rivalRow || String(rivalRow[primaryKey]) === String(pkValue)) {
+              throw uniqueError;
+            }
+
+            if (
+              !isPreferredOverRival(
+                localDb,
+                record,
+                rivalRow,
+                timestampColumn,
+                primaryKey
+              )
+            ) {
+              // 相手が勝つ → 届いた更新は採用しない。ここまでの畳みは
+              // 「この更新を通すため」に行ったものなので、区切りごと巻き戻す。
+              throw new UpdateRejectedByRival(rivalRow);
+            }
+
+            // 届いた更新が勝つ → 邪魔なローカル行を、更新される行へ畳んでから書き直す。
+            // 敗者の子は先に勝者へ付け替わるので、カスケードで道連れにならない。
+            foldRowInto(
+              localDb,
+              tableName,
+              primaryKey,
+              rivalRow,
+              record,
+              timestampColumn,
+              new Set(),
+              folds
+            );
+
+            try {
+              updateStatement.run(...values);
+              return remoteWins(folds);
+            } catch (retryErr: unknown) {
+              const retrySqliteErr = retryErr as { code?: string };
+              if (retrySqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE') {
+                throw retryErr;
+              }
+              uniqueError = retryErr;
+            }
+          }
+        });
+      } catch (thrown: unknown) {
+        // 畳みかけたぶんは巻き戻り済み。この1本だけは投げた側で受け止める
+        // （同期を止める側へ抜かさない）。
+        if (!(thrown instanceof UpdateRejectedByRival)) throw thrown;
+        rejectingRival = thrown.rivalRow;
+      }
+    }
+
+    // ローカル行が勝った → 届いた更新は採用しない。ただし**黙って捨てない**。
+    // 捨てるだけでは、相手はこの行を送り続け、こちらは断り続けて分岐したまま
+    // 収束しない。ユニークキーが同じ以上この2行は同じものなので、更新対象の行の方を
+    // 勝者へ畳み、その事実（`_tombstone.mergedInto`）を相手にも伝える。
+    // 相手はそれを受けて同じ畳みを行い、両者が1行へ揃う。
+    const folds: RecordFold[] = [];
+    runDeferringForeignKeys(localDb, () => {
+      foldRowInto(
+        localDb,
+        tableName,
+        primaryKey,
+        localRecord,
+        rejectingRival,
+        timestampColumn,
+        new Set(),
+        folds
+      );
+    });
+    return localWins(folds);
   }
 
   return {
@@ -1363,6 +1647,7 @@ export function applyUpdate(
             resolution: 'local_wins',
           }
         : undefined,
+    folds: [],
   };
 }
 
