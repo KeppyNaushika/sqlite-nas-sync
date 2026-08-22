@@ -11,6 +11,46 @@ import Database from 'better-sqlite3';
 import { TableConfig } from './types';
 
 /**
+ * 「今」をユーザーレコードの `updatedAt` と同じ精度・同じ書式で得るSQL式。
+ *
+ * `datetime('now')` は**秒に切り捨てた**スペース形式（`2026-05-02 02:19:56`）を返す。
+ * これを削除や畳みの時刻に使うと、同じ秒の中で起きた更新との前後が失われる:
+ * 12:00:00.800 の削除が `12:00:00`（= .000）として記録されるので、その前に起きた
+ * 12:00:00.400 の更新の方が新しいと判定され、**消したはずの行が復活する**。
+ * アプリが書く `updatedAt` はふつうミリ秒まで持つ（`toISOString()` 等）ので、
+ * こちらだけ粗いと比較が成り立たない。
+ *
+ * `strftime('%Y-%m-%dT%H:%M:%fZ','now')` はミリ秒までのISO-T形式
+ * （`2026-05-02T02:19:56.111Z`）を返し、`updatedAt` とそのまま比べられる。
+ *
+ * 古いDBに残る秒精度・スペース形式の値と混在しても、比較はすべて
+ * `julianday()` で正規化しているので前後は正しく決まる。
+ * @internal
+ */
+export const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`;
+
+/**
+ * 秒精度の `datetime('now')` で作られた古いトリガを落とす（冪等）。
+ *
+ * トリガは `CREATE TRIGGER IF NOT EXISTS` で作るため、**既に在るDBでは中身が
+ * 古いまま残る**。時刻の精度を上げても、旧版で作られたトリガが動いているかぎり
+ * `_changelog.changedAt` と `_tombstone.deletedAt` は秒のままになる。
+ * 定義そのものを見て、古い書き方をしているものだけ作り直す
+ * （新しい定義で作られていれば何もしないので、毎回の起動でスキーマは動かない）。
+ *
+ * @internal
+ */
+function dropStaleTrigger(db: Database.Database, name: string): void {
+  const stale = db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'trigger' AND name = ? AND sql LIKE '%datetime(''now'')%'`
+    )
+    .get(name);
+  if (stale) db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`);
+}
+
+/**
  * SQL識別子をダブルクォートでエスケープする。
  * @internal
  */
@@ -75,7 +115,7 @@ export function setupChangelog(
       tableName TEXT    NOT NULL,
       recordId  TEXT    NOT NULL,
       operation TEXT    NOT NULL,
-      changedAt TEXT    NOT NULL DEFAULT (datetime('now'))
+      changedAt TEXT    NOT NULL DEFAULT (${NOW_SQL})
     )
   `);
   db.exec(
@@ -100,7 +140,7 @@ export function setupChangelog(
     CREATE TABLE IF NOT EXISTS _tombstone (
       tableName  TEXT NOT NULL,
       recordId   TEXT NOT NULL,
-      deletedAt  TEXT NOT NULL DEFAULT (datetime('now')),
+      deletedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
       mergedInto TEXT,
       PRIMARY KEY (tableName, recordId)
     )
@@ -118,7 +158,7 @@ export function setupChangelog(
       tableName TEXT NOT NULL,
       losingId  TEXT NOT NULL,
       winningId TEXT NOT NULL,
-      mergedAt  TEXT NOT NULL DEFAULT (datetime('now')),
+      mergedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
       PRIMARY KEY (tableName, losingId)
     )
   `);
@@ -139,53 +179,58 @@ export function setupChangelog(
     const escapedTable = escapeIdentifier(table);
 
     // INSERT トリガー
+    dropStaleTrigger(db, `_changelog_after_insert_${table}`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_insert_${table}
       AFTER INSERT ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', NEW.${escapedPk}, 'INSERT');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', NEW.${escapedPk}, 'INSERT', ${NOW_SQL});
       END
     `);
 
     // UPDATE トリガー
+    dropStaleTrigger(db, `_changelog_after_update_${table}`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_update_${table}
       AFTER UPDATE ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', NEW.${escapedPk}, 'UPDATE');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', NEW.${escapedPk}, 'UPDATE', ${NOW_SQL});
       END
     `);
 
     // DELETE トリガー（_tombstone にも記録）
+    dropStaleTrigger(db, `_changelog_after_delete_${table}`);
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_delete_${table}
       AFTER DELETE ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', OLD.${escapedPk}, 'DELETE');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', OLD.${escapedPk}, 'DELETE', ${NOW_SQL});
         INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt)
-        VALUES ('${table}', OLD.${escapedPk}, datetime('now'));
+        VALUES ('${table}', OLD.${escapedPk}, ${NOW_SQL});
       END
     `);
   }
 
   // _heartbeat のchangelogトリガー
+  dropStaleTrigger(db, '_changelog_after_insert__heartbeat');
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS _changelog_after_insert__heartbeat
     AFTER INSERT ON _heartbeat FOR EACH ROW
     BEGIN
-      INSERT INTO _changelog (tableName, recordId, operation)
-      VALUES ('_heartbeat', NEW.id, 'INSERT');
+      INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+      VALUES ('_heartbeat', NEW.id, 'INSERT', ${NOW_SQL});
     END
   `);
+  dropStaleTrigger(db, '_changelog_after_update__heartbeat');
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS _changelog_after_update__heartbeat
     AFTER UPDATE ON _heartbeat FOR EACH ROW
     BEGIN
-      INSERT INTO _changelog (tableName, recordId, operation)
-      VALUES ('_heartbeat', NEW.id, 'UPDATE');
+      INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+      VALUES ('_heartbeat', NEW.id, 'UPDATE', ${NOW_SQL});
     END
   `);
 

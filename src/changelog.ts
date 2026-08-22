@@ -87,7 +87,14 @@ export function cleanupChangelog(
   retentionDays: number
 ): number {
   const result = db
-    .prepare(`DELETE FROM _changelog WHERE changedAt < datetime('now', '-' || ? || ' days')`)
+    // 時刻としてそろえてから比べる。`changedAt` は 0.19.0 以降ミリ秒までのISO-T形式だが、
+    // それ以前に書かれた行は秒精度のスペース形式で、**文字列のままでは比べられない**
+    // （' '(0x20) < 'T'(0x54) なので、同じ日でも古い書式の方が常に小さく出る）。
+    // 解析できない値は julianday() が NULL を返し、比較が偽になって消えずに残る。
+    .prepare(
+      `DELETE FROM _changelog
+        WHERE julianday(changedAt) < julianday('now', '-' || ? || ' days')`
+    )
     .run(retentionDays);
   return result.changes;
 }

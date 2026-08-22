@@ -33,6 +33,7 @@ import {
   ensureTombstoneMergedIntoColumn,
   readSchemaVersion,
   writeSchemaVersion,
+  NOW_SQL,
 } from './setup';
 
 /**
@@ -117,7 +118,7 @@ function updateSyncState(
   localDb
     .prepare(
       `INSERT OR REPLACE INTO _sync_state (remoteClientId, lastSeenId, lastSyncedAt)
-       VALUES (?, ?, datetime('now'))`
+       VALUES (?, ?, ${NOW_SQL})`
     )
     .run(remoteClientId, lastSeenId);
 }
@@ -620,8 +621,10 @@ function mergeChangelog(
   // リモートの7日以内のchangelogエントリを取得
   const entries = remoteDb
     .prepare(
+      // 書式が混在しても前後が正しく決まるよう、時刻としてそろえてから比べる
+      // （{@link cleanupChangelog} と同じ理由）。
       `SELECT tableName, recordId, operation, changedAt FROM _changelog
-       WHERE changedAt >= datetime('now', '-' || ? || ' days')
+       WHERE julianday(changedAt) >= julianday('now', '-' || ? || ' days')
        ORDER BY id`
     )
     .all(retentionDays) as { tableName: string; recordId: string; operation: string; changedAt: string }[];
@@ -691,8 +694,8 @@ function reEnableTriggers(
       CREATE TRIGGER IF NOT EXISTS _changelog_after_insert_${table}
       AFTER INSERT ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', NEW.${escapedPk}, 'INSERT');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', NEW.${escapedPk}, 'INSERT', ${NOW_SQL});
       END
     `);
 
@@ -700,8 +703,8 @@ function reEnableTriggers(
       CREATE TRIGGER IF NOT EXISTS _changelog_after_update_${table}
       AFTER UPDATE ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', NEW.${escapedPk}, 'UPDATE');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', NEW.${escapedPk}, 'UPDATE', ${NOW_SQL});
       END
     `);
 
@@ -709,10 +712,10 @@ function reEnableTriggers(
       CREATE TRIGGER IF NOT EXISTS _changelog_after_delete_${table}
       AFTER DELETE ON ${escapedTable} FOR EACH ROW
       BEGIN
-        INSERT INTO _changelog (tableName, recordId, operation)
-        VALUES ('${table}', OLD.${escapedPk}, 'DELETE');
+        INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+        VALUES ('${table}', OLD.${escapedPk}, 'DELETE', ${NOW_SQL});
         INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt)
-        VALUES ('${table}', OLD.${escapedPk}, datetime('now'));
+        VALUES ('${table}', OLD.${escapedPk}, ${NOW_SQL});
       END
     `);
   }
