@@ -7,7 +7,7 @@
  */
 import Database from 'better-sqlite3';
 import { ConflictInfo, RecordFold } from './types';
-import { ensureTombstoneMergedIntoColumn } from './setup';
+import { ensureTombstoneMergedIntoColumn, NOW_SQL } from './setup';
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
@@ -505,7 +505,7 @@ function ensureIdMergeTable(db: Database.Database): void {
       tableName TEXT NOT NULL,
       losingId  TEXT NOT NULL,
       winningId TEXT NOT NULL,
-      mergedAt  TEXT NOT NULL DEFAULT (datetime('now')),
+      mergedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
       PRIMARY KEY (tableName, losingId)
     )
   `);
@@ -534,14 +534,14 @@ function recordMerge(
   ensureIdMergeTable(db);
 
   db.prepare(
-    `UPDATE _id_merge SET winningId = ?, mergedAt = datetime('now')
+    `UPDATE _id_merge SET winningId = ?, mergedAt = ${NOW_SQL}
      WHERE tableName = ? COLLATE NOCASE AND winningId = ?`
   ).run(winningId, tableName, losingId);
 
   db.prepare(
     `INSERT INTO _id_merge (tableName, losingId, winningId) VALUES (?, ?, ?)
      ON CONFLICT(tableName, losingId)
-     DO UPDATE SET winningId = excluded.winningId, mergedAt = datetime('now')`
+     DO UPDATE SET winningId = excluded.winningId, mergedAt = ${NOW_SQL}`
   ).run(tableName, losingId, winningId);
 
   // 畳む向きが後から反転した場合（敗者idの方に新しい更新が届き、勝者を畳んだ場合）、
@@ -648,7 +648,7 @@ function recordTombstoneMerge(
   // 解析できない値のときだけ文字列比較へ落とす（{@link isLaterTimestamp} と同じ方針）。
   db.prepare(
     `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
-     VALUES (?, ?, COALESCE(?, datetime('now')), ?)
+     VALUES (?, ?, COALESCE(?, ${NOW_SQL}), ?)
      ON CONFLICT(tableName, recordId) DO UPDATE SET
        mergedInto = excluded.mergedInto,
        deletedAt = CASE
@@ -741,7 +741,7 @@ function writeFoldDeletion(
 
   db.prepare(
     `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
-     VALUES (?, ?, 'DELETE', datetime('now'))`
+     VALUES (?, ?, 'DELETE', ${NOW_SQL})`
   ).run(tableName, losingId);
 }
 
@@ -1711,10 +1711,13 @@ export function applyMergedDelete(
 /**
  * 2つのタイムスタンプを「時刻」として比較する。
  *
- * `updatedAt` はISO-T形式（例: `2026-05-13T23:17:35.111+00:00`）、
- * `_tombstone.deletedAt` / `_changelog.changedAt` はトリガの `datetime('now')` による
- * スペース形式（例: `2026-05-02 02:19:56`）で、**文字列としては比較できない**
- * （同日でも ' '(0x20) < 'T'(0x54) となり削除側が常に小さく扱われる）。
+ * 比べる値は書き手によって書式が違う。`updatedAt` はアプリが書くISO-T形式
+ * （例: `2026-05-13T23:17:35.111+00:00`）。`_tombstone.deletedAt` /
+ * `_changelog.changedAt` は 0.19.0 以降 {@link NOW_SQL} による同じ精度のISO-T形式だが、
+ * **それ以前に書かれた行は `datetime('now')` による秒精度のスペース形式**
+ * （例: `2026-05-02 02:19:56`）で残っており、両者は混在する。
+ * 書式が違うと文字列としては比較できない
+ * （同日でも ' '(0x20) < 'T'(0x54) となり古い書式の側が常に小さく扱われる）。
  * SQLiteの `julianday()` で正規化して数値比較し、解析不能時のみ文字列比較に
  * フォールバックする。
  *

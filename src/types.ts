@@ -437,7 +437,7 @@ export interface ChangelogEntry {
   recordId: string;
   /** 操作種別 */
   operation: 'INSERT' | 'UPDATE' | 'DELETE';
-  /** 変更日時（ISO 8601形式、SQLiteの `datetime('now')` で生成） */
+  /** 変更日時（ISO 8601形式、ミリ秒まで。`updatedAt` と同じ精度・書式で記録される） */
   changedAt: string;
 }
 
