@@ -28,6 +28,7 @@ import {
   applyUpdate,
   isLaterTimestamp,
 } from './conflict';
+import type { ResurrectionProbe, TimestampColumnFor } from './conflict';
 import { copyToNas, ensureDirectory, listRemoteClients, openRemoteDbViaLocalCopy } from './nas';
 import {
   ensureTombstoneMergedIntoColumn,
@@ -216,6 +217,98 @@ function readRemoteRecord(
 }
 
 /**
+ * 表の名前から、その表の時刻列を答える手続きを作る。
+ *
+ * **時刻列は表ごとに違う**（`TableConfig.timestampColumn`）。子の設定を親の表に
+ * 当てると列が見つからず、その先の判断が黙って既定値へ落ちるため、表をまたいで
+ * 時刻を読む場面ではここから引く。設定に無い表（内部テーブルなど）は既定の
+ * `updatedAt`。
+ * @internal
+ */
+function makeTimestampColumnFor(tables: TableConfig[]): TimestampColumnFor {
+  const byName = new Map<string, string>();
+  for (const tableConfig of tables) {
+    byName.set(
+      tableConfig.name.toLowerCase(),
+      tableConfig.timestampColumn ?? 'updatedAt'
+    );
+  }
+  return (tableName) => byName.get(tableName.toLowerCase()) ?? 'updatedAt';
+}
+
+/**
+ * 「その行は取り込み元に現存するか」を答える手続きを作る。
+ *
+ * `_tombstone` は「いつか消された」の記録であって「今も消えている」ではない。
+ * 消したあとに作り直された行は取り込み元に現存するので、それを見て
+ * 「消えていない」と扱う（{@link applyTombstoneDelete} が tombstone を無視するのと
+ * 同じ物差し）。これが無いと、**同じ取り込みの中で親が作り直されるのに、先に届いた
+ * 子だけが `ON DELETE` に従って捨てられる**（順番だけで結果が変わる）。
+ *
+ * **聞かれる表は、呼び出し元の表とは限らない**（子の取り込みから親の表を聞かれる）。
+ * 時刻列は表ごとに違いうるので、`timestampColumnFor` でその表の設定を引く。
+ * 子の列名で親を引くと列が見つからず、作り直された親を**認識できないまま子を捨てる**。
+ *
+ * 取り込み1回につき1つ作れば足りる（表ごとの `prepare` を中で使い回す）。
+ * @internal
+ */
+function makeResurrectionProbe(
+  remoteDb: Database.Database,
+  primaryKey: string,
+  timestampColumnFor: TimestampColumnFor
+): ResurrectionProbe {
+  const escapedPk = escapeIdentifier(primaryKey);
+  // 表ごとの `SELECT`。レコードごとに `prepare` し直さない（null は「引けない表」）
+  const statements = new Map<string, Database.Statement | null>();
+
+  const statementFor = (tableName: string): Database.Statement | null => {
+    const cached = statements.get(tableName);
+    if (cached !== undefined) return cached;
+
+    let statement: Database.Statement | null = null;
+    try {
+      const columns = getTableColumns(remoteDb, tableName);
+      const preferred = timestampColumnFor(tableName);
+      const column = columns.includes(preferred)
+        ? preferred
+        : columns.includes('updatedAt')
+          ? 'updatedAt'
+          : null;
+      if (column !== null) {
+        statement = remoteDb.prepare(
+          `SELECT ${escapeIdentifier(column)} AS ts
+           FROM ${escapeIdentifier(tableName)} WHERE ${escapedPk} = ?`
+        );
+      }
+    } catch {
+      // 取り込み元にその表が無い（スキーマ違い）なら、作り直しの証拠も無い
+      statement = null;
+    }
+    statements.set(tableName, statement);
+    return statement;
+  };
+
+  return (tableName, recordId, deletedAt) => {
+    const statement = statementFor(tableName);
+    if (statement === null) return false;
+
+    try {
+      // **「行がある」だけでは作り直しの証拠にならない。** 削除をまだ受け取っていない
+      // 相手はその行を持ったままなので、存在だけで判断すると「生きている」と誤って
+      // 答え、消えた親を指す子をそのまま入れて外部キー違反を起こす（＝その相手ぶんの
+      // 取り込みが丸ごと巻き戻り、同期がその相手から永久に止まる）。
+      // 削除より**厳密に新しい**行だけを作り直しとみなす。
+      const row = statement.get(recordId) as { ts: unknown } | undefined;
+      if (!row) return false;
+
+      return isLaterTimestamp(remoteDb, String(row.ts ?? ''), deletedAt);
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
  * 畳みの記録を同期結果へ写す。
  *
  * 畳みは**行が1つ消える**ので、削除として数える（畳んだ相手をそもそも持っていなかった
@@ -258,7 +351,9 @@ function applyTombstoneDelete(
   recordId: string,
   deletedAt: string,
   mergedInto: string | null,
-  result: SyncResult
+  result: SyncResult,
+  isResurrected: ResurrectionProbe,
+  timestampColumnFor: TimestampColumnFor
 ): void {
   const hasTombstone = localDb
     .prepare(
@@ -291,7 +386,7 @@ function applyTombstoneDelete(
     // 畳み先が分かっている削除。消す前に子を引き取る。
     // `deletedAt` を渡すのは、畳みより後に更新された行にまで及ばせないため
     // （判断は {@link applyMergedDelete} 側で行う）。
-    const { folds } = applyMergedDelete(
+    const { folds, warnings } = applyMergedDelete(
       localDb,
       tableName,
       primaryKey,
@@ -300,9 +395,12 @@ function applyTombstoneDelete(
       readRemoteRecord(remoteDb, tableName, primaryKey, mergedInto),
       columns,
       timestampColumn,
-      deletedAt
+      deletedAt,
+      isResurrected,
+      timestampColumnFor
     );
     recordFolds(result, folds);
+    result.warnings.push(...warnings);
     return;
   }
 
@@ -349,6 +447,14 @@ function processChangelogEntries(
   for (const tc of configTables) {
     tableConfigMap.set(tc.name, tc);
   }
+  // 表をまたいで時刻列を引く手続きと、作り直し判定。**取り込み1回につき1つ**
+  // （レコードごとに作り直すと、表ごとの `prepare` が毎回やり直しになる）
+  const timestampColumnFor = makeTimestampColumnFor(configTables);
+  const isResurrected = makeResurrectionProbe(
+    remoteDb,
+    primaryKey,
+    timestampColumnFor
+  );
 
   for (const entry of entries) {
     // _heartbeat エントリは特別扱い: 直接適用
@@ -409,7 +515,9 @@ function processChangelogEntries(
         entry.recordId,
         remoteTombstone?.deletedAt ?? entry.changedAt,
         mergedInto,
-        result
+        result,
+        isResurrected,
+        timestampColumnFor
       );
     } else {
       // INSERT or UPDATE: リモートからレコード取得
@@ -422,17 +530,20 @@ function processChangelogEntries(
       if (!remoteRecord) continue; // レコードがリモートに存在しない（後続のDELETEで消えた等）
 
       if (entry.operation === 'INSERT') {
-        const { action, conflict, folds } = applyInsert(
+        const { action, conflict, folds, warnings } = applyInsert(
           localDb,
           entry.tableName,
           primaryKey,
           remoteRecord,
           columns,
-          timestampColumn
+          timestampColumn,
+          isResurrected,
+          timestampColumnFor
         );
         if (action === 'inserted') result.inserted++;
         if (action === 'upserted') result.conflictsResolved++;
         recordFolds(result, folds);
+        result.warnings.push(...warnings);
         if (conflict) {
           result.warnings.push(
             `Conflict on ${entry.tableName}:${entry.recordId} resolved as ${conflict.resolution}`
@@ -440,14 +551,17 @@ function processChangelogEntries(
         }
       } else {
         // UPDATE
-        const { action, conflict, folds } = applyUpdate(
+        const { action, conflict, folds, warnings } = applyUpdate(
           localDb,
           entry.tableName,
           primaryKey,
           remoteRecord,
           columns,
-          timestampColumn
+          timestampColumn,
+          isResurrected,
+          timestampColumnFor
         );
+        result.warnings.push(...warnings);
         if (action === 'updated') result.updated++;
         if (action === 'inserted') result.inserted++;
         if (action === 'skipped') result.skipped++;
@@ -488,6 +602,13 @@ function performFullMergeData(
   primaryKey: string,
   result: SyncResult
 ): void {
+  const timestampColumnFor = makeTimestampColumnFor(tables);
+  const isResurrected = makeResurrectionProbe(
+    remoteDb,
+    primaryKey,
+    timestampColumnFor
+  );
+
   for (const tableConfig of tables) {
     const table = tableConfig.name;
     const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
@@ -509,14 +630,17 @@ function performFullMergeData(
       .all() as Record<string, unknown>[];
 
     for (const remoteRecord of remoteRecords) {
-      const { action, folds } = applyUpdate(
+      const { action, folds, warnings } = applyUpdate(
         localDb,
         table,
         primaryKey,
         remoteRecord,
         columns,
-        timestampColumn
+        timestampColumn,
+        isResurrected,
+        timestampColumnFor
       );
+      result.warnings.push(...warnings);
       if (action === 'updated') result.updated++;
       if (action === 'inserted') result.inserted++;
       if (action === 'skipped') result.skipped++;
@@ -551,6 +675,12 @@ function applyTombstones(
   for (const tc of tables) {
     tableConfigMap.set(tc.name, tc);
   }
+  const timestampColumnFor = makeTimestampColumnFor(tables);
+  const isResurrected = makeResurrectionProbe(
+    remoteDb,
+    primaryKey,
+    timestampColumnFor
+  );
 
   // mergedInto は v0.14.0以前のクライアントには無い列
   const mergedIntoColumn = hasMergedIntoColumn(remoteDb)
@@ -600,7 +730,9 @@ function applyTombstones(
       ts.recordId,
       ts.deletedAt,
       mergedInto,
-      result
+      result,
+      isResurrected,
+      timestampColumnFor
     );
   }
 }
