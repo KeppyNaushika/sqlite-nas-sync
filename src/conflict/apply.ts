@@ -293,14 +293,50 @@ export function applyMergedDelete(
   // 幽霊**になり、遅れて届いた子だけが終端へ読み替えられて本当の親から切り離される。
   // 終端が動いていても、畳み先が手元に在る（`localWinningRow`）ときは実際に畳めるので
   // ここには来ない。
+  //
+  // **この畳みは自動では戻ってこない。** リモートの `_tombstone` を全件読み直す
+  // `applyTombstones` はギャップ検出時（`pullFullMerge`）にしか走らず、ふだんの増分
+  // 同期は changelog のカーソルが進んで同じ削除を二度運ばない。終端の行がこの端末へ
+  // 届いても、それだけでは畳みはやり直されない（その行に新しい変更が載って初めて
+  // 通りかかる）。幽霊を作るよりは残す方が安全だが、**黙って落とすと分岐に気づけない**
+  // ので警告として伝える。
   if (
     losingRow &&
     !localWinningRow &&
     winningRow &&
     String(winningRow[primaryKey]) !== winningId
   ) {
-    return { action: 'skipped', folds, warnings: [] };
+    return {
+      action: 'skipped',
+      folds,
+      warnings: [
+        `Fold of ${tableName}:${losingId} into ${winningId} was not applied: ` +
+          `the fold target has moved and its row is not here. ` +
+          `${losingId} stays until ${winningId} arrives.`,
+      ],
+    };
   }
+
+  // **勝者行の読み替えは、帳簿へ書く前に済ませる。** 勝者行そのものが消えた親を
+  // 指していて採れないと決まることがあり（下の `remap.record === null`）、その場合は
+  // 敗者行も畳まない。先に `recordMerge` を通してからそこで見送ると、上と同じ
+  // 「生きたまま畳まれたと記録された幽霊」になる。
+  const remap =
+    losingRow && !localWinningRow && winningRow
+      ? remapMergedForeignKeys(
+          localDb,
+          tableName,
+          primaryKey,
+          winningRow,
+          timestampColumn,
+          isResurrected,
+          timestampColumnFor
+        )
+      : null;
+  if (remap && remap.record === null) {
+    return { action: 'skipped', folds, warnings: remap.warnings };
+  }
+  const remappedWinner = remap?.record ?? null;
 
   // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
   // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
@@ -330,30 +366,16 @@ export function applyMergedDelete(
     return { action: 'folded', folds, warnings: [] };
   }
 
-  if (winningRow) {
+  if (winningRow && remap && remappedWinner) {
     // 勝者行もローカルに無い → 敗者を畳んでから勝者を入れる。
-    // 勝者行の外部キーも、既に畳まれた行を指しているかもしれないので読み替える。
-    const remap = remapMergedForeignKeys(
-      localDb,
-      tableName,
-      primaryKey,
-      winningRow,
-      timestampColumn,
-      isResurrected,
-      timestampColumnFor
-    );
-    // 勝者行そのものが、消えた親を指していて採れないと決まることがある。
-    // その場合は敗者も畳まない（畳み先が入らないのだから、消せば子が道連れになる）。
-    if (remap.record === null) {
-      return { action: 'skipped', folds, warnings: remap.warnings };
-    }
-
+    // 勝者行の外部キーの読み替え（既に畳まれた行を指しているかもしれない）は、
+    // 帳簿へ書く前に上で済ませてある。
     foldAndReplace(
       localDb,
       tableName,
       primaryKey,
       [losingRow],
-      remap.record,
+      remappedWinner,
       columns,
       timestampColumn,
       folds,
@@ -647,7 +669,12 @@ export function applyInsert(
       );
 
       return {
-        action: 'upserted',
+        // 同一PKの経路と同じ理由で、ここでも `upserted` と名乗ってはいけない。
+        // **届いたリモート行は書いていない**（勝ったのはローカルの競合行）。
+        // `action` だけを見る呼び出し元が「リモートを適用した」と読むとずれる。
+        // 行が1つに畳まれたことは `folds` が伝える（`processChangelogEntries` は
+        // `folds` を `conflictsResolved` に数える）。
+        action: 'skipped',
         conflict: {
           table: tableName,
           recordId: String(survivingRival[primaryKey]),

@@ -1,5 +1,5 @@
 /**
- * コードレビューで見つかった6件の回帰テスト。
+ * コードレビューで見つかった不具合の回帰テスト。
  *
  * どれも「同期がその相手から永久に止まる」「書かれたデータが黙って消える」側の壊れ方で、
  * 症状が出るのは**設定や履歴の組み合わせが揃ったときだけ**なので、形を固定して残す。
@@ -13,6 +13,9 @@
  * 7. 張り替えで `_id_merge.mergedAt` が**進み**、`_tombstone.deletedAt` と食い違う
  * 8. 循環の刈り取りが `_tombstone.mergedInto` を置き去りにする
  * 9. 届いたリモート行を採らなかったのに `upserted` と名乗る
+ * 10. 勝者行を採れないと決めたのに、畳みの帳簿にだけ「畳んだ」と書く
+ * 11. 書式の違う時刻を字面で比べ、循環の刈り取りが**古い主張**を残す
+ * 12. 時刻列が NULL の表で、本物の膠着まで黙って握り潰す
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -428,12 +431,13 @@ describe('レビュー指摘の回帰', () => {
             `SELECT deletedAt, mergedInto FROM _tombstone
              WHERE tableName = 'items' AND recordId = ?`
           )
-          .get(recordId) as TombstoneRow;
+          .get(recordId) as TombstoneRow | undefined;
 
-      // 刈られた B は、もう畳み先を名乗らない。名乗ったままだと `lookupIdMerge` は
-      // null を返すのに tombstone だけが `A` を指し、`remapMergedForeignKeys` が
-      // 読み替えをやめる（遅れて届いた B の子が消えた親を指して取り込みが巻き戻る）
-      expect(tombstoneOf('B').mergedInto).toBeNull();
+      // 刈られた `B→A` の主張は、2つの帳簿の**どちらからも**消える。
+      // `mergedInto` を NULL にして残すと、それは「B はただ消された」という主張に
+      // なる。B は循環で**生き残る**側の id なので、その tombstone が同期で渡ると
+      // 相手は B を畳まずに DELETE する（子も道連れ）。行ごと捨てる。
+      expect(tombstoneOf('B')).toBeUndefined();
       // 張り替えた D は終端の B を指す（`_id_merge` と同じ向き）
       expect(tombstoneOf('D').mergedInto).toBe('B');
       // 時刻は動かさない
@@ -478,6 +482,179 @@ describe('レビュー指摘の回帰', () => {
         .prepare(`SELECT name FROM items WHERE id = 'A'`)
         .get() as { name: string };
       expect(row.name).toBe('local');
+    });
+
+    it('セカンダリUNIQUE でローカルが勝っても `skipped` を返す', () => {
+      // 同一PKの経路だけ直しても、こちらが `upserted` を返し続けると2つの入口で
+      // 呼び方が食い違ったままになる（どちらも「届いた行は書いていない」結果）
+      db = createDb('insert-unique-local-wins');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          name      TEXT NOT NULL UNIQUE,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      db.prepare(
+        `INSERT INTO items (id, name, updatedAt)
+         VALUES ('A', 'same-name', '2026-06-01T00:00:00.000Z')`
+      ).run();
+
+      const result = applyInsert(
+        db,
+        'items',
+        'id',
+        { id: 'B', name: 'same-name', updatedAt: '2026-01-01T00:00:00.000Z' },
+        ['id', 'name', 'updatedAt'],
+        'updatedAt'
+      );
+
+      expect(result.action).toBe('skipped');
+      expect(result.conflict?.resolution).toBe('local_wins');
+      // 届いた B の行はどこにも入っていない
+      const ids = db
+        .prepare(`SELECT id FROM items ORDER BY id`)
+        .all() as { id: string }[];
+      expect(ids.map((row) => row.id)).toEqual(['A']);
+      // 「2つが1つになった」ことは `folds` が伝える（数え落とさない）
+      expect(result.folds).toHaveLength(1);
+    });
+  });
+
+  describe('10. 勝者行を採れないなら、帳簿にも書かない', () => {
+    const TABLES: TableConfig[] = [{ name: 'parents' }, { name: 'children' }];
+
+    it('消えた親を指す勝者行を捨てるとき、畳みを記録しない', () => {
+      db = createDb('winner-dropped');
+      db.pragma('foreign_keys = ON');
+      db.exec(`
+        CREATE TABLE parents (
+          id        TEXT PRIMARY KEY,
+          updatedAt TEXT NOT NULL
+        );
+        CREATE TABLE children (
+          id        TEXT PRIMARY KEY,
+          parentId  TEXT REFERENCES parents(id) ON DELETE CASCADE,
+          updatedAt TEXT NOT NULL
+        );
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      // 親 P は Q へ畳まれ、その Q も既に消えている（＝読み替えた先が居ない）
+      db.prepare(
+        `INSERT INTO parents (id, updatedAt) VALUES ('Q', '2026-01-01T00:00:00.000Z')`
+      ).run();
+      db.prepare(`DELETE FROM parents WHERE id = 'Q'`).run();
+      recordMerge(db, 'parents', 'P', 'Q', '2026-01-01T00:00:00.000Z');
+
+      // 敗者 c1 はローカルに在る（親は指していない）
+      db.prepare(
+        `INSERT INTO children (id, parentId, updatedAt)
+         VALUES ('c1', NULL, '2026-01-01T00:00:00.000Z')`
+      ).run();
+
+      // 届いた「c1 は c2 へ畳まれた」。勝者 c2 の行は**消えた親（P→Q）を指している**
+      const result = applyMergedDelete(
+        db,
+        'children',
+        'id',
+        'c1',
+        'c2',
+        { id: 'c2', parentId: 'P', updatedAt: '2026-02-01T00:00:00.000Z' },
+        ['id', 'parentId', 'updatedAt'],
+        'updatedAt',
+        '2026-02-01T00:00:00.000Z'
+      );
+
+      // 勝者行を採らないと決めたので、敗者 c1 も畳まない
+      expect(result.action).toBe('skipped');
+      expect(result.warnings.length).toBeGreaterThan(0);
+      const ids = db
+        .prepare(`SELECT id FROM children ORDER BY id`)
+        .all() as { id: string }[];
+      expect(ids.map((row) => row.id)).toEqual(['c1']);
+
+      // **帳簿にも書かない。** 書くと c1 は生きたまま「c2 へ畳まれた」と記録され、
+      // 遅れて届いた c1 の子だけがどこにも無い c2 へ読み替えられて、COMMIT 時の
+      // 外部キー検査でその相手ぶんの取り込みが丸ごと巻き戻る
+      expect(lookupIdMerge(db, 'children', 'c1')).toBeNull();
+      const tombstone = db
+        .prepare(
+          `SELECT mergedInto FROM _tombstone
+           WHERE tableName = 'children' AND recordId = 'c1'`
+        )
+        .get() as { mergedInto: string | null } | undefined;
+      expect(tombstone?.mergedInto ?? null).toBeNull();
+    });
+  });
+
+  describe('11. 循環の刈り取りは、時刻を「時刻として」比べる', () => {
+    const TABLES: TableConfig[] = [{ name: 'items' }];
+
+    it('旧版のスペース形式と ISO-T 形式が混ざっても、新しい主張が残る', () => {
+      db = createDb('cycle-mixed-format');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      // 循環 A↔B。**新しいのは `A→B`（10:00）** だが、そちらは旧版が書いた
+      // スペース形式なので、字面で比べると ' '(0x20) < 'T'(0x54) で古い方が勝つ。
+      // この掃除が相手にするのは旧版が残した記録そのものなので、混在は前提。
+      const insertMerge = db.prepare(
+        `INSERT OR REPLACE INTO _id_merge (tableName, losingId, winningId, mergedAt)
+         VALUES ('items', ?, ?, ?)`
+      );
+      insertMerge.run('A', 'B', '2026-06-01 10:00:00');
+      insertMerge.run('B', 'A', '2026-06-01T09:00:00.000Z');
+
+      setupChangelog(db, TABLES, 'id');
+
+      const merges = db
+        .prepare(`SELECT losingId, winningId FROM _id_merge ORDER BY losingId`)
+        .all() as { losingId: string; winningId: string }[];
+      // 残るのは新しい方の主張だけ（＝生き残るのは B）
+      expect(merges).toEqual([{ losingId: 'A', winningId: 'B' }]);
+    });
+  });
+
+  describe('12. 時刻が NULL でも、中身が違えば膠着は膠着', () => {
+    const TABLES: TableConfig[] = [{ name: 'items' }];
+
+    it('時刻列を許容 NULL にした表で、食い違いが黙って握り潰されない', () => {
+      db = createDb('null-timestamp-stalemate');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          name      TEXT,
+          updatedAt TEXT
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      db.prepare(
+        `INSERT INTO items (id, name, updatedAt) VALUES ('A', 'local', NULL)`
+      ).run();
+
+      const result = applyInsert(
+        db,
+        'items',
+        'id',
+        { id: 'A', name: 'remote', updatedAt: null },
+        ['id', 'name', 'updatedAt'],
+        'updatedAt'
+      );
+
+      expect(result.action).toBe('skipped');
+      // 両側とも時刻が無く中身が違う ＝ どちらも勝てない。**黙ってはいけない**
+      expect(
+        result.warnings.filter((warning) => warning.startsWith('Stalemate'))
+      ).toHaveLength(1);
     });
   });
 });

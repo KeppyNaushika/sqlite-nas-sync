@@ -93,7 +93,8 @@ describe('conflict', () => {
         updatedAt: '2024-01-01T00:00:00Z',
       }, columns);
 
-      expect(result.action).toBe('upserted');
+      // 届いた行は書いていないので `skipped`（勝ったのはローカルの u1）
+      expect(result.action).toBe('skipped');
       expect(result.conflict?.resolution).toBe('local_wins');
 
       // ローカル（u1）が保持され、リモート（u2）は挿入されない
@@ -650,7 +651,7 @@ describe('conflict', () => {
         accountColumns
       );
 
-      expect(result.action).toBe('upserted');
+      expect(result.action).toBe('skipped');
       expect(result.conflict?.resolution).toBe('local_wins');
       expect(result.conflict?.recordId).toBe('r2');
 
