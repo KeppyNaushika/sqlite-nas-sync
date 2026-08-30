@@ -1,3 +1,14 @@
+/**
+ * 公開型の定義と、設定の既定値。
+ *
+ * 利用者が触れるのは {@link SyncConfig} と {@link SyncResult} の2つで、残りは
+ * その中身か、結果に載る内訳（{@link ConflictInfo} / {@link RecordFold}）である。
+ *
+ * ここの doc は**利用者向けの説明そのもの**として読まれる（typedoc がそのまま
+ * APIリファレンスへ出す）。実装の都合ではなく、「何が起きるか」「どう設定するか」を書く。
+ *
+ * @module types
+ */
 import Database from 'better-sqlite3';
 
 /**

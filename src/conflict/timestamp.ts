@@ -72,7 +72,6 @@ export function isSameTimestamp(
  * 呼び出し元の設定をここから引くこと。
  *
  * 渡されない場合（公開APIを直接呼ぶ場合）は、呼び出し元が持っている列名を使う。
- * @internal
  */
 export type TimestampColumnFor = (tableName: string) => string;
 
