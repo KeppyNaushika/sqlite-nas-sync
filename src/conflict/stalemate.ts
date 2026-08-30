@@ -21,7 +21,7 @@ import { isSameIdentifier } from './schema';
  * 既に読み込んである2行を突き合わせるだけなのでDBへの問い合わせは増えない。
  *
  * @returns 食い違っていれば利用者へ見せる文言、中身も同じなら null（報告することが無い）。
- *   両側の時刻が空（＝時刻列が読めていない）ときも null —— それは膠着ではない
+ *   時刻列がその表に無い（＝設定のずれ）ときも null —— それは膠着ではない
  * @internal
  */
 export function describeStalemate(
@@ -33,12 +33,17 @@ export function describeStalemate(
   columns: string[],
   timestampColumn: string
 ): string | null {
-  // 両側の時刻が**空**なら、それは膠着ではなく「時刻が読めていない」。
-  // `timestampColumn` の設定が実際の列とずれていると（明示 `tables:` 設定でのみ起こる。
+  // 時刻列がその表に**無い**なら、それは膠着ではなく設定のずれ。
+  // `timestampColumn` が実際の列とずれていると（明示 `tables:` 設定でのみ起こる。
   // `discoverTables` は実在する列しか選ばない）、両側とも `''` を読んで
   // `isSameTimestamp('', '')` が真になり、**中身が違う行の数だけ**この警告が出る。
-  // 出るべきなのは「時刻は同じなのに中身が違う」ときだけなので、ここでは黙る。
-  if (timestamp === '') return null;
+  //
+  // 黙る条件は**列が引けたか**で見る。値が空かどうかで見ると、時刻列が NULL を
+  // 許す表で両側とも NULL のまま中身が違う——**本物の膠着**——まで一緒に握り潰し、
+  // 収束しない食い違いが誰にも知らされないまま残る。
+  if (!columns.some((column) => isSameIdentifier(column, timestampColumn))) {
+    return null;
+  }
 
   const differing = columns.filter((column) => {
     if (isSameIdentifier(column, timestampColumn)) return false;
