@@ -9,6 +9,39 @@
 
 ### 修正
 
+- **古い畳みの主張が、`_id_merge` にだけ通っていました。** `_tombstone` 側は古い主張を
+  断るのに `_id_merge.winningId` は無条件に書き換わるため、**同じ敗者idについて2つの
+  帳簿が別々の勝者を名乗る**ことがありました。6月の `A→B` のあとに1月の `A→C` が届くと
+  `_id_merge = {A→C}` / `_tombstone = {A, mergedInto: B}` となり、`A` の遅れた子は `C` へ
+  送られる一方、他端末には `A→B` と伝わり、さらに `isFoldRecordStale` は `C` への主張を
+  `B` の時刻で判定していました。主張を置いてよいかの判断を**一度だけ**下し、断るなら
+  **どちらの帳簿にも書かない**ようにしました。
+
+- **「畳み先が動いた」ときの取りやめが、いちばん起きやすい経路で素通りしていました。**
+  判定が「渡された勝者行が終端と違う id を名乗っているか」だったため、勝者行が
+  `undefined` で来る場合を拾えていませんでした。**鎖が動いた理由は中間の勝者自身が
+  畳まれて消えたこと**なので、取り込み元にもその行はもう無く、`undefined` で来るのが
+  ふつうです。素通りすると、生きている敗者行が「畳まれた」と記録され、その主張が
+  `_tombstone.mergedInto` として他端末へ渡って**向こうの生きている行が消されます**。
+  判定の根拠を「終端が動いたか」に変えました。
+
+- **循環の刈り取りが、畳み先のずれた `_tombstone` の主張を残していました。** 削除の
+  条件が `_id_merge` の勝者との一致だったため、2つの帳簿が既にずれているときだけ
+  `_id_merge` の行は消えて `_tombstone` の主張が残り、**刈り取りが直すはずの食い違いが、
+  引き先の `_id_merge` も無い状態で残っていました**。刈られる id は循環で生き残る側
+  なので、その行に載っている畳みの主張は行き先が何であれ矛盾します。畳み先を問わず
+  捨てるようにしました（利用者操作によるただの削除は今までどおり触りません）。
+
+- **`isShadowedByTombstone` だけ、表名を `COLLATE NOCASE` で引いていませんでした。**
+  DELETEトリガは自分の設定どおりの表記で書き、届くエントリは相手の設定どおりの表記を
+  持つため、`Users` と `users` のように綴りが違う端末どうしではこの引きだけ外れ、
+  同じモジュールの `isKnownDeleted` が「消えている」と見る行がここで復活していました。
+
+- **膠着（どちらも勝てない食い違い）を、INSERT だけ `local_wins` の競合として報告して
+  いました。** `Stalemate on …` と矛盾する `Conflict on …: local_wins` が並び、しかも
+  同じ膠着が UPDATE で届いた場合は競合を返さないため、**同じ状態が届き方で違って
+  見えて**いました。競合は時刻に差があるときだけ返します。
+
 - **畳みの記録に、同期を回した時刻を刻んでいました。** 別id・同一ユニークキーの2行を
   1行へ畳むとき、`_tombstone.deletedAt` と `_id_merge.mergedAt` には**現在時刻**が
   入っていました。実データの `updatedAt` は必ずそれより過去なので、畳まれた側の id は
@@ -150,6 +183,20 @@
   ままで）。`build` の前に `dist/` を消すようにしました。
 
 ### 変更
+
+- **大きくなったファイルを役割ごとに分割しました。** 公開APIと import 先は変わりません
+  （`./conflict` / `./sync` / `./setup` はそのまま使えます）。
+  `src/conflict/` は schema / timestamp / unique / stalemate / ledger / tombstone /
+  fold-changelog / remap / child-carry / transaction / fold / overwrite /
+  merged-delete / insert / update の15モジュールに、`src/sync/` は sql / state /
+  remote / entries / full-merge / triggers / pull に、`src/setup/` は sql / tombstone /
+  id-merge-repair / schema-version に分かれ、いずれも最大569行になりました。
+  テストも題材ごとに分け、共有する足場は `__tests__/helpers/` に集約しています。
+
+- **公開APIの引数・戻り値に現れる型を、APIリファレンスに載るようにしました。**
+  `ApplyInsertResult` / `ApplyUpdateResult` / `ResurrectionProbe` /
+  `TimestampColumnFor` は `applyInsert` / `applyUpdate` の型に現れるのに `@internal`
+  だったため、利用者からは**説明の無い型**として見えていました。
 
 - **`src/conflict.ts`（3000行超）を役割ごとに分割しました。** 公開APIと import 先
   （`./conflict`）は変わりません。`conflict/schema`（`PRAGMA` の読み取り）、

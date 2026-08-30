@@ -219,6 +219,14 @@ export { discoverTables } from './validator';
 // syncNowと同一のLWW競合解決（セカンダリUNIQUE違反の収束を含む）を再利用できる。
 export { applyInsert, applyUpdate, applyDelete } from './conflict';
 
+// 公開API: 上の3つの引数・戻り値に現れる型
+export type {
+  ApplyInsertResult,
+  ApplyUpdateResult,
+  ResurrectionProbe,
+  TimestampColumnFor,
+} from './conflict';
+
 // 公開型のre-export
 export type {
   TableConfig,
