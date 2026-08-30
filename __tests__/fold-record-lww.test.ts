@@ -476,8 +476,16 @@ describe('畳み先の鎖を張り替えるとき', () => {
       columns
     );
 
-    // B はこの端末では既に消えており、よそで 2026-01-01 に決まった畳み B→C が届く
+    // B はこの端末では**ずっと前に**消えており、よそで 2026-01-01 に決まった畳み
+    // B→C が届く。DELETEトリガは現在時刻を刻むので、そのままだと「手元の削除の方が
+    // 新しい」＝届いた畳みは古い主張、という別の話になってしまう（その規則自体は
+    // `fold-ledger.test.ts` で固定した）。ここで見たいのは張り替えの側なので、
+    // 削除は届いた畳みより前に起きたことにする。
     db.prepare(`DELETE FROM n WHERE id = 'B'`).run();
+    db.prepare(
+      `UPDATE _tombstone SET deletedAt = '2025-01-01T00:00:00Z'
+       WHERE tableName = 'n' AND recordId = 'B'`
+    ).run();
     applyMergedDelete(
       db,
       'n',

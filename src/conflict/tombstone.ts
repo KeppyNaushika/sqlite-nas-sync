@@ -15,20 +15,54 @@ import { escapeIdentifier, hasTable } from './schema';
 import { isLaterTimestamp } from './timestamp';
 
 /**
- * `_tombstone` の既存行を、いま書こうとしている記録で置き換えてよいか（SQLの条件式）。
- *
- * 「既存より古い主張では上書きしない」。ただし**自分がいま消した行**
- * （`replacesOwnDeletion`）だけは、DELETEトリガが書いた現在時刻を畳みの時刻で
- * 置き直す必要があるので無条件に通す。
+ * `_tombstone` に載っているこの id の主張1件。
  * @internal
  */
-export const TOMBSTONE_CLAIM_WINS = `(
-  ? = 1
-  OR NOT COALESCE(
-       julianday(_tombstone.deletedAt) > julianday(excluded.deletedAt),
-       _tombstone.deletedAt > excluded.deletedAt
-     )
-)`;
+export interface TombstoneClaim {
+  /** 消えたと主張している時刻 */
+  deletedAt: string;
+  /** 畳み先。ただの削除なら null */
+  mergedInto: string | null;
+}
+
+/**
+ * `_tombstone` からこの id の主張を読む（**いちばん新しいもの1件**）。
+ *
+ * 表名は `COLLATE NOCASE` で引く。DELETEトリガは**自分の設定どおりの表記**で書き、
+ * 届くエントリは**相手の設定どおりの表記**を持つので、`Users` と `users` のように
+ * 綴りが違う端末どうしでは、区別して引くと取り逃がす。
+ *
+ * ただし**書き込み側の主キーは BINARY で照合される**（`ON CONFLICT(tableName, recordId)`
+ * も DELETEトリガも表名をそのまま入れる）ので、綴りの違う2行が同時に載りうる。
+ * どちらが返るかを走査順まかせにすると**古い方を拾って削除を見落とす**ので、
+ * 時刻で並べて新しい方を採る（このライブラリの他の判断と同じ「新しい主張が勝つ」）。
+ * @internal
+ */
+export function readTombstoneClaim(
+  db: Database.Database,
+  tableName: string,
+  recordId: string
+): TombstoneClaim | null {
+  if (!hasTable(db, '_tombstone')) return null;
+  ensureTombstoneMergedIntoColumn(db);
+
+  const row = db
+    .prepare(
+      `SELECT deletedAt, mergedInto FROM _tombstone
+       WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+       ORDER BY julianday(deletedAt) DESC, deletedAt DESC
+       LIMIT 1`
+    )
+    .get(tableName, recordId) as
+    | { deletedAt: string; mergedInto: string | null }
+    | undefined;
+  if (row === undefined) return null;
+
+  return {
+    deletedAt: String(row.deletedAt),
+    mergedInto: row.mergedInto === null ? null : String(row.mergedInto),
+  };
+}
 
 /**
  * 畳み先を `_tombstone` に載せる（他クライアントへはこの列で伝わる）。
@@ -63,8 +97,7 @@ export function recordTombstoneMerge(
   tableName: string,
   losingId: string,
   winningId: string,
-  foldedAt?: string,
-  replacesOwnDeletion = false
+  foldedAt?: string
 ): void {
   if (!hasTable(db, '_tombstone')) return;
   ensureTombstoneMergedIntoColumn(db);
@@ -75,35 +108,25 @@ export function recordTombstoneMerge(
      WHERE tableName = ? COLLATE NOCASE AND mergedInto = ?`
   ).run(winningId, tableName, losingId);
 
-  // **新しい主張が勝つ。古い畳みが新しい記録を上書きしてはいけない。**
-  // 既存が利用者の削除（2026年）で、あとから2020年の畳みが届いたときにそれを置くと、
-  // `deletedAt` が過去へ戻って {@link isShadowedByTombstone} を素通りし、
-  // **消したはずの行が別の端末の版で復活する**（実測）。`mergedInto` も同じで、
-  // 実削除の NULL を古い畳み先で塗り替えると、受け取った側はその削除を畳みとして扱う。
+  // **ここは比べない。置く。**
   //
-  // 例外は `replacesOwnDeletion` —— **いま自分がこの畳みのために消した行**。
-  // DELETEトリガが直前に現在時刻を書いているので、比べる形にすると畳みの時刻が必ず負け、
-  // 畳んだ端末だけが「今消した」という強すぎるしきい値を持つことになる。ここは置く。
+  // 「この主張を受け入れてよいか」は {@link recordMerge} が**2つの帳簿の両方を見て
+  // 一度だけ**決めており、ここへ来る時点で受け入れは確定している。ここで独自にもう一度
+  // 比べると、`_id_merge` 側と**違う物差しで違う答え**を出しうる —— 実測では、
+  // `_id_merge` の記録が無く `_tombstone` にだけ新しい削除がある状態で古い畳みを受けると、
+  // `_id_merge` は受け入れ `_tombstone` は断り、**2つの帳簿が別々の勝者を名乗った**
+  // （ローカルでは子が畳み先へ読み替えられ、他端末には「ただ削除された」と伝わって、
+  // 向こうの生きている行が子ごと消える）。
   //
-  // 時刻の大小はフォーマット差（ISO-T vs スペース形式）を吸収するため julianday で見る。
-  // 解析できない値のときだけ文字列比較へ落とす（{@link isLaterTimestamp} と同じ方針）。
+  // 判断を1か所に集めたので、書き込みは1つの決定から素直に導かれる。
   const explicitFoldedAt = foldedAt ? foldedAt : null;
   db.prepare(
     `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
      VALUES (?, ?, COALESCE(?, ${NOW_SQL}), ?)
      ON CONFLICT(tableName, recordId) DO UPDATE SET
-       mergedInto = CASE WHEN ${TOMBSTONE_CLAIM_WINS}
-         THEN excluded.mergedInto ELSE _tombstone.mergedInto END,
-       deletedAt = CASE WHEN ${TOMBSTONE_CLAIM_WINS}
-         THEN excluded.deletedAt ELSE _tombstone.deletedAt END`
-  ).run(
-    tableName,
-    losingId,
-    explicitFoldedAt,
-    winningId,
-    replacesOwnDeletion ? 1 : 0,
-    replacesOwnDeletion ? 1 : 0
-  );
+       mergedInto = excluded.mergedInto,
+       deletedAt = excluded.deletedAt`
+  ).run(tableName, losingId, explicitFoldedAt, winningId);
 
   // 自分自身を指す畳み先は意味を持たない（畳む向きが反転したときに生まれる）
   db.prepare(
@@ -147,14 +170,8 @@ export function isKnownDeleted(
   recordId: string,
   isResurrected: ResurrectionProbe | undefined
 ): boolean {
-  if (!hasTable(db, '_tombstone')) return false;
-  const tombstone = db
-    .prepare(
-      `SELECT deletedAt FROM _tombstone
-       WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
-    )
-    .get(tableName, recordId) as { deletedAt: string } | undefined;
-  if (tombstone === undefined) return false;
+  const tombstone = readTombstoneClaim(db, tableName, recordId);
+  if (tombstone === null) return false;
 
   // **`_tombstone` は「いつか消された」の記録であって「今も消えている」ではない。**
   // 同じ取り込みの中で作り直された行が、この子より**後**に処理されることがあり、
@@ -162,7 +179,7 @@ export function isKnownDeleted(
   // 取り込み元にその行が現存するかを見て、作り直されたものは「消えていない」と扱う
   // （`applyTombstoneDelete` が tombstone を無視するのと同じ物差し）。
   return !(
-    isResurrected?.(tableName, recordId, String(tombstone.deletedAt)) ?? false
+    isResurrected?.(tableName, recordId, tombstone.deletedAt) ?? false
   );
 }
 
@@ -183,21 +200,9 @@ export function isShadowedByTombstone(
   recordId: string,
   recordTimestamp: string
 ): boolean {
-  if (!hasTable(localDb, '_tombstone')) return false;
-
-  const ts = localDb
-    .prepare(
-      // 表名は `COLLATE NOCASE` で引く（`_tombstone` / `_id_merge` の読み取りは
-      // すべてこれで揃えてある）。DELETEトリガは**自分の設定どおりの表記**で
-      // 書き、届くエントリは**相手の設定どおりの表記**を持つので、`Users` と `users` の
-      // ように綴りが違う端末どうしでは、ここだけ引きが外れて
-      // {@link isKnownDeleted} が「消えている」と見る行が復活していた。
-      `SELECT deletedAt FROM _tombstone
-       WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
-    )
-    .get(tableName, recordId) as { deletedAt: string } | undefined;
-  if (!ts) return false;
+  const ts = readTombstoneClaim(localDb, tableName, recordId);
+  if (ts === null) return false;
 
   // record が削除より「厳密に新しい」場合のみ採用。さもなくば（同時刻含め）削除が勝つ。
-  return !isLaterTimestamp(localDb, recordTimestamp, String(ts.deletedAt));
+  return !isLaterTimestamp(localDb, recordTimestamp, ts.deletedAt);
 }

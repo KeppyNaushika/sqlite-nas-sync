@@ -14,6 +14,11 @@ import { setupChangelog } from '../src/setup';
 import { lookupIdMerge, recordMerge } from '../src/conflict/ledger';
 import { TableConfig } from '../src/types';
 
+interface TombstoneRow {
+  deletedAt: string;
+  mergedInto: string | null;
+}
+
 const testDir = path.join(__dirname, 'test-data-fold-ledger-repair');
 
 /** ファイルDBを作る（`:memory:` ではトリガーの検証がしづらいため、実ファイルで揃える） */
@@ -108,6 +113,11 @@ describe('鎖の畳み直しは `_tombstone.mergedInto` も連れて動く', () 
       insertTombstone.run(losingId, at, winningId);
     }
 
+    // B の行は手元に**在る**（＝「消えた」という記録そのものが間違っている）
+    db.prepare(
+      `INSERT INTO items (id, updatedAt) VALUES ('B', '2026-04-01T00:00:00.000Z')`
+    ).run();
+
     // 起動時の掃除は setupChangelog が呼ぶ
     setupChangelog(db, TABLES, 'id');
 
@@ -121,13 +131,52 @@ describe('鎖の畳み直しは `_tombstone.mergedInto` も連れて動く', () 
 
     // 刈られた `B→A` の主張は、2つの帳簿の**どちらからも**消える。
     // `mergedInto` を NULL にして残すと、それは「B はただ消された」という主張に
-    // なる。B は循環で**生き残る**側の id なので、その tombstone が同期で渡ると
+    // なる。B の行は手元に在るのだから、その tombstone が同期で渡ると
     // 相手は B を畳まずに DELETE する（子も道連れ）。行ごと捨てる。
     expect(tombstoneOf('B')).toBeUndefined();
     // 張り替えた D は終端の B を指す（`_id_merge` と同じ向き）
     expect(tombstoneOf('D').mergedInto).toBe('B');
     // 時刻は動かさない
     expect(tombstoneOf('D').deletedAt).toBe('2026-03-01T00:00:00.000Z');
+  });
+
+  it('手元に行が無ければ、畳み先だけ外して「消えた」記録は残す', () => {
+    db = createDb('cycle-tombstone-absent');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 循環 A↔B。刈り取りで残るのは新しい主張 A→B なので、B の記録が消える。
+    // **B の行は手元に無い** ＝ その id は本当に消えている
+    const insertMerge = db.prepare(
+      `INSERT OR REPLACE INTO _id_merge (tableName, losingId, winningId, mergedAt)
+       VALUES ('items', ?, ?, ?)`
+    );
+    insertMerge.run('A', 'B', '2026-02-01T00:00:00.000Z');
+    insertMerge.run('B', 'A', '2026-01-01T00:00:00.000Z');
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+       VALUES ('items', 'B', '2026-01-01T00:00:00.000Z', 'A')`
+    ).run();
+
+    setupChangelog(db, TABLES, 'id');
+
+    const tombstone = db
+      .prepare(
+        `SELECT deletedAt, mergedInto FROM _tombstone
+         WHERE tableName = 'items' AND recordId = 'B'`
+      )
+      .get() as TombstoneRow | undefined;
+
+    // 畳みの主張は捨てるが、**「消えた」という事実は残す**。行ごと消すと
+    // `isShadowedByTombstone` が効かなくなり、相手の古い版がそのまま復活する
+    expect(tombstone).toBeDefined();
+    expect(tombstone!.mergedInto).toBeNull();
+    expect(tombstone!.deletedAt).toBe('2026-01-01T00:00:00.000Z');
   });
 });
 
@@ -195,14 +244,18 @@ describe('循環の刈り取りは、畳み先がずれていても主張を捨�
 
     // A は循環で**生き残る**id。生きていると決めた以上、行き先が何であれ
     // 畳みの主張は矛盾する。畳み先の一致を条件にすると、ここだけ残って
-    // 「引き先の `_id_merge` が無いのに畳まれたと主張する」状態になる
+    // 「引き先の `_id_merge` が無いのに畳まれたと主張する」状態になる。
+    //
+    // A の行は手元に無いので、捨てるのは**畳み先の主張だけ**（削除の事実は残る）
     const tombstone = db
       .prepare(
-        `SELECT mergedInto FROM _tombstone
+        `SELECT deletedAt, mergedInto FROM _tombstone
          WHERE tableName = 'items' AND recordId = 'A'`
       )
-      .get();
-    expect(tombstone).toBeUndefined();
+      .get() as TombstoneRow | undefined;
+    expect(tombstone).toBeDefined();
+    expect(tombstone!.mergedInto).toBeNull();
+    expect(tombstone!.deletedAt).toBe('2026-01-01T00:00:00.000Z');
   });
 
   it('利用者操作によるただの削除（畳み先なし）は触らない', () => {
