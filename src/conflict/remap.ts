@@ -15,13 +15,8 @@ import {
   includesPrimaryKeyColumn,
   readForeignKeys,
 } from './schema';
-import {
-  hasIdMerges,
-  isFoldRecordStale,
-  isKnownDeleted,
-  lookupIdMerge,
-  ResurrectionProbe,
-} from './ledger';
+import { hasIdMerges, isFoldRecordStale, lookupIdMerge } from './ledger';
+import { isKnownDeleted, ResurrectionProbe } from './tombstone';
 import { TimestampColumnFor } from './timestamp';
 
 /**
@@ -105,12 +100,9 @@ export function parentRowExists(
  *
  * - **読み替えるのは、記録が敗者行より新しいときだけ**（{@link isFoldRecordStale}）。
  *   敗者行がその後もっと新しく更新されていれば、畳みはもう古い判断である
- * - **読み替えたら、この行の時刻を記録の時刻へ進める。** 書き換えた後の「親は勝者」と
- *   いう内容は勝った側の版に由来するので、その版の時刻を名乗る。負けた側の版の時刻も、
- *   同期を回した時刻も残さない（収束はその帰結 — 進めないと両端末が同点のまま
- *   食い違い続ける。同一主キーのLWWは「厳密に新しい」ものしか採らないため）。
- *   ただし**巻き戻しはしない**。記録より新しい子が届いた場合に時刻を下げると、
- *   その子は他端末の古い版に負けて消える
+ * - **読み替えても、この行の時刻には触らない。** 書き換わるのは外部キーの列だけで、
+ *   他の列は元の書き手のものだから、行全体で畳みの時刻を名乗ると外部キー以外の列に
+ *   ついて過大に申告することになる（詳しくは関数末尾のコメント）
  *
  * **読み替え先が消えているとき**は、`ON DELETE` の宣言に従う（原則は「手元に居たら
  * 何が起きていたかを、そのまま再現する」）:
