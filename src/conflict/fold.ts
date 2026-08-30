@@ -243,12 +243,20 @@ export function repointChild(
       // （利用者へ「2つを1つにまとめた」と伝える対象ではない）。
       // 刻む時刻は動いた先の行が名乗っている版の時刻。現在時刻にすると、古いidへの
       // 到着を無条件に止めるしきい値になってしまう（{@link recordTombstoneMerge}）。
+      //
+      // **これは主張ではなく、たった今この手で起こした移動である**（上の UPDATE で
+      // 行はもう `previousId` に無い）。だから `replacesOwnDeletion` を渡して、
+      // 古い記録との比較で断られないようにする。断られると、帳簿は `previousId` を
+      // 古い勝者へ向けたまま、実体は `nextId` に在るという食い違いが残り、しかも下の
+      // `writeFoldDeletion` は走るので**古い畳み先を名乗る DELETE を公開してしまう**
+      // （行が既に消えている点は、同じ形の `foldRowInto` の記録と変わらない）。
       recordMerge(
         db,
         foreignKey.childTable,
         previousId,
         nextId,
-        foldTimestampOf(repointedRow, childTimestampColumn)
+        foldTimestampOf(repointedRow, childTimestampColumn),
+        true
       );
 
       // idが動いた＝古いidの行はもうどこにも無い。UPDATEトリガーが残すのは新しいidの

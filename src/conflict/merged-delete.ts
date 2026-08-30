@@ -130,6 +130,11 @@ export function applyMergedDelete(
   // もう無く**、`winningRow` は `undefined` で来るのがふつうである（`readRemoteRecord`
   // は動く前の id で引く）。行の有無で振り分けると、いちばん起きやすい経路が素通りして
   // 幽霊が生まれる。渡された行が終端と違う id を名乗っている場合も同じ扱い。
+  //
+  // 第2項（渡された行が終端と違う id を名乗っている）は、同期経路からは起きない
+  // ——`readRemoteRecord` は必ず `requestedWinningId` で引くので、真になるときは
+  // 第1項も真である。**公開APIを直接呼ぶ利用者**が、鎖と無関係な行を渡した場合の
+  // ためだけに残してある（渡された行をそのまま入れると別の id が復活する）。
   const foldTargetMoved =
     winningId !== requestedWinningId ||
     (winningRow !== undefined && String(winningRow[primaryKey]) !== winningId);

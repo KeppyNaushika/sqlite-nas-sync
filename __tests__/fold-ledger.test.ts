@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
 import { setupChangelog } from '../src/setup';
-import { applyMergedDelete } from '../src/conflict';
+import { applyInsert, applyMergedDelete } from '../src/conflict';
 import { lookupIdMerge, recordMerge } from '../src/conflict/ledger';
 import { TableConfig } from '../src/types';
 
@@ -431,5 +431,152 @@ describe('終端が動いていれば、勝者行が渡されなくても帳簿�
 
     expect(result.action).toBe('skipped');
     expect(lookupIdMerge(db, 'items', 'A')?.winningId).toBe('B');
+  });
+});
+
+describe('判断は2つの帳簿の両方を見て、一度だけ下す', () => {
+  const TABLES: TableConfig[] = [{ name: 'items' }];
+
+  it('ローカルの新しい削除に、届いた古い畳みは勝てない（どちらの帳簿にも書かない）', () => {
+    db = createDb('both-ledgers-gate');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 手元で普通に削除する。DELETEトリガが `deletedAt = 現在時刻` / `mergedInto = NULL`
+    // を書く（`_id_merge` には何も入らない ＝ 片方の帳簿にだけ記録がある状態）
+    db.prepare(
+      `INSERT INTO items (id, updatedAt) VALUES ('A', '2020-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(`DELETE FROM items WHERE id = 'A'`).run();
+
+    // そこへ、よそで 2020 年に決まった畳み A→C が届く
+    const result = applyMergedDelete(
+      db,
+      'items',
+      'id',
+      'A',
+      'C',
+      undefined,
+      ['id', 'updatedAt'],
+      'updatedAt',
+      '2020-01-01T00:00:00.000Z'
+    );
+    expect(result.action).toBe('skipped');
+
+    // **2つの帳簿が別々のことを言わないこと。**
+    // `_id_merge` だけが受け入れると、ローカルでは A の遅れた子が C へ読み替えられる
+    // 一方、他端末には「A はただ削除された」と伝わり、向こうは生きている A を
+    // 子ごと消す（`_id_merge` を見て決め、`_tombstone` を見ずに決めていた穴）
+    expect(lookupIdMerge(db, 'items', 'A')).toBeNull();
+    const tombstone = db
+      .prepare(
+        `SELECT mergedInto FROM _tombstone
+         WHERE tableName = 'items' AND recordId = 'A'`
+      )
+      .get() as { mergedInto: string | null };
+    expect(tombstone.mergedInto).toBeNull();
+  });
+
+  it('届いた畳みの方が新しければ、両方そろって受け入れる', () => {
+    db = createDb('both-ledgers-gate-newer');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    db.prepare(
+      `INSERT INTO items (id, updatedAt) VALUES ('A', '2020-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(`DELETE FROM items WHERE id = 'A'`).run();
+    // 手元の削除は「ずっと前」に起きたことにする（トリガは現在時刻を刻むため）
+    db.prepare(
+      `UPDATE _tombstone SET deletedAt = '2020-01-01T00:00:00.000Z'
+       WHERE tableName = 'items' AND recordId = 'A'`
+    ).run();
+
+    applyMergedDelete(
+      db,
+      'items',
+      'id',
+      'A',
+      'C',
+      undefined,
+      ['id', 'updatedAt'],
+      'updatedAt',
+      '2026-06-01T00:00:00.000Z'
+    );
+
+    expect(lookupIdMerge(db, 'items', 'A')?.winningId).toBe('C');
+    const tombstone = db
+      .prepare(
+        `SELECT deletedAt, mergedInto FROM _tombstone
+         WHERE tableName = 'items' AND recordId = 'A'`
+      )
+      .get() as { deletedAt: string; mergedInto: string | null };
+    expect(tombstone.mergedInto).toBe('C');
+    expect(tombstone.deletedAt).toBe('2026-06-01T00:00:00.000Z');
+  });
+});
+
+describe('自分の手で起こした移動は、古い記録に断られない', () => {
+  const TABLES: TableConfig[] = [{ name: 'parents' }, { name: 'profiles' }];
+
+  it('付け替えで子のidが動いたとき、帳簿は実体の在る方を指す', () => {
+    db = createDb('moved-pk-records');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
+      CREATE TABLE parents (
+        id        TEXT PRIMARY KEY,
+        ukey      TEXT NOT NULL UNIQUE,
+        updatedAt TEXT NOT NULL
+      );
+      CREATE TABLE profiles (
+        id        TEXT PRIMARY KEY REFERENCES parents(id) ON DELETE CASCADE,
+        bio       TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    db.prepare(
+      `INSERT INTO parents (id, ukey, updatedAt)
+       VALUES ('p1', 'k1', '2020-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO profiles (id, bio, updatedAt)
+       VALUES ('p1', '自己紹介', '2020-01-01T00:00:00.000Z')`
+    ).run();
+
+    // 子テーブルに、**古くて誤った**畳みの記録が先に残っている状況を作る
+    // （`applyMergedDelete` はローカルに行が無い敗者idの畳みも覚えるので、
+    //  この記録は `p1` の行より長生きしうる）
+    recordMerge(db, 'profiles', 'p1', 'zz', '2026-06-01T00:00:00.000Z');
+
+    // 親 p1 が p2 へ畳まれる。子は主キーを親と共有しているので、id が p1 → p2 へ動く
+    applyInsert(
+      db,
+      'parents',
+      'id',
+      { id: 'p2', ukey: 'k1', updatedAt: '2026-07-01T00:00:00.000Z' },
+      ['id', 'ukey', 'updatedAt']
+    );
+
+    const profiles = db
+      .prepare(`SELECT id FROM profiles ORDER BY id`)
+      .all() as { id: string }[];
+    expect(profiles.map((row) => row.id)).toEqual(['p2']);
+
+    // **実体は p2 に在る。** 古い記録に断られて `p1 → zz` のままだと、帳簿は
+    // 実在しない勝者を指したまま、`writeFoldDeletion` だけが p1 の DELETE を
+    // 公開する（受け取った端末は p1 の子を行き先の無い zz へ読み替えて捨てる）
+    expect(lookupIdMerge(db, 'profiles', 'p1')?.winningId).toBe('p2');
   });
 });

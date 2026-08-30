@@ -156,8 +156,10 @@ export function applyUpdate(
   }
 
   // 同じ時刻で中身が違うなら、どちらも勝てない。解けないので**報告する**
-  // （同時刻かどうかは字面ではなく時刻として見る）
-  if (isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
+  // （同時刻かどうかは字面ではなく時刻として見る）。膠着の報告と競合の有無の
+  // 両方が見るので、`julianday` の問い合わせは一度だけにする
+  const sameTimestamp = isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt);
+  if (sameTimestamp) {
     const stalemate = describeStalemate(
       tableName,
       String(pkValue),
@@ -172,7 +174,7 @@ export function applyUpdate(
 
   return {
     action: 'skipped',
-    conflict: !isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)
+    conflict: !sameTimestamp
         ? {
             table: tableName,
             recordId: String(pkValue),

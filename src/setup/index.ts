@@ -111,7 +111,7 @@ export function setupChangelog(
   `);
 
   // 旧バージョンが書いた鎖（`A→C` と `C→B` が並ぶ形）をここで畳む。
-  collapseIdMergeChains(db);
+  collapseIdMergeChains(db, primaryKey);
 
   // _heartbeat テーブル（changelog延命用）
   db.exec(`

@@ -181,3 +181,40 @@ describe('表名の綴り違いでも tombstone を引ける', () => {
     expect(rows).toHaveLength(0);
   });
 });
+
+describe('表名の綴りが違う tombstone が2行あっても、新しい方を見る', () => {
+  const TABLES: TableConfig[] = [{ name: 'Items' }];
+
+  it('古い方を拾って削除を見落とさない', () => {
+    db = createDb('tombstone-collation-order');
+    db.exec(`
+      CREATE TABLE Items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 読みは `COLLATE NOCASE` だが、**書き込み側の主キーは BINARY で照合される**
+    // （`ON CONFLICT(tableName, recordId)` もトリガも表名をそのまま入れる）ので、
+    // 設定の綴りがリリースをまたいで変わると、綴り違いの2行が同時に載りうる
+    const insert = db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+       VALUES (?, 'A', ?, NULL)`
+    );
+    insert.run('items', '2020-01-01T00:00:00.000Z');
+    insert.run('Items', '2026-06-01T00:00:00.000Z');
+
+    // 走査順まかせだと古い方（2020年）を拾い、2021年の行を「削除より新しい」として
+    // 通してしまう。時刻で並べて新しい方を採る
+    const result = applyInsert(
+      db,
+      'Items',
+      'id',
+      { id: 'A', updatedAt: '2021-01-01T00:00:00.000Z' },
+      ['id', 'updatedAt']
+    );
+    expect(result.action).toBe('skipped');
+    expect(db.prepare(`SELECT id FROM Items`).all()).toHaveLength(0);
+  });
+});

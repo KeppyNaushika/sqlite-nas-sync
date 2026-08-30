@@ -17,7 +17,7 @@ import { RecordFold } from '../types';
 import { NOW_SQL } from '../setup';
 import { escapeIdentifier, hasTable } from './schema';
 import { isLaterTimestamp, resolveTimestampColumn } from './timestamp';
-import { recordTombstoneMerge } from './tombstone';
+import { readTombstoneClaim, recordTombstoneMerge } from './tombstone';
 
 /**
  * `_id_merge` テーブルを作成する（冪等）。
@@ -39,25 +39,30 @@ export function ensureIdMergeTable(db: Database.Database): void {
 }
 
 /**
- * この畳みの主張を、既にある記録の上へ置いてよいか。
+ * この畳みの主張を、既にある記録の上へ置いてよいか。**判断はここ1か所だけで下す。**
  *
- * **2つの帳簿（`_id_merge` と `_tombstone`）は、同じ主張を同じ条件で受け入れる/断る
- * 必要がある。** `_tombstone` 側は {@link TOMBSTONE_CLAIM_WINS} が古い主張を断るので、
- * `_id_merge` 側だけが無条件に受け入れると、**同じ敗者idについて2つの帳簿が別々の
- * 勝者を名乗る**。実測では、6月の `A→B` のあとに1月の `A→C` が届くと
- * `_id_merge = {A→C}` / `_tombstone = {A, mergedInto: B}` となり、`A` の遅れた子は
- * `C` へ送られる一方、他端末には `A→B` と伝わり、さらに
- * {@link isFoldRecordStale} は `C` への主張を `B` の時刻で判定した。
+ * `_id_merge`（ローカル索引）と `_tombstone`（他端末へ渡る主張）は、同じ1つの事実を
+ * 別の形で持っている。**片方だけが受け入れると、2つの帳簿が別々の勝者を名乗る** ——
+ * ローカルでは遅れて届いた子が片方の勝者へ読み替えられ、他端末にはもう片方が伝わる。
+ * その先で外部キー違反が起き、その相手ぶんの取り込みが丸ごと巻き戻る。
  *
- * したがって判断はここで**一度だけ**下し、断るなら**どちらの帳簿にも書かない**。
+ * だから**見るのも両方**である。片方（`_id_merge`）だけを見て決めると、記録が無く
+ * `_tombstone` にだけ新しい削除がある状態で穴が開く。実測では、ローカルで普通に
+ * 削除した行（トリガが `deletedAt = 現在時刻` を書く）に対して相手の古い畳みを受けると、
+ * `_id_merge` は受け入れ `_tombstone` は断り、**「ローカルでは畳み先へ読み替え、
+ * 他端末へは『ただ削除された』と公開する」**という最悪の組み合わせになった
+ * （受け取った端末は生きている行を子ごと消す）。
+ *
+ * 受け入れると決めたら、両方の帳簿へその決定のまま書く（比べ直さない）。
  *
  * - `replacesOwnDeletion` — **いま自分がこの畳みのために消した行**。手元で実際に
  *   起きたことなので、記録は現実に従う（断ると、消えた行の子が実在しない勝者を
- *   指したまま残る）
+ *   指したまま残る）。DELETEトリガが直前に現在時刻を書いているため、比べる形にすると
+ *   畳みの時刻は必ず負ける
  * - `foldedAt` が無い（本物の削除・公開APIの直接呼び出し）— 主張の時刻は「今」なので
  *   必ず最新
- * - それ以外 — 既にある記録が**厳密に新しい**なら断る。同時刻なら新しい主張が勝つ
- *   （`_tombstone` 側と同じ向き）
+ * - それ以外 — **どちらかの帳簿に既にある主張が厳密に新しい**なら断る。
+ *   同時刻なら新しい主張が勝つ
  * @internal
  */
 function foldClaimWins(
@@ -70,10 +75,14 @@ function foldClaimWins(
   if (replacesOwnDeletion) return true;
   if (foldedAt === undefined) return true;
 
-  const existing = lookupIdMerge(db, tableName, losingId);
-  if (existing === null) return true;
+  // 2つの帳簿のうち**強い方**（新しい方）と比べる。片方しか見ないと、そちらに
+  // 記録が無いだけで通ってしまい、もう片方が断って食い違う
+  const claimedAt = [
+    lookupIdMerge(db, tableName, losingId)?.mergedAt,
+    readTombstoneClaim(db, tableName, losingId)?.deletedAt,
+  ].filter((value): value is string => value !== undefined);
 
-  return !isLaterTimestamp(db, existing.mergedAt, foldedAt);
+  return !claimedAt.some((existing) => isLaterTimestamp(db, existing, foldedAt));
 }
 
 /**
@@ -154,14 +163,8 @@ export function recordMerge(
     `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = winningId`
   ).run(tableName);
 
-  recordTombstoneMerge(
-    db,
-    tableName,
-    losingId,
-    winningId,
-    foldedAt,
-    replacesOwnDeletion
-  );
+  // 受け入れは上で決まっている。`_tombstone` 側は比べ直さず、同じ決定のまま書く
+  recordTombstoneMerge(db, tableName, losingId, winningId, foldedAt);
 }
 
 /**
