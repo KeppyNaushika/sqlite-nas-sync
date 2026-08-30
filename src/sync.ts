@@ -541,7 +541,11 @@ function processChangelogEntries(
           timestampColumnFor
         );
         if (action === 'inserted') result.inserted++;
-        if (action === 'upserted') result.conflictsResolved++;
+        if (action === 'skipped') result.skipped++;
+        // 畳みは「消えた行」でもある。届いた行を採用しなかった場合でも、同じPKの
+        // ローカル行が畳まれて消えていることがある（UPDATE 側と同じ数え方）。
+        // `upserted` 自体が畳みを伴うこともあるので、二重には数えない。
+        if (action === 'upserted' || folds.length > 0) result.conflictsResolved++;
         recordFolds(result, folds);
         result.warnings.push(...warnings);
         if (conflict) {

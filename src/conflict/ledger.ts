@@ -70,22 +70,21 @@ export function recordMerge(
   const mergedAt = foldedAt ?? null;
 
   // 畳み先の鎖を作らない（`A→B` のあとに `B→C` が来たら `A→C` へ張り替える）。
-  // **張り替えても「A が畳まれた時刻」は変わらない。** 新しい畳みの時刻をそのまま置くと、
-  // それが古いときに既存の記録が過去へ引き戻され、`isFoldRecordStale` の判定が変わる
-  // （実測: 6月に確定した `A→B` が、1月の `B→C` の巻き添えで1月へ戻った）。遅い方を採る。
+  // **張り替えても「A が畳まれた時刻」は動かさない。** 向き先が変わっただけで、
+  // 「A が畳まれた」という事実の時刻は変わらないからである（`collapseIdMergeChains`
+  // が鎖を畳み直すときと同じ扱い）。過去へ引き戻さないのはもちろん、**新しい方へ
+  // 進めてもいけない**: 張り替えは `_id_merge` にしか届かず、対になる
+  // `_tombstone.deletedAt`（{@link recordTombstoneMerge} が書く）は `A` 自身の畳みの
+  // 時刻のまま残るので、進めると2つの帳簿が食い違う。実測では、1月に畳まれた `A` が
+  // 6月の `B→C` の巻き添えで `_id_merge` だけ6月になり、3月版の `A` が
+  // `isShadowedByTombstone`（1月より新しい）を通って復活する一方、
+  // `isFoldRecordStale`（6月より古い）は畳みを有効と見たため、**`A` が生きたまま
+  // その子だけ `C` へ読み替えられた**。
   db.prepare(
     `UPDATE _id_merge
-     SET winningId = ?,
-         mergedAt = CASE
-           WHEN COALESCE(
-                  julianday(COALESCE(?, ${NOW_SQL})) > julianday(mergedAt),
-                  COALESCE(?, ${NOW_SQL}) > mergedAt
-                )
-           THEN COALESCE(?, ${NOW_SQL})
-           ELSE mergedAt
-         END
+     SET winningId = ?
      WHERE tableName = ? COLLATE NOCASE AND winningId = ?`
-  ).run(winningId, mergedAt, mergedAt, mergedAt, tableName, losingId);
+  ).run(winningId, tableName, losingId);
 
   // **`mergedAt` は巻き戻さない。** 同じ畳みが違う時刻を名乗って二度届くことがある
   // （相手の `_tombstone.deletedAt` が旧版で書かれていた場合など）。あとから来た方を

@@ -20,7 +20,8 @@ import { isSameIdentifier } from './schema';
  * 比較は時刻列を除く全列。**この判定が走るのは時刻が同じで採らないと決めた経路だけ**で、
  * 既に読み込んである2行を突き合わせるだけなのでDBへの問い合わせは増えない。
  *
- * @returns 食い違っていれば利用者へ見せる文言、中身も同じなら null（報告することが無い）
+ * @returns 食い違っていれば利用者へ見せる文言、中身も同じなら null（報告することが無い）。
+ *   両側の時刻が空（＝時刻列が読めていない）ときも null —— それは膠着ではない
  * @internal
  */
 export function describeStalemate(
@@ -32,6 +33,13 @@ export function describeStalemate(
   columns: string[],
   timestampColumn: string
 ): string | null {
+  // 両側の時刻が**空**なら、それは膠着ではなく「時刻が読めていない」。
+  // `timestampColumn` の設定が実際の列とずれていると（明示 `tables:` 設定でのみ起こる。
+  // `discoverTables` は実在する列しか選ばない）、両側とも `''` を読んで
+  // `isSameTimestamp('', '')` が真になり、**中身が違う行の数だけ**この警告が出る。
+  // 出るべきなのは「時刻は同じなのに中身が違う」ときだけなので、ここでは黙る。
+  if (timestamp === '') return null;
+
   const differing = columns.filter((column) => {
     if (isSameIdentifier(column, timestampColumn)) return false;
     return !isSameStoredValue(record[column], localRecord[column]);

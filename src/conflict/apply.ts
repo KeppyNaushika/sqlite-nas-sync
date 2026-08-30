@@ -273,15 +273,40 @@ export function applyMergedDelete(
     return { action: 'skipped', folds, warnings: [] };
   }
 
+  const localWinningRow = losingRow
+    ? (localDb
+        .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+        .get(winningId) as Record<string, unknown> | undefined)
+    : undefined;
+
+  // **渡された勝者行は、鎖を辿る前の畳み先のもの。** 終端が動いていたら、その行は
+  // ここで入れてよい行ではない。入れると、**この端末が既に畳んで tombstone まで
+  // 書いた中間の id が復活する**（`_id_merge` には終端しか載っていないので、その行の
+  // 子は行き先の無い id へ読み替えられて捨てられる）。呼び出し元が終端の行を読んで
+  // 渡し直すまで、敗者行はそのまま残す（消さなければ子は道連れにならない）。
+  //
+  // **帳簿にも書かずに戻る。** 先に `recordMerge` を通してからここで見送ると、
+  // `_id_merge` と `_tombstone.mergedInto` には「敗者は終端へ畳まれた」と載るのに
+  // 敗者行は消されないまま残る。渡し直す呼び出し元は無い（`applyTombstoneDelete` は
+  // `ts.mergedInto` から勝者行を一度しか読まず、changelog経路はカーソルが進んで
+  // 同じ削除が二度来ない）ので、その行は**永久に生きたまま「畳まれた」と記録された
+  // 幽霊**になり、遅れて届いた子だけが終端へ読み替えられて本当の親から切り離される。
+  // 終端が動いていても、畳み先が手元に在る（`localWinningRow`）ときは実際に畳めるので
+  // ここには来ない。
+  if (
+    losingRow &&
+    !localWinningRow &&
+    winningRow &&
+    String(winningRow[primaryKey]) !== winningId
+  ) {
+    return { action: 'skipped', folds, warnings: [] };
+  }
+
   // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
   // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
   recordMerge(localDb, tableName, losingId, winningId, foldedAt);
 
   if (!losingRow) return { action: 'skipped', folds, warnings: [] };
-
-  const localWinningRow = localDb
-    .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-    .get(winningId) as Record<string, unknown> | undefined;
 
   if (localWinningRow) {
     runDeferringForeignKeys(localDb, () => {
@@ -303,15 +328,6 @@ export function applyMergedDelete(
       );
     });
     return { action: 'folded', folds, warnings: [] };
-  }
-
-  // **渡された勝者行は、鎖を辿る前の畳み先のもの。** 終端が動いていたら、その行は
-  // ここで入れてよい行ではない。入れると、**この端末が既に畳んで tombstone まで
-  // 書いた中間の id が復活する**（`_id_merge` には終端しか載っていないので、その行の
-  // 子は行き先の無い id へ読み替えられて捨てられる）。呼び出し元が終端の行を読んで
-  // 渡し直すまで、敗者行はそのまま残す（消さなければ子は道連れにならない）。
-  if (winningRow && String(winningRow[primaryKey]) !== winningId) {
-    return { action: 'skipped', folds, warnings: [] };
   }
 
   if (winningRow) {
@@ -496,7 +512,14 @@ export function applyInsert(
             timestampColumn
           );
           return {
-            action: 'upserted',
+            // 届いた行を採らなかった場合は `upserted` と言ってはいけない。
+            // 上書きに負けた側では**リモートの行は捨てられ、ローカルのPK行が
+            // 畳まれて消えている**だけなので、`action` だけを見る呼び出し元が
+            // 「リモートを適用した」と読むと数え方がずれる（`processChangelogEntries`
+            // は `upserted` を `conflictsResolved` に、`skipped` を `skipped` に数える）。
+            // 同じ結果を `applyUpdate` は `skipped` と呼ぶので、そちらへ揃える。
+            action:
+              outcome.resolution === 'remote_wins' ? 'upserted' : 'skipped',
             conflict: conflictOf(outcome.resolution),
             folds: outcome.folds,
             warnings,
@@ -519,8 +542,11 @@ export function applyInsert(
           if (stalemate !== null) warnings.push(stalemate);
         }
 
+        // ローカルの方が新しい ＝ **届いた行は書いていない**。`upserted` は
+        // 「リモートの行を入れた」ときの名前なので、ここで名乗ってはいけない
+        // （同じ結果を `applyUpdate` は `skipped` と呼ぶ）。
         return {
-          action: 'upserted',
+          action: 'skipped',
           conflict: conflictOf('local_wins'),
           folds,
           warnings,

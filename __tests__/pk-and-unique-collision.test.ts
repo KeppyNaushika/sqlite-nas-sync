@@ -164,7 +164,8 @@ describe('主キーとセカンダリUNIQUEに同時にぶつかるINSERT', () =
       EXAM_STUDENT_COLUMNS
     );
 
-    expect(result.action).toBe('upserted');
+    // 届いた版は書いていないので `upserted` ではない（`applyUpdate` と同じ呼び方）
+    expect(result.action).toBe('skipped');
     expect(result.conflict?.resolution).toBe('local_wins');
     expect(result.folds).toEqual([]);
     expect(rowsOf(db, `SELECT id, studentId FROM exam_students ORDER BY id`)).toEqual([

@@ -121,6 +121,10 @@ export function ensureTombstoneMergedIntoColumn(db: Database.Database): void {
  * - 記録に**循環**（`A→B` と `B→A` が同時に立つ矛盾した形。畳む向きが反転したときに
  *   旧バージョンが残しえた）がある場合は、**いちばん新しい主張だけを残します**
  *   （他と同じ「新しい主張が勝つ」。同時刻なら敗者idの辞書順で1つに決める）
+ * - **`_tombstone.mergedInto` も同じだけ動かします。** 畳み先は2か所に載っており、
+ *   片方だけ直すと帳簿が食い違う（刈ったのに tombstone が畳み先を名乗り続けると、
+ *   `remapMergedForeignKeys` が読み替えをやめ、遅れて届いた子が消えた親を指したまま
+ *   入って外部キー検査で取り込みが巻き戻る）
  * - 何度走らせても同じ結果になります（鎖が短くなる方向にしか動きません）
  *
  * **走査は1回では足りません。** 循環へ流れ込む鎖（`D→A` があり `A↔B` が循環）は、
@@ -170,14 +174,34 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
     Map<string, { winningId: string; mergedAt: string }>
   >();
   for (const row of rows) {
+    // `_id_merge` の主キーは大小を区別するが、引くときは常に `COLLATE NOCASE` なので、
+    // 表名の大小だけが違う2件は**同じ1件として扱われる**（下の UPDATE / DELETE も
+    // 両方に当たる）。索引の側だけ後勝ちにすると、辿る鎖と書き換える対象がずれるので、
+    // 他と同じ「新しい主張が勝つ」で1つに決める（同時刻なら先に読んだ方を残す）。
     const key = row.tableName.toLowerCase();
     const records = byTable.get(key) ?? new Map();
-    records.set(row.losingId, {
-      winningId: row.winningId,
-      mergedAt: row.mergedAt,
-    });
+    const existing = records.get(row.losingId);
+    if (existing === undefined || row.mergedAt > existing.mergedAt) {
+      records.set(row.losingId, {
+        winningId: row.winningId,
+        mergedAt: row.mergedAt,
+      });
+    }
     byTable.set(key, records);
   }
+
+  // 畳み先は `_id_merge`（ローカル索引）と `_tombstone.mergedInto`（他クライアントへ
+  // 渡る側）の2か所に載っている。**片方だけ直すと帳簿が食い違う。** 刈ったのに
+  // `_tombstone.mergedInto` を残すと、`lookupIdMerge` は null を返すのに tombstone は
+  // 畳み先を名乗り続け、`remapMergedForeignKeys` が読み替えをやめる。遅れて届いた子は
+  // 消えた親を指したまま入り、COMMIT時の外部キー検査でその相手ぶんの取り込みが丸ごと
+  // 巻き戻る —— この仕組みが防ぐためにある失敗そのものになる。
+  const hasTombstone =
+    db
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+      )
+      .get() !== undefined;
 
   const update = db.prepare(
     `UPDATE _id_merge SET winningId = ?
@@ -186,6 +210,19 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
   const remove = db.prepare(
     `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
   );
+  const repointTombstone = hasTombstone
+    ? db.prepare(
+        `UPDATE _tombstone SET mergedInto = ?
+         WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+           AND mergedInto IS NOT NULL`
+      )
+    : null;
+  const clearTombstone = hasTombstone
+    ? db.prepare(
+        `UPDATE _tombstone SET mergedInto = NULL
+         WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
+      )
+    : null;
 
   for (const row of rows) {
     const records = byTable.get(row.tableName.toLowerCase());
@@ -224,6 +261,7 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
       );
       if (strongest.losingId !== row.losingId) {
         remove.run(row.tableName, row.losingId);
+        clearTombstone?.run(row.tableName, row.losingId);
         changed = true;
       }
       continue;
@@ -231,6 +269,7 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
 
     if (terminal !== row.winningId) {
       update.run(terminal, row.tableName, row.losingId);
+      repointTombstone?.run(terminal, row.tableName, row.losingId);
       changed = true;
     }
   }
