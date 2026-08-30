@@ -103,6 +103,141 @@ export function ensureTombstoneMergedIntoColumn(db: Database.Database): void {
  * // _changelog, _sync_state テーブルと6つのトリガーが作成される
  * ```
  */
+/**
+ * `_id_merge` に残っている**畳み先の鎖**を、終端まで畳み直す。
+ *
+ * 記録は「参照が常に1段で解ける」ことを前提に使われる（`remapMergedForeignKeys` は
+ * 1回しか引かない）。鎖が残っていると、遅れて届いた子が**既に死んでいる中間の行**へ
+ * 向けられ、`ON DELETE` に従って捨てられる（実測）。
+ *
+ * 書き込み側は終端まで辿ってから記録するようになったので、鎖は**もう増えません**。
+ * ここで畳むのは、そうなる前に書かれたぶんです。`_id_merge` は同期されない
+ * ローカル索引（`_` 始まりで自動検出から外れ、リモートからも読まない）なので、
+ * **自分のDBを一度直せば、他の端末が古いライブラリでも鎖は入ってきません。**
+ * したがって起動時の一回で足ります。
+ *
+ * - **時刻は動かしません。** `A→C` を `A→B` へ張り替えても「`A` が畳まれた時刻」は
+ *   変わらないためです（畳み先の張り替えと同じ扱い）
+ * - 記録に**循環**（`A→B` と `B→A` が同時に立つ矛盾した形。畳む向きが反転したときに
+ *   旧バージョンが残しえた）がある場合は、**いちばん新しい主張だけを残します**
+ *   （他と同じ「新しい主張が勝つ」。同時刻なら敗者idの辞書順で1つに決める）
+ * - 何度走らせても同じ結果になります（鎖が短くなる方向にしか動きません）
+ *
+ * **走査は1回では足りません。** 循環へ流れ込む鎖（`D→A` があり `A↔B` が循環）は、
+ * 1回目の走査では終端が循環の中に居るため張り替えられず、循環を刈った結果
+ * `D→A→B` が残ります。刈ったあとの形をもう一度見る必要があるので、
+ * **何も変わらなくなるまで**繰り返します（鎖は短くなる方向にしか動かないので必ず止まる）。
+ * @internal
+ */
+function collapseIdMergeChains(db: Database.Database): void {
+  // 1回の走査で直せるのは、その時点で見えている形だけ。刈り取りで形が変われば
+  // もう一度見る（打ち切りの上限は、鎖が1回の走査で最低1段は縮むことから置いている）
+  for (let pass = 0; pass < ID_MERGE_COLLAPSE_MAX_PASSES; pass++) {
+    if (!collapseIdMergeChainsOnce(db)) return;
+  }
+}
+
+/**
+ * 走査の打ち切り上限。
+ *
+ * 1回の走査は必ず鎖を縮めるか循環を1つ刈るので、記録の件数を超えて回ることはない。
+ * それでも上限を置くのは、記録が想定外の形でも**起動が止まらない**ようにするため。
+ * @internal
+ */
+const ID_MERGE_COLLAPSE_MAX_PASSES = 16;
+
+/**
+ * {@link collapseIdMergeChains} の1回ぶんの走査。
+ *
+ * @returns 記録を1件でも書き換えた（＝もう一度見る価値がある）か
+ * @internal
+ */
+function collapseIdMergeChainsOnce(db: Database.Database): boolean {
+  const rows = db
+    .prepare(`SELECT tableName, losingId, winningId, mergedAt FROM _id_merge`)
+    .all() as {
+    tableName: string;
+    losingId: string;
+    winningId: string;
+    mergedAt: string;
+  }[];
+  if (rows.length === 0) return false;
+
+  let changed = false;
+
+  const byTable = new Map<
+    string,
+    Map<string, { winningId: string; mergedAt: string }>
+  >();
+  for (const row of rows) {
+    const key = row.tableName.toLowerCase();
+    const records = byTable.get(key) ?? new Map();
+    records.set(row.losingId, {
+      winningId: row.winningId,
+      mergedAt: row.mergedAt,
+    });
+    byTable.set(key, records);
+  }
+
+  const update = db.prepare(
+    `UPDATE _id_merge SET winningId = ?
+     WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
+  );
+  const remove = db.prepare(
+    `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
+  );
+
+  for (const row of rows) {
+    const records = byTable.get(row.tableName.toLowerCase());
+    if (!records) continue;
+
+    // 終端まで辿る。通った記録を控えておき、出発点へ戻ったら循環と分かる
+    const walked: { losingId: string; mergedAt: string }[] = [
+      { losingId: row.losingId, mergedAt: row.mergedAt },
+    ];
+    const seen = new Set<string>([row.losingId]);
+    let terminal = row.winningId;
+    let cycles = false;
+    for (;;) {
+      if (terminal === row.losingId) {
+        cycles = true;
+        break;
+      }
+      if (seen.has(terminal)) break;
+      seen.add(terminal);
+      const next = records.get(terminal);
+      if (next === undefined) break;
+      walked.push({ losingId: terminal, mergedAt: next.mergedAt });
+      terminal = next.winningId;
+    }
+
+    if (cycles) {
+      // 「A は B へ畳まれた」と「B は A へ畳まれた」が同時に立っている矛盾した記録。
+      // どちらが正しいかは決められないので、**いちばん新しい主張だけを残す**
+      // （他と同じ「新しい主張が勝つ」。同時刻なら敗者idの辞書順で1つに決める）。
+      const strongest = walked.reduce((best, candidate) =>
+        candidate.mergedAt > best.mergedAt ||
+        (candidate.mergedAt === best.mergedAt &&
+          candidate.losingId < best.losingId)
+          ? candidate
+          : best
+      );
+      if (strongest.losingId !== row.losingId) {
+        remove.run(row.tableName, row.losingId);
+        changed = true;
+      }
+      continue;
+    }
+
+    if (terminal !== row.winningId) {
+      update.run(terminal, row.tableName, row.losingId);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 export function setupChangelog(
   db: Database.Database,
   tables: TableConfig[],
@@ -162,6 +297,9 @@ export function setupChangelog(
       PRIMARY KEY (tableName, losingId)
     )
   `);
+
+  // 旧バージョンが書いた鎖（`A→C` と `C→B` が並ぶ形）をここで畳む。
+  collapseIdMergeChains(db);
 
   // _heartbeat テーブル（changelog延命用）
   db.exec(`
