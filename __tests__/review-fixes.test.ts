@@ -10,6 +10,9 @@
  * 4. 循環へ流れ込む鎖が1回の走査では畳み切れない
  * 5. NULL を含む複合外部キーを「親が居ない」と判定して行を捨てる
  * 6. 親の表を**子の**時刻列で引き、作り直し／記録の有効性を判定し損ねる
+ * 7. 張り替えで `_id_merge.mergedAt` が**進み**、`_tombstone.deletedAt` と食い違う
+ * 8. 循環の刈り取りが `_tombstone.mergedInto` を置き去りにする
+ * 9. 届いたリモート行を採らなかったのに `upserted` と名乗る
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -86,8 +89,18 @@ describe('レビュー指摘の回帰', () => {
         .prepare(`SELECT id FROM items ORDER BY id`)
         .all() as { id: string }[];
       expect(rows.map((row) => row.id)).toEqual(['A']);
-      // 読み替えは終端を指す（子が中間の C へ向けられない）
-      expect(lookupIdMerge(db, 'items', 'A')?.winningId).toBe('B');
+      // **帳簿にも何も書かない。** 畳めなかったのに `A→B` を載せると、A の行は
+      // 生きたまま「畳まれた」と記録され（`_tombstone.mergedInto` は同期で他端末へ
+      // 伝わる）、遅れて届いた A の子だけが手元に無い B へ読み替えられる。
+      // `applyTombstones` はリモートの `_tombstone` を毎回**全件**読み直すので、
+      // B の行が届いた次の同期で同じ畳みがやり直される。
+      expect(lookupIdMerge(db, 'items', 'A')).toBeNull();
+      const tombstoneA = db
+        .prepare(
+          `SELECT mergedInto FROM _tombstone WHERE tableName = 'items' AND recordId = 'A'`
+        )
+        .get() as { mergedInto: string | null } | undefined;
+      expect(tombstoneA?.mergedInto ?? null).toBeNull();
     });
   });
 
@@ -336,6 +349,135 @@ describe('レビュー指摘の回帰', () => {
         .prepare(`SELECT parentId FROM children WHERE id = 'c1'`)
         .get() as { parentId: string };
       expect(row.parentId).toBe('A');
+    });
+  });
+  describe('7. 張り替えは `_id_merge.mergedAt` を進めもしない', () => {
+    const TABLES: TableConfig[] = [{ name: 'items' }];
+
+    it('あとから来た新しい畳みの巻き添えで、既存の記録の時刻が動かない', () => {
+      db = createDb('repoint-time');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      // A は1月に B へ畳まれ、その B が6月に C へ畳まれる（A は C へ張り替わる）
+      recordMerge(db, 'items', 'A', 'B', '2026-01-01T00:00:00.000Z');
+      recordMerge(db, 'items', 'B', 'C', '2026-06-01T00:00:00.000Z');
+
+      const record = lookupIdMerge(db, 'items', 'A')!;
+      expect(record.winningId).toBe('C');
+      // **A が畳まれたのは1月**。向き先が変わっただけで事実の時刻は動かない
+      expect(record.mergedAt).toBe('2026-01-01T00:00:00.000Z');
+
+      // 対になる `_tombstone.deletedAt` と揃っていること。ここがずれると、3月版の A は
+      // `isShadowedByTombstone`（1月より新しい）を通って復活する一方、
+      // `isFoldRecordStale`（6月より古い）は畳みを有効と見て、**A が生きたまま
+      // その子だけ C へ読み替えられる**
+      const tombstone = db
+        .prepare(
+          `SELECT deletedAt, mergedInto FROM _tombstone
+           WHERE tableName = 'items' AND recordId = 'A'`
+        )
+        .get() as TombstoneRow;
+      expect(tombstone.deletedAt).toBe(record.mergedAt);
+      expect(tombstone.mergedInto).toBe('C');
+    });
+  });
+
+  describe('8. 鎖の畳み直しは `_tombstone.mergedInto` も連れて動く', () => {
+    const TABLES: TableConfig[] = [{ name: 'items' }];
+
+    it('刈られた循環の tombstone は畳み先を名乗らなくなる', () => {
+      db = createDb('cycle-tombstone');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      // 旧バージョンが残しえた形（循環 A↔B と、そこへ流れ込む D→A）を2つの帳簿へ直接書く
+      const insertMerge = db.prepare(
+        `INSERT OR REPLACE INTO _id_merge (tableName, losingId, winningId, mergedAt)
+         VALUES ('items', ?, ?, ?)`
+      );
+      const insertTombstone = db.prepare(
+        `INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+         VALUES ('items', ?, ?, ?)`
+      );
+      for (const [losingId, winningId, at] of [
+        ['A', 'B', '2026-02-01T00:00:00.000Z'],
+        ['B', 'A', '2026-01-01T00:00:00.000Z'],
+        ['D', 'A', '2026-03-01T00:00:00.000Z'],
+      ]) {
+        insertMerge.run(losingId, winningId, at);
+        insertTombstone.run(losingId, at, winningId);
+      }
+
+      // 起動時の掃除は setupChangelog が呼ぶ
+      setupChangelog(db, TABLES, 'id');
+
+      const tombstoneOf = (recordId: string) =>
+        db
+          .prepare(
+            `SELECT deletedAt, mergedInto FROM _tombstone
+             WHERE tableName = 'items' AND recordId = ?`
+          )
+          .get(recordId) as TombstoneRow;
+
+      // 刈られた B は、もう畳み先を名乗らない。名乗ったままだと `lookupIdMerge` は
+      // null を返すのに tombstone だけが `A` を指し、`remapMergedForeignKeys` が
+      // 読み替えをやめる（遅れて届いた B の子が消えた親を指して取り込みが巻き戻る）
+      expect(tombstoneOf('B').mergedInto).toBeNull();
+      // 張り替えた D は終端の B を指す（`_id_merge` と同じ向き）
+      expect(tombstoneOf('D').mergedInto).toBe('B');
+      // 時刻は動かさない
+      expect(tombstoneOf('D').deletedAt).toBe('2026-03-01T00:00:00.000Z');
+    });
+  });
+
+  describe('9. 採らなかったリモート行を `upserted` と数えない', () => {
+    const TABLES: TableConfig[] = [{ name: 'items' }];
+
+    it('PK重複でローカルが勝ったら `skipped` を返す', () => {
+      db = createDb('insert-local-wins');
+      db.exec(`
+        CREATE TABLE items (
+          id        TEXT PRIMARY KEY,
+          name      TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `);
+      setupChangelog(db, TABLES, 'id');
+
+      db.prepare(
+        `INSERT INTO items (id, name, updatedAt)
+         VALUES ('A', 'local', '2026-06-01T00:00:00.000Z')`
+      ).run();
+
+      const result = applyInsert(
+        db,
+        'items',
+        'id',
+        { id: 'A', name: 'remote', updatedAt: '2026-01-01T00:00:00.000Z' },
+        ['id', 'name', 'updatedAt'],
+        'updatedAt'
+      );
+
+      // 届いた行は捨てられている。`upserted` と名乗ると、`processChangelogEntries` が
+      // これを `conflictsResolved` に数え、`action` だけを見る呼び出し元は
+      // 「リモートを適用した」と読む
+      expect(result.action).toBe('skipped');
+      expect(result.conflict?.resolution).toBe('local_wins');
+      const row = db
+        .prepare(`SELECT name FROM items WHERE id = 'A'`)
+        .get() as { name: string };
+      expect(row.name).toBe('local');
     });
   });
 });
