@@ -9,6 +9,7 @@
 import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { TableConfig } from './types';
+import { isLaterTimestamp } from './conflict/timestamp';
 
 /**
  * 「今」をユーザーレコードの `updatedAt` と同じ精度・同じ書式で得るSQL式。
@@ -181,7 +182,14 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
     const key = row.tableName.toLowerCase();
     const records = byTable.get(key) ?? new Map();
     const existing = records.get(row.losingId);
-    if (existing === undefined || row.mergedAt > existing.mergedAt) {
+    // 時刻は**字面で比べない**。ここが掃除する相手は旧版が書いた記録で、
+    // `datetime('now')` のスペース形式（`2026-06-01 10:00:00`）と `NOW_SQL` の
+    // ISO-T形式（`2026-06-01T09:00:00.000Z`）が混在する。字面だと ' '(0x20) <
+    // 'T'(0x54) なので**古い方が常に勝ち**、辿る鎖が本来と逆向きに決まる。
+    if (
+      existing === undefined ||
+      isLaterTimestamp(db, row.mergedAt, existing.mergedAt)
+    ) {
       records.set(row.losingId, {
         winningId: row.winningId,
         mergedAt: row.mergedAt,
@@ -217,10 +225,20 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
            AND mergedInto IS NOT NULL`
       )
     : null;
-  const clearTombstone = hasTombstone
+  // 刈る循環の記録は `_tombstone` にも同じ主張として載っている。**`mergedInto` を
+  // NULL にしてはいけない。** 刈られる側の `recordId` は循環で**生き残る**id なので、
+  // `{recordId: B, mergedInto: A}` を `{recordId: B, mergedInto: NULL}` に変えると、
+  // それは「B はただ消された」という主張になる。`_tombstone` は同期で他端末へ渡り、
+  // 向こうの `applyTombstoneDelete` は畳まずに **B を DELETE する**（子も道連れ）。
+  // 捨てるべきは主張そのものなので、行ごと消す（消えた B は相手から入り直せる。
+  // 張り替えた `D→B` の行き先が実在するようになるので、そちらとも辻褄が合う）。
+  // 消すのは**いま刈っている主張と同じ畳み先を指す tombstone だけ**で、無関係な
+  // ただの削除（`mergedInto IS NULL`）や別の畳み先は触らない。
+  const dropTombstoneClaim = hasTombstone
     ? db.prepare(
-        `UPDATE _tombstone SET mergedInto = NULL
-         WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
+        `DELETE FROM _tombstone
+         WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+           AND mergedInto IS NOT NULL AND mergedInto = ?`
       )
     : null;
 
@@ -252,16 +270,17 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
       // 「A は B へ畳まれた」と「B は A へ畳まれた」が同時に立っている矛盾した記録。
       // どちらが正しいかは決められないので、**いちばん新しい主張だけを残す**
       // （他と同じ「新しい主張が勝つ」。同時刻なら敗者idの辞書順で1つに決める）。
-      const strongest = walked.reduce((best, candidate) =>
-        candidate.mergedAt > best.mergedAt ||
-        (candidate.mergedAt === best.mergedAt &&
-          candidate.losingId < best.losingId)
-          ? candidate
-          : best
-      );
+      // 比較は `julianday()` で正規化する（索引を作るときと同じ理由 —— 旧版の
+      // スペース形式と ISO-T 形式が混在するので、字面で比べると古い方が勝つ）
+      const strongest = walked.reduce((best, candidate) => {
+        if (isLaterTimestamp(db, candidate.mergedAt, best.mergedAt))
+          return candidate;
+        if (isLaterTimestamp(db, best.mergedAt, candidate.mergedAt)) return best;
+        return candidate.losingId < best.losingId ? candidate : best;
+      });
       if (strongest.losingId !== row.losingId) {
         remove.run(row.tableName, row.losingId);
-        clearTombstone?.run(row.tableName, row.losingId);
+        dropTombstoneClaim?.run(row.tableName, row.losingId, row.winningId);
         changed = true;
       }
       continue;
