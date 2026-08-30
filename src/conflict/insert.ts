@@ -152,6 +152,13 @@ export function applyInsert(
 
       if (localRecord) {
         const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
+        // 同時刻かどうかは膠着の報告と競合の有無の**両方**が見る。`julianday` の
+        // 問い合わせを1レコードにつき二度投げないよう、一度だけ引く
+        const sameTimestamp = isSameTimestamp(
+          localDb,
+          remoteUpdatedAt,
+          localUpdatedAt
+        );
         const conflictOf = (
           resolution: 'remote_wins' | 'local_wins'
         ): ConflictInfo => ({
@@ -190,7 +197,7 @@ export function applyInsert(
         // 同じ時刻で中身が違うなら、どちらも勝てない。解けないので**報告する**。
         // 同時刻かどうかは字面ではなく時刻として見る（書式が違うだけの同時刻を
         // 取り逃がすと、膠着に気づけないまま黙って捨て合うことになる）
-        if (isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
+        if (sameTimestamp) {
           const stalemate = describeStalemate(
             tableName,
             String(pkValue),
@@ -214,9 +221,7 @@ export function applyInsert(
         // 届き方で違って見える**。競合は時刻に差があるときだけ返す。
         return {
           action: 'skipped',
-          conflict: isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)
-            ? undefined
-            : conflictOf('local_wins'),
+          conflict: sameTimestamp ? undefined : conflictOf('local_wins'),
           folds,
           warnings,
         };

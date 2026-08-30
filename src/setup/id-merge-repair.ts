@@ -13,6 +13,7 @@
  */
 import Database from 'better-sqlite3';
 import { isLaterTimestamp } from '../conflict/timestamp';
+import { escapeIdentifier } from './sql';
 
 /**
  * `_id_merge` に残っている**畳み先の鎖**を、終端まで畳み直す。
@@ -44,11 +45,41 @@ import { isLaterTimestamp } from '../conflict/timestamp';
  * **何も変わらなくなるまで**繰り返します（鎖は短くなる方向にしか動かないので必ず止まる）。
  * @internal
  */
-export function collapseIdMergeChains(db: Database.Database): void {
+export function collapseIdMergeChains(
+  db: Database.Database,
+  primaryKey: string
+): void {
   // 1回の走査で直せるのは、その時点で見えている形だけ。刈り取りで形が変われば
   // もう一度見る（打ち切りの上限は、鎖が1回の走査で最低1段は縮むことから置いている）
   for (let pass = 0; pass < ID_MERGE_COLLAPSE_MAX_PASSES; pass++) {
-    if (!collapseIdMergeChainsOnce(db)) return;
+    if (!collapseIdMergeChainsOnce(db, primaryKey)) return;
+  }
+}
+
+/**
+ * その id の行が、いま手元に在るか。
+ *
+ * 表が無い（同期対象でない・まだ作られていない）ときは false —— 確かめられないことを
+ * 「在る」に倒さない。削除の記録は、余分に残る方が失うものが小さい。
+ * @internal
+ */
+function rowIsPresent(
+  db: Database.Database,
+  tableName: string,
+  primaryKey: string,
+  recordId: string
+): boolean {
+  try {
+    return (
+      db
+        .prepare(
+          `SELECT 1 FROM ${escapeIdentifier(tableName)}
+           WHERE ${escapeIdentifier(primaryKey)} = ?`
+        )
+        .get(recordId) !== undefined
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -67,7 +98,10 @@ const ID_MERGE_COLLAPSE_MAX_PASSES = 16;
  * @returns 記録を1件でも書き換えた（＝もう一度見る価値がある）か
  * @internal
  */
-function collapseIdMergeChainsOnce(db: Database.Database): boolean {
+function collapseIdMergeChainsOnce(
+  db: Database.Database,
+  primaryKey: string
+): boolean {
   const rows = db
     .prepare(`SELECT tableName, losingId, winningId, mergedAt FROM _id_merge`)
     .all() as {
@@ -135,21 +169,24 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
            AND mergedInto IS NOT NULL`
       )
     : null;
-  // 刈る循環の記録は `_tombstone` にも同じ主張として載っている。**`mergedInto` を
-  // NULL にしてはいけない。** 刈られる側の `recordId` は循環で**生き残る**id なので、
-  // `{recordId: B, mergedInto: A}` を `{recordId: B, mergedInto: NULL}` に変えると、
-  // それは「B はただ消された」という主張になる。`_tombstone` は同期で他端末へ渡り、
-  // 向こうの `applyTombstoneDelete` は畳まずに **B を DELETE する**（子も道連れ）。
-  // 捨てるべきは主張そのものなので、行ごと消す（消えた B は相手から入り直せる。
-  // 張り替えた `D→B` の行き先が実在するようになるので、そちらとも辻褄が合う）。
-  // 消すのは**畳みの主張だけ**（`mergedInto IS NOT NULL`）で、利用者操作による
-  // ただの削除（`mergedInto IS NULL`）は触らない。
+  // 刈る循環の記録は `_tombstone` にも同じ主張として載っている。**その主張は捨てるが、
+  // 「消えた」という事実まで捨ててはいけない。** 刈られる側の `recordId` について
+  // この関数が知っているのは**帳簿の上で生き残る**ということだけで、その行が
+  // **実際に手元に在るか**は別の話である。2つの場合を分ける:
   //
-  // **どの畳み先を指しているかは問わない。** 刈られる `recordId` は循環で**生き残る**
-  // id であり、「この行は生きている」と決めた以上、その行に載っている畳みの主張は
-  // 行き先が何であれ矛盾する。畳み先の一致を条件にすると、2つの帳簿が既にずれている
-  // ときだけ `_id_merge` の行は消えて `_tombstone` の主張が残り、
-  // **刈り取りが直すはずの食い違いが、引き先の `_id_merge` も無い状態で残る**。
+  // - **手元に行が在る** — 畳みの主張も、削除という記録そのものも間違っている。
+  //   行ごと消す。`mergedInto` を NULL にするだけでは「B はただ消された」という主張に
+  //   なり、`_tombstone` は同期で渡るので、向こうの `applyTombstoneDelete` が
+  //   **生きている B を子ごと DELETE する**（消えた B は相手から入り直せるし、
+  //   張り替えた `D→B` の行き先が実在するようになるので辻褄も合う）
+  // - **手元に行が無い** — その id は本当に消えている。畳み先の主張だけを外して
+  //   「ただ消された」に戻す。行ごと消すと**削除の記録が失われ**、
+  //   `isShadowedByTombstone` が効かなくなって、相手の古い版がそのまま復活する
+  //
+  // どちらの場合も、利用者操作によるただの削除（`mergedInto IS NULL`）は触らない。
+  // **どの畳み先を指しているかは問わない** —— 生きていると決めた行に載っている畳みの
+  // 主張は行き先が何であれ矛盾するし、一致を条件にすると、2つの帳簿が既にずれている
+  // ときだけ `_id_merge` の行は消えて `_tombstone` の主張が残る。
   const dropTombstoneClaim = hasTombstone
     ? db.prepare(
         `DELETE FROM _tombstone
@@ -157,6 +194,22 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
            AND mergedInto IS NOT NULL`
       )
     : null;
+  const clearTombstoneClaim = hasTombstone
+    ? db.prepare(
+        `UPDATE _tombstone SET mergedInto = NULL
+         WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+           AND mergedInto IS NOT NULL`
+      )
+    : null;
+
+  /** 刈られた循環の主張を `_tombstone` からも落とす（上のコメントの2つの場合分け）。 */
+  const dropCycleClaim = (tableName: string, recordId: string): void => {
+    if (rowIsPresent(db, tableName, primaryKey, recordId)) {
+      dropTombstoneClaim?.run(tableName, recordId);
+      return;
+    }
+    clearTombstoneClaim?.run(tableName, recordId);
+  };
 
   for (const row of rows) {
     const records = byTable.get(row.tableName.toLowerCase());
@@ -196,7 +249,7 @@ function collapseIdMergeChainsOnce(db: Database.Database): boolean {
       });
       if (strongest.losingId !== row.losingId) {
         remove.run(row.tableName, row.losingId);
-        dropTombstoneClaim?.run(row.tableName, row.losingId);
+        dropCycleClaim(row.tableName, row.losingId);
         changed = true;
       }
       continue;
