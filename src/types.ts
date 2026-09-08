@@ -9,7 +9,7 @@
  *
  * @module types
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 
 /**
  * テーブル別の同期設定。
@@ -20,12 +20,12 @@ import Database from 'better-sqlite3';
  */
 export interface TableConfig {
   /** テーブル名 */
-  name: string;
+  name: string
   /**
    * LWW比較に使うタイムスタンプカラム名。
    * @defaultValue `'updatedAt'`
    */
-  timestampColumn?: string;
+  timestampColumn?: string
   /**
    * trueの場合、sync時にこのテーブルへのDELETE操作を適用しない（tombstone保護）。
    *
@@ -34,7 +34,7 @@ export interface TableConfig {
    * 見送っても行は救えないため（勝者行が届いた時点で同じ統合が起きるだけで、
    * それまでのあいだ子が宙に浮き、両者が同じユニークキーを送り合い続ける）。
    */
-  deleteProtected?: boolean;
+  deleteProtected?: boolean
 }
 
 /**
@@ -43,7 +43,7 @@ export interface TableConfig {
  * {@link SyncConfig.tableOptions} で利用する、{@link TableConfig} から
  * `name` を除いた形。
  */
-export type TableOptions = Omit<TableConfig, 'name'>;
+export type TableOptions = Omit<TableConfig, 'name'>
 
 /**
  * {@link discoverTables} に渡す検出オプション。
@@ -57,19 +57,19 @@ export interface DiscoverOptions {
    *
    * @defaultValue `'id'`
    */
-  primaryKey?: string;
+  primaryKey?: string
   /**
    * 検出から除外するテーブル名の配列。
    * ローカル専用キャッシュ等を持つ場合に使用。
    * @defaultValue `[]`
    */
-  excludeTables?: string[];
+  excludeTables?: string[]
   /**
    * テーブル別の追加オプション。
    * 指定しないテーブルはデフォルト動作（`updatedAt` / `deleteProtected: false`）。
    * @defaultValue `{}`
    */
-  tableOptions?: Record<string, TableOptions>;
+  tableOptions?: Record<string, TableOptions>
   /**
    * `id` を持つが `updatedAt`（または指定 `timestampColumn`）が無いテーブルを
    * 検出した際の警告コールバック。指定しなければ `console.warn` に出力される。
@@ -77,7 +77,7 @@ export interface DiscoverOptions {
    * 警告はあくまで「同期対象から外しました」の通知であり、エラーではない。
    * 意図的に除外したい場合は {@link excludeTables} を使えば警告も抑制される。
    */
-  onWarning?: (message: string) => void;
+  onWarning?: (message: string) => void
 }
 
 /**
@@ -119,22 +119,22 @@ export interface DiscoverOptions {
  */
 export interface SyncConfig {
   /** ローカルSQLite DBのファイルパス */
-  dbPath: string;
+  dbPath: string
   /** NAS上の共有ディレクトリパス */
-  nasPath: string;
+  nasPath: string
   /** このクライアントの一意識別子（UUID推奨） */
-  clientId: string;
+  clientId: string
   /**
    * 自動検出から除外するテーブル名の配列。
    * @defaultValue `[]`
    */
-  excludeTables?: string[];
+  excludeTables?: string[]
   /**
    * テーブル別の追加オプション。
    * 指定しないテーブルはデフォルト動作。
    * @defaultValue `{}`
    */
-  tableOptions?: Record<string, TableOptions>;
+  tableOptions?: Record<string, TableOptions>
   /**
    * 主キーカラム名。全対象テーブルで共通。
    *
@@ -149,23 +149,23 @@ export interface SyncConfig {
    *
    * @defaultValue `'id'`
    */
-  primaryKey?: string;
+  primaryKey?: string
   /**
    * 定期sync間隔（ミリ秒）。{@link SyncInstance.start} で使用される。
    * @defaultValue `30000`
    */
-  intervalMs?: number;
+  intervalMs?: number
   /**
    * `_changelog` テーブルの保持期間（日数）。
    * この日数より古いエントリはsync後に自動削除される。
    * @defaultValue `7`
    */
-  changelogRetentionDays?: number;
+  changelogRetentionDays?: number
   /**
    * sync完了後に呼ばれるコールバック。
    * changelog掃除の後に実行される。
    */
-  onAfterSync?: (localDb: Database.Database, result: SyncResult) => void;
+  onAfterSync?: (localDb: Database.Database, result: SyncResult) => void
   /**
    * アプリケーションのスキーマバージョン。
    *
@@ -177,7 +177,7 @@ export interface SyncConfig {
    *
    * @example `"20260324_002"` や `"v2.0.0"` など任意の文字列
    */
-  schemaVersion?: string;
+  schemaVersion?: string
 
   /**
    * heartbeat 機能を有効にするかどうか。
@@ -188,7 +188,7 @@ export interface SyncConfig {
    *
    * @defaultValue `true`
    */
-  heartbeatEnabled?: boolean;
+  heartbeatEnabled?: boolean
 
   /**
    * テーブル自動検出時の警告ログコールバック。
@@ -196,7 +196,7 @@ export interface SyncConfig {
    * `id` を持つが `updatedAt` が無いテーブルが見つかった際に呼ばれる。
    * 未指定なら `console.warn` に出力される。
    */
-  onDiscoveryWarning?: (message: string) => void;
+  onDiscoveryWarning?: (message: string) => void
 }
 
 /**
@@ -214,32 +214,32 @@ export interface SyncInstance {
    * @returns 同期結果の統計情報
    * @throws 同期中に再度呼び出した場合、またはNASアクセス不可時
    */
-  syncNow(): Promise<SyncResult>;
+  syncNow(): Promise<SyncResult>
   /**
    * 定期syncを開始する。
    *
    * {@link SyncConfig.intervalMs} 間隔で {@link syncNow} を繰り返し実行する。
    * 既に開始済みの場合は何もしない。
    */
-  start(): void;
+  start(): void
   /**
    * 定期syncを停止する。
    *
    * {@link start} で開始したインターバルをクリアする。
    */
-  stop(): void;
+  stop(): void
   /**
    * 現在の同期状態を取得する。
    * @returns 同期状態のスナップショット
    */
-  getStatus(): SyncStatus;
+  getStatus(): SyncStatus
   /**
    * このインスタンスが同期対象として認識しているテーブル名の一覧を返す。
    *
    * `setupSync` 時に `discoverTables` で検出された結果のスナップショット。
    * マージ処理など、ライブラリ外で同じテーブル集合を扱いたい場合に利用する。
    */
-  getSyncedTables(): string[];
+  getSyncedTables(): string[]
   /**
    * イベントリスナーを登録する。
    *
@@ -253,7 +253,7 @@ export interface SyncInstance {
    * });
    * ```
    */
-  on(event: SyncEvent, callback: SyncEventCallback): void;
+  on(event: SyncEvent, callback: SyncEventCallback): void
 }
 
 /**
@@ -263,11 +263,11 @@ export interface SyncInstance {
  */
 export interface SkippedRemote {
   /** スキップされたリモートのクライアントID */
-  clientId: string;
+  clientId: string
   /** リモート側のスキーマバージョン。読み取れなかった場合は `null` */
-  remoteVersion: string | null;
+  remoteVersion: string | null
   /** ローカル側のスキーマバージョン */
-  localVersion: string;
+  localVersion: string
 }
 
 /**
@@ -281,18 +281,18 @@ export interface SkippedRemote {
  */
 export interface RecordFold {
   /** 畳みが起きたテーブル名 */
-  tableName: string;
+  tableName: string
   /** 吸収されて消えた側のid */
-  losingId: string;
+  losingId: string
   /** 残った側のid */
-  winningId: string;
+  winningId: string
   /**
    * この端末で実際に行が消えたかどうか。
    *
    * `false` は「敗者行をそもそもローカルに持っていなかった」場合
    * （届いた行が負けたとき）。畳みの事実は記録されるが、ローカルの行数は変わらない。
    */
-  removedLocalRow: boolean;
+  removedLocalRow: boolean
   /**
    * この畳みで、消えた行から残った行へ**付け替えた子行の数**。
    *
@@ -316,7 +316,7 @@ export interface RecordFold {
    * その値を受け渡すため子の列を書き換えない。親が入れ替わったことに変わりはないので、
    * 引き継げた子はここに数える（引き継げなかったぶんは {@link lostChildren}）。
    */
-  movedChildren: number;
+  movedChildren: number
   /**
    * この畳みで、残った行へ**引き継げずに失われた**直接の子の行数。
    *
@@ -335,7 +335,7 @@ export interface RecordFold {
    * `movedChildren` と同じく**直接の子だけ**を数える（カスケードで一緒に消えた
    * 孫は数に入らない）。0 でない値を受け取ったら、利用者へ知らせること。
    */
-  lostChildren: number;
+  lostChildren: number
 }
 
 /**
@@ -345,11 +345,11 @@ export interface RecordFold {
  */
 export interface SyncResult {
   /** 今回の同期で処理したリモートクライアント数 */
-  clientsSynced: number;
+  clientsSynced: number
   /** リモートから挿入したレコード数 */
-  inserted: number;
+  inserted: number
   /** LWW比較でリモートが新しかったため更新したレコード数 */
-  updated: number;
+  updated: number
   /**
    * ローカルから消えたレコード数。
    *
@@ -357,9 +357,9 @@ export interface SyncResult {
    * ぶんの両方を数える（畳みも行が1つ消える）。畳んだ相手をローカルに
    * 持っていなかった場合は行が消えないので数えない。
    */
-  deleted: number;
+  deleted: number
   /** LWW比較でローカルが新しかったためスキップしたレコード数 */
-  skipped: number;
+  skipped: number
   /**
    * UNIQUE制約違反をLWWで解決して取り込んだレコード数。
    *
@@ -367,14 +367,14 @@ export interface SyncResult {
    * **届いたレコード1件につき1** 数える（1件の取り込みが連鎖的に複数の行を
    * 畳むことがあるが、その内訳は {@link folds} を見ること）。
    */
-  conflictsResolved: number;
+  conflictsResolved: number
   /**
    * 別id・同一ユニークキーの行を1つへ畳んだ一覧。
    *
    * 件数だけでは「何と何が1つになったか」を利用者へ説明できないため、
    * 畳みの中身をそのまま載せる。同じ内容は `_id_merge` にも永続化される。
    */
-  folds: RecordFold[];
+  folds: RecordFold[]
   /**
    * 致命的でない警告メッセージの配列。
    *
@@ -397,21 +397,21 @@ export interface SyncResult {
    * どちらも「その子が手元に居たら何が起きていたか」の再現であり、スキーマの
    * `ON DELETE` 宣言がそのまま扱いを決める（README「遅れて届いた子と、消えた畳み先」）。
    */
-  warnings: string[];
+  warnings: string[]
   /**
    * スキーマバージョン不一致でスキップされたリモートクライアントの一覧。
    *
    * {@link SyncConfig.schemaVersion} 指定時のみ記録される。
    * 同一クライアントは1回のsyncにつき1エントリ。
    */
-  skippedRemotes: SkippedRemote[];
+  skippedRemotes: SkippedRemote[]
   /**
    * changelogギャップが検出されたかどうか。
    *
    * `true` の場合、このクライアントは長期間同期しておらず、
    * pull-first モードで同期が行われた（NASアップロードはpull完了後）。
    */
-  hadChangelogGap: boolean;
+  hadChangelogGap: boolean
 }
 
 /**
@@ -421,13 +421,13 @@ export interface SyncResult {
  */
 export interface SyncStatus {
   /** 現在syncが実行中かどうか */
-  isSyncing: boolean;
+  isSyncing: boolean
   /** 最後にsyncが正常完了した時刻。未実行の場合は `null` */
-  lastSyncedAt: Date | null;
+  lastSyncedAt: Date | null
   /** 最後のsync結果。未実行の場合は `null` */
-  lastResult: SyncResult | null;
+  lastResult: SyncResult | null
   /** {@link SyncInstance.start} による定期syncが有効かどうか */
-  isRunning: boolean;
+  isRunning: boolean
 }
 
 /**
@@ -441,16 +441,13 @@ export interface SyncStatus {
  * | `sync:conflict` | 競合発生時 | `ConflictInfo` |
  */
 export type SyncEvent =
-  | 'sync:start'
-  | 'sync:complete'
-  | 'sync:error'
-  | 'sync:conflict';
+  'sync:start' | 'sync:complete' | 'sync:error' | 'sync:conflict'
 
 /**
  * {@link SyncInstance.on} に渡すイベントコールバック関数の型。
  * @param data - イベントに応じたデータ。イベント種別により型が異なる。
  */
-export type SyncEventCallback = (data?: unknown) => void;
+export type SyncEventCallback = (data?: unknown) => void
 
 // --- 内部型 ---
 
@@ -462,15 +459,15 @@ export type SyncEventCallback = (data?: unknown) => void;
  */
 export interface ChangelogEntry {
   /** changelogのオートインクリメントID */
-  id: number;
+  id: number
   /** 変更が発生したテーブル名 */
-  tableName: string;
+  tableName: string
   /** 変更されたレコードの主キー値 */
-  recordId: string;
+  recordId: string
   /** 操作種別 */
-  operation: 'INSERT' | 'UPDATE' | 'DELETE';
+  operation: 'INSERT' | 'UPDATE' | 'DELETE'
   /** 変更日時（ISO 8601形式、ミリ秒まで。`updatedAt` と同じ精度・書式で記録される） */
-  changedAt: string;
+  changedAt: string
 }
 
 /**
@@ -481,11 +478,11 @@ export interface ChangelogEntry {
  */
 export interface SyncStateEntry {
   /** リモートクライアントの識別子 */
-  remoteClientId: string;
+  remoteClientId: string
   /** 最後に処理したchangelog ID */
-  lastSeenId: number;
+  lastSeenId: number
   /** 最後にsyncした日時 */
-  lastSyncedAt: string | null;
+  lastSyncedAt: string | null
 }
 
 /**
@@ -496,15 +493,15 @@ export interface SyncStateEntry {
  */
 export interface ConflictInfo {
   /** 競合が発生したテーブル名 */
-  table: string;
+  table: string
   /** 競合が発生したレコードの主キー値 */
-  recordId: string;
+  recordId: string
   /** ローカル側の `updatedAt` 値 */
-  localUpdatedAt: string;
+  localUpdatedAt: string
   /** リモート側の `updatedAt` 値 */
-  remoteUpdatedAt: string;
+  remoteUpdatedAt: string
   /** 解決方法: ローカル保持 or リモート採用 */
-  resolution: 'local_wins' | 'remote_wins';
+  resolution: 'local_wins' | 'remote_wins'
 }
 
 /**
@@ -513,9 +510,9 @@ export interface ConflictInfo {
  */
 export interface RemoteClient {
   /** クライアント識別子（ファイル名から抽出） */
-  clientId: string;
+  clientId: string
   /** DBファイルの絶対パス */
-  filePath: string;
+  filePath: string
 }
 
 /**
@@ -531,4 +528,4 @@ export const DEFAULTS = {
   intervalMs: 30000,
   changelogRetentionDays: 7,
   heartbeatEnabled: true,
-} as const;
+} as const

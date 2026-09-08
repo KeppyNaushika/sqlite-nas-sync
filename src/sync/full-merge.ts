@@ -8,10 +8,10 @@
  * @module sync/full-merge
  * @internal
  */
-import Database from 'better-sqlite3';
-import { SyncResult, TableConfig } from '../types';
-import { applyUpdate } from '../conflict';
-import { escapeIdentifier, getTableColumns } from './sql';
+import Database from 'better-sqlite3'
+import { SyncResult, TableConfig } from '../types'
+import { applyUpdate } from '../conflict'
+import { escapeIdentifier, getTableColumns } from './sql'
 import {
   hasMergedIntoColumn,
   makeTableConfigLookup,
@@ -19,8 +19,8 @@ import {
   makeTimestampColumnFor,
   resolveFoldTarget,
   TombstoneEntry,
-} from './remote';
-import { applyTombstoneDelete, recordFolds } from './entries';
+} from './remote'
+import { applyTombstoneDelete, recordFolds } from './entries'
 
 /**
  * フルマージ: リモートの全レコードをLWWでローカルに適用する。
@@ -36,32 +36,30 @@ export function performFullMergeData(
   primaryKey: string,
   result: SyncResult
 ): void {
-  const timestampColumnFor = makeTimestampColumnFor(tables);
+  const timestampColumnFor = makeTimestampColumnFor(tables)
   const isResurrected = makeResurrectionProbe(
     remoteDb,
     primaryKey,
     timestampColumnFor
-  );
+  )
 
   for (const tableConfig of tables) {
-    const table = tableConfig.name;
-    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
-    const escapedTable = escapeIdentifier(table);
+    const table = tableConfig.name
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt'
+    const escapedTable = escapeIdentifier(table)
 
     // リモートDBにテーブルが存在するか確認
     const exists = remoteDb
-      .prepare(
-        `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
-      )
-      .get(table);
-    if (!exists) continue;
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+      .get(table)
+    if (!exists) continue
 
-    const columns = getTableColumns(localDb, table);
+    const columns = getTableColumns(localDb, table)
 
     // 全レコードをスキャン
     const remoteRecords = remoteDb
       .prepare(`SELECT * FROM ${escapedTable}`)
-      .all() as Record<string, unknown>[];
+      .all() as Record<string, unknown>[]
 
     for (const remoteRecord of remoteRecords) {
       const { action, folds, warnings } = applyUpdate(
@@ -73,13 +71,13 @@ export function performFullMergeData(
         timestampColumn,
         isResurrected,
         timestampColumnFor
-      );
-      result.warnings.push(...warnings);
-      if (action === 'updated') result.updated++;
-      if (action === 'inserted') result.inserted++;
-      if (action === 'skipped') result.skipped++;
-      if (folds.length > 0) result.conflictsResolved++;
-      recordFolds(result, folds);
+      )
+      result.warnings.push(...warnings)
+      if (action === 'updated') result.updated++
+      if (action === 'inserted') result.inserted++
+      if (action === 'skipped') result.skipped++
+      if (folds.length > 0) result.conflictsResolved++
+      recordFolds(result, folds)
     }
   }
 }
@@ -101,58 +99,62 @@ export function applyTombstones(
 ): void {
   // リモートに _tombstone テーブルが存在するか確認
   const exists = remoteDb
-    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_tombstone'`)
-    .get();
-  if (!exists) return;
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='_tombstone'`
+    )
+    .get()
+  if (!exists) return
 
   // 取り込み元の `_tombstone` が名乗る表名も**相手の綴り**なので、大小を畳んで引く
-  const tableConfigFor = makeTableConfigLookup(tables);
-  const timestampColumnFor = makeTimestampColumnFor(tables);
+  const tableConfigFor = makeTableConfigLookup(tables)
+  const timestampColumnFor = makeTimestampColumnFor(tables)
   const isResurrected = makeResurrectionProbe(
     remoteDb,
     primaryKey,
     timestampColumnFor
-  );
+  )
 
   // mergedInto は v0.14.0以前のクライアントには無い列
   const mergedIntoColumn = hasMergedIntoColumn(remoteDb)
     ? 'mergedInto'
-    : 'NULL AS mergedInto';
+    : 'NULL AS mergedInto'
   const tombstones = remoteDb
     .prepare(
       `SELECT tableName, recordId, deletedAt, ${mergedIntoColumn} FROM _tombstone`
     )
-    .all() as TombstoneEntry[];
+    .all() as TombstoneEntry[]
 
-  const columnCache = new Map<string, string[]>();
+  const columnCache = new Map<string, string[]>()
 
   for (const ts of tombstones) {
-    const tableConfig = tableConfigFor(ts.tableName);
-    if (!tableConfig) continue;
+    const tableConfig = tableConfigFor(ts.tableName)
+    if (!tableConfig) continue
 
     // 相手の綴りではなく、こちらの設定の綴りで扱う（`entries.ts` と同じ理由 ——
     // 帳簿の重複行をそもそも作らない）
-    const table = tableConfig.name;
+    const table = tableConfig.name
 
     // 畳みは deleteProtected でも適用する（processChangelogEntries と同じ理由）
-    const mergedInto = resolveFoldTarget(ts.recordId, ts.mergedInto);
-    if (tableConfig.deleteProtected && mergedInto === null) continue;
+    const mergedInto = resolveFoldTarget(ts.recordId, ts.mergedInto)
+    if (tableConfig.deleteProtected && mergedInto === null) continue
 
     // リモートにレコードが現存する場合は再作成されたものとみなし、tombstoneを無視する。
     // （削除後に同一ソースで再INSERTされたケース。削除時刻との大小に依らず存続させる）
-    const escapedTable = escapeIdentifier(table);
-    const escapedPk = escapeIdentifier(primaryKey);
+    const escapedTable = escapeIdentifier(table)
+    const escapedPk = escapeIdentifier(primaryKey)
     const remoteRecord = remoteDb
-      .prepare(`SELECT ${escapedPk} FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-      .get(ts.recordId);
-    if (remoteRecord) continue;
+      .prepare(
+        `SELECT ${escapedPk} FROM ${escapedTable} WHERE ${escapedPk} = ?`
+      )
+      .get(ts.recordId)
+    if (remoteRecord) continue
 
-    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt'
 
-    let columns = columnCache.get(table);
+    let columns = columnCache.get(table)
     if (!columns) {
-      columns = getTableColumns(localDb, table);
-      columnCache.set(table, columns);
+      columns = getTableColumns(localDb, table)
+      columnCache.set(table, columns)
     }
 
     // フォーマット差(ISO-T vs スペース形式)を吸収したLWWで削除を適用する。
@@ -169,7 +171,7 @@ export function applyTombstones(
       result,
       isResurrected,
       timestampColumnFor
-    );
+    )
   }
 }
 
@@ -195,15 +197,25 @@ export function mergeChangelog(
        WHERE julianday(changedAt) >= julianday('now', '-' || ? || ' days')
        ORDER BY id`
     )
-    .all(retentionDays) as { tableName: string; recordId: string; operation: string; changedAt: string }[];
+    .all(retentionDays) as {
+    tableName: string
+    recordId: string
+    operation: string
+    changedAt: string
+  }[]
 
-  if (entries.length === 0) return;
+  if (entries.length === 0) return
 
   const insertStmt = localDb.prepare(
     `INSERT INTO _changelog (tableName, recordId, operation, changedAt) VALUES (?, ?, ?, ?)`
-  );
+  )
 
   for (const entry of entries) {
-    insertStmt.run(entry.tableName, entry.recordId, entry.operation, entry.changedAt);
+    insertStmt.run(
+      entry.tableName,
+      entry.recordId,
+      entry.operation,
+      entry.changedAt
+    )
   }
 }

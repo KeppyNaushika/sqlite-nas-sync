@@ -17,6 +17,10 @@
     "build": "npm run clean && tsc",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "format": "prettier --write \"src/**/*.ts\" \"__tests__/**/*.ts\" \"*.json\" \"*.mjs\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"__tests__/**/*.ts\" \"*.json\" \"*.mjs\"",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test:watch": "vitest",
     "docs": "typedoc",
     "docs:serve": "typedoc && npx serve docs/api -l 3333",
@@ -50,10 +54,15 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.2.0",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
     "typedoc": "^0.28.20",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
     "vitest": "^4.1.11"
   },
   "files": [

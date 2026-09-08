@@ -6,30 +6,30 @@
  *
  * @module conflict/update
  */
-import Database from 'better-sqlite3';
-import { ConflictInfo, RecordFold } from '../types';
-import { escapeIdentifier, readColumn } from './schema';
+import Database from 'better-sqlite3'
+import { ConflictInfo, RecordFold } from '../types'
+import { escapeIdentifier, readColumn } from './schema'
 import {
   isLaterTimestamp,
   isSameTimestamp,
   TimestampColumnFor,
-} from './timestamp';
-import { describeStalemate } from './stalemate';
-import { ResurrectionProbe } from './tombstone';
-import { remapMergedForeignKeys } from './remap';
-import { overwriteExistingRow } from './overwrite';
-import { applyInsert } from './insert';
+} from './timestamp'
+import { describeStalemate } from './stalemate'
+import { ResurrectionProbe } from './tombstone'
+import { remapMergedForeignKeys } from './remap'
+import { overwriteExistingRow } from './overwrite'
+import { applyInsert } from './insert'
 
 /**
  * {@link applyUpdate} の返り値。
  */
 export interface ApplyUpdateResult {
-  action: 'updated' | 'skipped' | 'inserted';
-  conflict?: ConflictInfo;
+  action: 'updated' | 'skipped' | 'inserted'
+  conflict?: ConflictInfo
   /** 別id・同一ユニークキーの行を1つへ畳んだ記録（畳んでいなければ空） */
-  folds: RecordFold[];
+  folds: RecordFold[]
   /** 利用者へ伝えるべきこと（{@link ApplyInsertResult.warnings} と同じ） */
-  warnings: string[];
+  warnings: string[]
 }
 
 /**
@@ -64,8 +64,8 @@ export function applyUpdate(
   isResurrected?: ResurrectionProbe,
   timestampColumnFor?: TimestampColumnFor
 ): ApplyUpdateResult {
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedPk = escapeIdentifier(primaryKey)
 
   // 既に畳まれて消えた行を指す外部キーを、吸収先へ向け直す。
   // 向け直した先が消えていれば、その外部キーの `ON DELETE` に従う。
@@ -80,18 +80,18 @@ export function applyUpdate(
     timestampColumn,
     isResurrected,
     timestampColumnFor
-  );
-  const warnings = remap.warnings;
+  )
+  const warnings = remap.warnings
   if (remap.record === null) {
-    return { action: 'skipped', folds: [], warnings };
+    return { action: 'skipped', folds: [], warnings }
   }
 
-  const record = remap.record;
-  const pkValue = readColumn(record, primaryKey);
+  const record = remap.record
+  const pkValue = readColumn(record, primaryKey)
 
   const localRecord = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-    .get(pkValue) as Record<string, unknown> | undefined;
+    .get(pkValue) as Record<string, unknown> | undefined
 
   if (!localRecord) {
     // ローカルに存在しない → INSERT（リモートでINSERT後UPDATEされた場合など）。
@@ -106,13 +106,13 @@ export function applyUpdate(
       timestampColumn,
       isResurrected,
       timestampColumnFor
-    );
+    )
     if (insertResult.action === 'inserted') {
       return {
         action: 'inserted',
         folds: insertResult.folds,
         warnings: [...warnings, ...insertResult.warnings],
-      };
+      }
     }
     return {
       action:
@@ -122,12 +122,12 @@ export function applyUpdate(
       conflict: insertResult.conflict,
       folds: insertResult.folds,
       warnings: [...warnings, ...insertResult.warnings],
-    };
+    }
   }
 
   // LWW比較
-  const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '');
-  const localUpdatedAt = String(readColumn(localRecord, timestampColumn) ?? '');
+  const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '')
+  const localUpdatedAt = String(readColumn(localRecord, timestampColumn) ?? '')
 
   if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
     const outcome = overwriteExistingRow(
@@ -138,7 +138,7 @@ export function applyUpdate(
       localRecord,
       columns,
       timestampColumn
-    );
+    )
     return {
       // 届いた更新を採らなかった場合でも、更新対象の行は畳まれて消えている
       // （呼び出し元は `folds` の側でそれを数える）。
@@ -152,13 +152,17 @@ export function applyUpdate(
       },
       folds: outcome.folds,
       warnings,
-    };
+    }
   }
 
   // 同じ時刻で中身が違うなら、どちらも勝てない。解けないので**報告する**
   // （同時刻かどうかは字面ではなく時刻として見る）。膠着の報告と競合の有無の
   // 両方が見るので、`julianday` の問い合わせは一度だけにする
-  const sameTimestamp = isSameTimestamp(localDb, remoteUpdatedAt, localUpdatedAt);
+  const sameTimestamp = isSameTimestamp(
+    localDb,
+    remoteUpdatedAt,
+    localUpdatedAt
+  )
   if (sameTimestamp) {
     const stalemate = describeStalemate(
       tableName,
@@ -168,24 +172,24 @@ export function applyUpdate(
       localRecord,
       columns,
       timestampColumn
-    );
-    if (stalemate !== null) warnings.push(stalemate);
+    )
+    if (stalemate !== null) warnings.push(stalemate)
   }
 
   return {
     action: 'skipped',
     conflict: !sameTimestamp
-        ? {
-            table: tableName,
-            recordId: String(pkValue),
-            localUpdatedAt,
-            remoteUpdatedAt,
-            resolution: 'local_wins',
-          }
-        : undefined,
+      ? {
+          table: tableName,
+          recordId: String(pkValue),
+          localUpdatedAt,
+          remoteUpdatedAt,
+          resolution: 'local_wins',
+        }
+      : undefined,
     folds: [],
     warnings,
-  };
+  }
 }
 
 /**
@@ -209,12 +213,12 @@ export function applyDelete(
   primaryKey: string,
   recordId: string
 ): { action: 'deleted' | 'skipped' } {
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedPk = escapeIdentifier(primaryKey)
 
   const result = localDb
     .prepare(`DELETE FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-    .run(recordId);
+    .run(recordId)
 
-  return { action: result.changes > 0 ? 'deleted' : 'skipped' };
+  return { action: result.changes > 0 ? 'deleted' : 'skipped' }
 }

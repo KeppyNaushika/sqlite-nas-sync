@@ -13,8 +13,8 @@
  * @module conflict/fold
  * @internal
  */
-import Database from 'better-sqlite3';
-import { RecordFold } from '../types';
+import Database from 'better-sqlite3'
+import { RecordFold } from '../types'
 import {
   escapeIdentifier,
   findReferencingForeignKeys,
@@ -23,29 +23,29 @@ import {
   foldIdentifier,
   isSameIdentifier,
   readColumn,
-} from './schema';
-import { foldTimestampOf, resolveTimestampColumn } from './timestamp';
+} from './schema'
+import { foldTimestampOf, resolveTimestampColumn } from './timestamp'
 import {
   findUniqueRivals,
   outranksAllRivals,
   primaryKeyAsUniqueKey,
   readSecondaryUniqueKeys,
   selectSurvivingRival,
-} from './unique';
-import { recordFold, recordMerge } from './ledger';
+} from './unique'
+import { recordFold, recordMerge } from './ledger'
 import {
   hasChangelogDelete,
   maxChangelogId,
   writeFoldDeletion,
-} from './fold-changelog';
+} from './fold-changelog'
 import {
   carryChildrenThroughDelete,
   ChildCarry,
   countChildrenLostToDelete,
   countChildrenReferencing,
   emptyChildCarry,
-} from './child-carry';
-import { runInSavepoint } from './transaction';
+} from './child-carry'
+import { runInSavepoint } from './transaction'
 /**
  * 敗者行を指している子を勝者行へ付け替える。
  *
@@ -72,7 +72,7 @@ export function repointChildren(
   folds: RecordFold[],
   deletesLosingRow: boolean
 ): ChildCarry {
-  const carry = emptyChildCarry();
+  const carry = emptyChildCarry()
   for (const foreignKey of findReferencingForeignKeys(
     db,
     parentTable,
@@ -80,14 +80,14 @@ export function repointChildren(
   )) {
     const losingValues = foreignKey.columns.map(
       (column) => losingRow[column.parentColumn]
-    );
+    )
     const winningValues = foreignKey.columns.map(
       (column) => winningRow[column.parentColumn]
-    );
+    )
 
     // 敗者側の参照先がNULLなら、その参照で敗者を指している子は居ない
     if (losingValues.some((value) => value === null || value === undefined)) {
-      continue;
+      continue
     }
     // 勝者側の参照先がNULLなら、そこへは付け替えられない（付け替えると外部キーが壊れる）。
     // 衝突したユニーク列の値はNULLになり得ない（SQLiteのUNIQUEはNULL同士を衝突させない）ので、
@@ -102,9 +102,9 @@ export function repointChildren(
           losingValues,
           countChildrenReferencing(db, foreignKey, losingValues),
           carry
-        );
+        )
       }
-      continue;
+      continue
     }
     // 参照先の値が同じ。**「子は既に勝者を指している」とは限らない。**
     // 主キーを指す外部キーならその通りだが（敗者と勝者で主キーは必ず違うので、
@@ -113,19 +113,19 @@ export function repointChildren(
     // 走るため。子は敗者の行に繋がったままで、敗者を消せば道連れになる。
     if (losingValues.every((value, index) => value === winningValues[index])) {
       if (deletesLosingRow) {
-        carryChildrenThroughDelete(db, foreignKey, losingValues, carry);
+        carryChildrenThroughDelete(db, foreignKey, losingValues, carry)
       }
-      continue;
+      continue
     }
 
-    const escapedChildTable = escapeIdentifier(foreignKey.childTable);
+    const escapedChildTable = escapeIdentifier(foreignKey.childTable)
     const matchClause = foreignKey.columns
       .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
-      .join(' AND ');
+      .join(' AND ')
 
     const childRows = db
       .prepare(`SELECT * FROM ${escapedChildTable} WHERE ${matchClause}`)
-      .all(...losingValues) as Record<string, unknown>[];
+      .all(...losingValues) as Record<string, unknown>[]
 
     for (const childRow of childRows) {
       carry.movedChildren += repointChild(
@@ -137,10 +137,10 @@ export function repointChildren(
         timestampColumn,
         folded,
         folds
-      );
+      )
     }
   }
-  return carry;
+  return carry
 }
 
 /**
@@ -162,14 +162,17 @@ export function overwriteRow(
 ): void {
   const updateColumns = getTableColumns(db, tableName).filter(
     (column) => !isSameIdentifier(column, primaryKey)
-  );
-  if (updateColumns.length === 0) return;
+  )
+  if (updateColumns.length === 0) return
 
   db.prepare(
     `UPDATE ${escapeIdentifier(tableName)} SET ${updateColumns
       .map((column) => `${escapeIdentifier(column)} = ?`)
       .join(', ')} WHERE ${escapeIdentifier(primaryKey)} = ?`
-  ).run(...updateColumns.map((column) => row[column]), readColumn(row, primaryKey));
+  ).run(
+    ...updateColumns.map((column) => row[column]),
+    readColumn(row, primaryKey)
+  )
 }
 
 /**
@@ -189,20 +192,20 @@ export function repointChild(
   folded: Set<string>,
   folds: RecordFold[]
 ): number {
-  const escapedChildTable = escapeIdentifier(foreignKey.childTable);
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedChildTable = escapeIdentifier(foreignKey.childTable)
+  const escapedPk = escapeIdentifier(primaryKey)
   const setClause = foreignKey.columns
     .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
-    .join(', ');
+    .join(', ')
   const updateStatement = db.prepare(
     `UPDATE ${escapedChildTable} SET ${setClause} WHERE ${escapedPk} = ?`
-  );
+  )
 
   // 付け替え後の姿
-  const repointedRow = { ...childRow };
+  const repointedRow = { ...childRow }
   foreignKey.columns.forEach((column, index) => {
-    repointedRow[column.childColumn] = winningValues[index];
-  });
+    repointedRow[column.childColumn] = winningValues[index]
+  })
 
   // **子の時刻列は、親の時刻列と同じ名前とは限らない。** 畳みの記録に刻む時刻は
   // ここで解決した列から読むこと。親の列名のまま子の行を引くと値が取れず、記録は
@@ -211,19 +214,19 @@ export function repointChild(
     db,
     foreignKey.childTable,
     timestampColumn
-  );
+  )
 
   const runRepoint = (): number => {
-    const changelogIdBefore = maxChangelogId(db) ?? 0;
+    const changelogIdBefore = maxChangelogId(db) ?? 0
     const { changes } = updateStatement.run(
       ...winningValues,
       readColumn(childRow, primaryKey)
-    );
+    )
 
     // 親と主キーを共有する1:1のテーブルでは、外部キーが主キーそのものなので
     // 付け替えで子のidが動く。孫は古いidを指したままになるため、ここで引き取る。
-    const previousId = String(readColumn(childRow, primaryKey));
-    const nextId = String(readColumn(repointedRow, primaryKey));
+    const previousId = String(readColumn(childRow, primaryKey))
+    const nextId = String(readColumn(repointedRow, primaryKey))
     if (previousId !== nextId) {
       // 孫がここで動いた数は、どの `RecordFold` にも載らない（行が消えたのではなく
       // 1行のidが動いただけなので、畳みとして記録されないため）。
@@ -240,7 +243,7 @@ export function repointChild(
         // この経路は行を消さない（1行のidが動くだけ）ので、
         // 子を削除から守る細工は要らないし、してはいけない
         false
-      );
+      )
       // ここは行が1つ消えたのではなく、1行のidが動いただけなので `folds` には載せない
       // （利用者へ「2つを1つにまとめた」と伝える対象ではない）。
       // 刻む時刻は動いた先の行が名乗っている版の時刻。現在時刻にすると、古いidへの
@@ -259,7 +262,7 @@ export function repointChild(
         nextId,
         foldTimestampOf(repointedRow, childTimestampColumn),
         true
-      );
+      )
 
       // idが動いた＝古いidの行はもうどこにも無い。UPDATEトリガーが残すのは新しいidの
       // UPDATEだけなので、「古いid → 新しいid」の畳みは自分で差分経路へ載せる。
@@ -271,22 +274,22 @@ export function repointChild(
           changelogIdBefore
         )
       ) {
-        writeFoldDeletion(db, foreignKey.childTable, previousId);
+        writeFoldDeletion(db, foreignKey.childTable, previousId)
       }
     }
 
-    return changes;
-  };
+    return changes
+  }
 
   try {
-    return runRepoint();
+    return runRepoint()
   } catch (err: unknown) {
-    const sqliteErr = err as { code?: string };
+    const sqliteErr = err as { code?: string }
     if (
       sqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE' &&
       sqliteErr.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY'
     ) {
-      throw err;
+      throw err
     }
 
     // 勝者側に「同じもの」が既にある。子どうしを親と同じLWWで1行へ畳む。
@@ -303,10 +306,10 @@ export function repointChild(
         primaryKeyAsUniqueKey(primaryKey),
         ...readSecondaryUniqueKeys(db, foreignKey.childTable),
       ]
-    );
+    )
 
     // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
-    if (rivalRows.length === 0) throw err;
+    if (rivalRows.length === 0) throw err
 
     // 付け替え先の主キーを既に占めている行（外部キーが子の主キーを兼ねる1:1で、
     // 付け替えによって子のidが動く場合にだけ現れる）。
@@ -318,13 +321,13 @@ export function repointChild(
     //
     // 席は1つしか無いのだから、**どちらが勝っても残る行はこの席の行1つ**。
     // 勝敗が決めるのは中身であって、どちらの行が消えるかではない。
-    const nextId = String(readColumn(repointedRow, primaryKey));
+    const nextId = String(readColumn(repointedRow, primaryKey))
     const slotOccupant = rivalRows.find(
       (rivalRow) => String(readColumn(rivalRow, primaryKey)) === nextId
-    );
+    )
     const foldableRivals = rivalRows.filter(
       (rivalRow) => rivalRow !== slotOccupant
-    );
+    )
 
     if (
       outranksAllRivals(
@@ -351,13 +354,13 @@ export function repointChild(
             foldTimestampOf(repointedRow, childTimestampColumn)
           )
         )
-        .every((didFold) => didFold);
+        .every((didFold) => didFold)
 
       // 畳めなかった相手が居るのに付け替えを走らせると、同じ違反をもう一度、
       // 今度は誰も受け取らない形で投げることになる。握りつぶさず呼び出し元へ渡す。
-      if (!allFolded) throw err;
+      if (!allFolded) throw err
 
-      if (!slotOccupant) return runRepoint();
+      if (!slotOccupant) return runRepoint()
 
       // 席が埋まっているので行そのものは動かせない。動かす側の行を席へ畳んでから、
       // 中身だけ席へ移す（孫は席の行へ引き取られる）。
@@ -376,10 +379,10 @@ export function repointChild(
         folds,
         // 席に残るのは付け替える側の中身。その版の時刻を刻む
         foldTimestampOf(repointedRow, childTimestampColumn)
-      );
-      overwriteRow(db, foreignKey.childTable, primaryKey, repointedRow);
+      )
+      overwriteRow(db, foreignKey.childTable, primaryKey, repointedRow)
       // 付け替えたのではなく畳まれて消えた（この子ぶんの `RecordFold` が別に1件出る）
-      return 0;
+      return 0
     }
 
     // 衝突相手が残る → 付け替える側を衝突相手へ畳む（孫は衝突相手へ引き取られる）
@@ -388,7 +391,7 @@ export function repointChild(
       rivalRows,
       childTimestampColumn,
       primaryKey
-    );
+    )
     foldRowInto(
       db,
       foreignKey.childTable,
@@ -400,11 +403,11 @@ export function repointChild(
       folds,
       // 勝ち残るのは衝突相手の子。その行が名乗っている版の時刻を刻む
       foldTimestampOf(survivingChild, childTimestampColumn)
-    );
+    )
 
     // この子は付け替えたのではなく畳まれて消えた。数えるのは付け替えた行だけなので 0
     // （この子ぶんの `RecordFold` が別に1件出ており、孫の数はそちらに載る）。
-    return 0;
+    return 0
   }
 }
 
@@ -450,18 +453,18 @@ export function foldRowInto(
   folds: RecordFold[],
   foldedAt: string | undefined
 ): boolean {
-  const losingId = String(readColumn(losingRow, primaryKey));
-  const winningId = String(readColumn(winningRow, primaryKey));
-  if (losingId === winningId) return false;
+  const losingId = String(readColumn(losingRow, primaryKey))
+  const winningId = String(readColumn(winningRow, primaryKey))
+  if (losingId === winningId) return false
 
   // 自己参照する外部キーがあると同じ行へ戻ってくる可能性があるため、
   // **子の付け替えだけ**は繰り返さない（無限再帰になる）。
   // 削除と記録は再入のたびに行う — ここへ再入するのは「この行は消える」と二度決まった
   // ときであり、何もせず戻ると、畳まれて消える親を指したままの子が残って
   // COMMIT時に外部キー違反になる（その相手ぶんの取り込みが丸ごと巻き戻る）。
-  const marker = `${foldIdentifier(tableName)}:${losingId}`;
-  const revisited = folded.has(marker);
-  folded.add(marker);
+  const marker = `${foldIdentifier(tableName)}:${losingId}`
+  const revisited = folded.has(marker)
+  folded.add(marker)
 
   // 付け替えた子の数は利用者へ返す（{@link RecordFold.movedChildren}）。
   // 再入したときは付け替えを繰り返さないので 0。
@@ -478,22 +481,22 @@ export function foldRowInto(
         folds,
         // このあと敗者行を消す。値で繋がっている子は削除から守る必要がある
         true
-      );
+      )
 
-  const changelogIdBefore = maxChangelogId(db) ?? 0;
+  const changelogIdBefore = maxChangelogId(db) ?? 0
 
   db.prepare(
     `DELETE FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
-  ).run(readColumn(losingRow, primaryKey));
+  ).run(readColumn(losingRow, primaryKey))
 
   // 削除を越えて子を引き継ぐ後始末（外した参照を戻す・失われた数を数える）。
   // ここで `carry` の数が確定する。
-  for (const finishCarry of carry.afterDelete) finishCarry();
+  for (const finishCarry of carry.afterDelete) finishCarry()
 
   // 刻むのは畳みが確定した時刻であって、いま削除を走らせた時刻ではない。
   // 直前のDELETEでトリガーが `_tombstone` に現在時刻を書いているので、ここだけは
   // 比べずに**置く**（`replacesOwnDeletion`）。比べる形にすると必ず負ける。
-  recordMerge(db, tableName, losingId, winningId, foldedAt, true);
+  recordMerge(db, tableName, losingId, winningId, foldedAt, true)
 
   // 「この行とこの行が1つになった」を呼び出し元へ伝える（利用者への説明に使われる）。
   // この経路は行を消しているので removedLocalRow は true。
@@ -505,15 +508,15 @@ export function foldRowInto(
     true,
     carry.movedChildren,
     carry.lostChildren
-  );
+  )
 
   // 通常はいま起こしたDELETEでトリガーが `_changelog` に記録している。フルマージは
   // トリガーを外して走るのでそれが無く、畳みが差分経路に載らないまま埋もれる。手で書く。
   if (!hasChangelogDelete(db, tableName, losingId, changelogIdBefore)) {
-    writeFoldDeletion(db, tableName, losingId);
+    writeFoldDeletion(db, tableName, losingId)
   }
 
-  return true;
+  return true
 }
 
 /**
@@ -552,10 +555,10 @@ export function foldAndReplace(
   // 畳みが確定した時刻。**よそで下された判断を適用しているなら、その判断の時刻**を
   // 呼び出し元が渡す。渡されなければ、勝者は挿入される `record` なので、
   // その行が名乗る版の時刻を使う。
-  const foldedAt = decidedAt ?? foldTimestampOf(record, timestampColumn);
+  const foldedAt = decidedAt ?? foldTimestampOf(record, timestampColumn)
 
   runInSavepoint(db, () => {
-    const folded = new Set<string>();
+    const folded = new Set<string>()
     for (const losingRow of losingRows) {
       foldRowInto(
         db,
@@ -567,13 +570,12 @@ export function foldAndReplace(
         folded,
         folds,
         foldedAt
-      );
+      )
     }
     db.prepare(
       `INSERT INTO ${escapeIdentifier(tableName)} (${columns
         .map((column) => escapeIdentifier(column))
         .join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
-    ).run(...columns.map((column) => record[column]));
-  });
+    ).run(...columns.map((column) => record[column]))
+  })
 }
-

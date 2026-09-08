@@ -6,12 +6,12 @@
  *
  * @module nas
  */
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import * as crypto from 'crypto';
-import Database from 'better-sqlite3';
-import { RemoteClient } from './types';
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import * as crypto from 'crypto'
+import Database from 'better-sqlite3'
+import { RemoteClient } from './types'
 
 /**
  * ディレクトリが存在しない場合に再帰的に作成する。
@@ -20,7 +20,7 @@ import { RemoteClient } from './types';
  */
 export function ensureDirectory(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
+    fs.mkdirSync(dirPath, { recursive: true })
   }
 }
 
@@ -41,14 +41,14 @@ export async function copyToNas(
   nasPath: string,
   clientId: string
 ): Promise<void> {
-  ensureDirectory(nasPath);
+  ensureDirectory(nasPath)
 
-  const destFile = `client-${clientId}.sqlite`;
-  const destPath = path.join(nasPath, destFile);
-  const tempPath = `${destPath}.tmp`;
+  const destFile = `client-${clientId}.sqlite`
+  const destPath = path.join(nasPath, destFile)
+  const tempPath = `${destPath}.tmp`
 
-  await localDb.backup(tempPath);
-  fs.renameSync(tempPath, destPath);
+  await localDb.backup(tempPath)
+  fs.renameSync(tempPath, destPath)
 }
 
 /**
@@ -66,29 +66,29 @@ export function listRemoteClients(
   currentClientId: string
 ): RemoteClient[] {
   if (!fs.existsSync(nasPath)) {
-    return [];
+    return []
   }
 
-  const files = fs.readdirSync(nasPath);
-  const clients: RemoteClient[] = [];
+  const files = fs.readdirSync(nasPath)
+  const clients: RemoteClient[] = []
 
   for (const file of files) {
-    const match = file.match(/^client-(.+)\.sqlite$/);
-    if (!match) continue;
+    const match = file.match(/^client-(.+)\.sqlite$/)
+    if (!match) continue
 
-    const clientId = match[1];
-    if (clientId === currentClientId) continue;
+    const clientId = match[1]
+    if (clientId === currentClientId) continue
 
     // .tmp ファイルは除外
-    if (file.endsWith('.tmp')) continue;
+    if (file.endsWith('.tmp')) continue
 
     clients.push({
       clientId,
       filePath: path.join(nasPath, file),
-    });
+    })
   }
 
-  return clients;
+  return clients
 }
 
 /**
@@ -98,9 +98,9 @@ export function listRemoteClients(
  */
 export interface RemoteDbHandle {
   /** 読み取り専用でオープンされたデータベース接続。 */
-  db: Database.Database;
+  db: Database.Database
   /** 接続を閉じ、ローカル一時ファイル（あれば）を削除する。 */
-  cleanup: () => void;
+  cleanup: () => void
 }
 
 /**
@@ -123,40 +123,60 @@ export function openRemoteDbViaLocalCopy(
   filePath: string,
   tmpDir?: string
 ): RemoteDbHandle | null {
-  const effectiveTmpDir = tmpDir ?? path.join(os.tmpdir(), 'sqlite-nas-sync');
-  let tmpPath: string | null = null;
+  const effectiveTmpDir = tmpDir ?? path.join(os.tmpdir(), 'sqlite-nas-sync')
+  let tmpPath: string | null = null
 
   try {
-    ensureDirectory(effectiveTmpDir);
+    ensureDirectory(effectiveTmpDir)
 
-    const unique = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-    tmpPath = path.join(effectiveTmpDir, `remote-${unique}.sqlite`);
+    const unique = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+    tmpPath = path.join(effectiveTmpDir, `remote-${unique}.sqlite`)
 
-    fs.copyFileSync(filePath, tmpPath);
+    fs.copyFileSync(filePath, tmpPath)
 
-    const db = new Database(tmpPath, { readonly: true });
-    db.pragma('query_only = ON');
+    const db = new Database(tmpPath, { readonly: true })
+    db.pragma('query_only = ON')
 
-    const integrity = db.pragma('integrity_check', { simple: true }) as string;
+    const integrity = db.pragma('integrity_check', { simple: true }) as string
     if (integrity !== 'ok') {
-      try { db.close(); } catch { /* ignore */ }
-      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-      return null;
+      try {
+        db.close()
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.unlinkSync(tmpPath)
+      } catch {
+        /* ignore */
+      }
+      return null
     }
 
-    const fileToCleanup = tmpPath;
+    const fileToCleanup = tmpPath
     return {
       db,
       cleanup: () => {
-        try { db.close(); } catch { /* ignore */ }
-        try { fs.unlinkSync(fileToCleanup); } catch { /* ignore */ }
+        try {
+          db.close()
+        } catch {
+          /* ignore */
+        }
+        try {
+          fs.unlinkSync(fileToCleanup)
+        } catch {
+          /* ignore */
+        }
       },
-    };
+    }
   } catch {
     if (tmpPath) {
-      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      try {
+        fs.unlinkSync(tmpPath)
+      } catch {
+        /* ignore */
+      }
     }
-    return null;
+    return null
   }
 }
 
@@ -169,21 +189,19 @@ export function openRemoteDbViaLocalCopy(
  *
  * 互換性のため残しているが、内部からは利用していない。
  */
-export function openRemoteDb(
-  filePath: string
-): Database.Database | null {
+export function openRemoteDb(filePath: string): Database.Database | null {
   try {
-    const db = new Database(filePath, { readonly: true });
-    db.pragma('query_only = ON');
+    const db = new Database(filePath, { readonly: true })
+    db.pragma('query_only = ON')
 
-    const result = db.pragma('integrity_check', { simple: true }) as string;
+    const result = db.pragma('integrity_check', { simple: true }) as string
     if (result !== 'ok') {
-      db.close();
-      return null;
+      db.close()
+      return null
     }
 
-    return db;
+    return db
   } catch {
-    return null;
+    return null
   }
 }

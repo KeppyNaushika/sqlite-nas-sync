@@ -24,12 +24,12 @@
  *
  * @module conflict
  */
-export { applyInsert } from './insert';
-export type { ApplyInsertResult } from './insert';
-export { applyDelete, applyUpdate } from './update';
-export type { ApplyUpdateResult } from './update';
-export { applyMergedDelete } from './merged-delete';
-export { isLaterTimestamp } from './timestamp';
-export { isShadowedByTombstone } from './tombstone';
-export type { ResurrectionProbe } from './tombstone';
-export type { TimestampColumnFor } from './timestamp';
+export { applyInsert } from './insert'
+export type { ApplyInsertResult } from './insert'
+export { applyDelete, applyUpdate } from './update'
+export type { ApplyUpdateResult } from './update'
+export { applyMergedDelete } from './merged-delete'
+export { isLaterTimestamp } from './timestamp'
+export { isShadowedByTombstone } from './tombstone'
+export type { ResurrectionProbe } from './tombstone'
+export type { TimestampColumnFor } from './timestamp'

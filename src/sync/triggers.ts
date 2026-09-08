@@ -8,10 +8,10 @@
  * @module sync/triggers
  * @internal
  */
-import Database from 'better-sqlite3';
-import { TableConfig } from '../types';
-import { NOW_SQL, setupChangelog } from '../setup';
-import { escapeIdentifier } from './sql';
+import Database from 'better-sqlite3'
+import { TableConfig } from '../types'
+import { NOW_SQL, setupChangelog } from '../setup'
+import { escapeIdentifier } from './sql'
 
 /**
  * 対象テーブルのトリガーを無効化する。
@@ -25,26 +25,28 @@ export function disableTriggers(
   db: Database.Database,
   tables: TableConfig[]
 ): string[] {
-  const triggers: string[] = [];
+  const triggers: string[] = []
   for (const tableConfig of tables) {
-    const table = tableConfig.name;
+    const table = tableConfig.name
     const triggerNames = [
       `_changelog_after_insert_${table}`,
       `_changelog_after_update_${table}`,
       `_changelog_after_delete_${table}`,
-    ];
+    ]
     for (const name of triggerNames) {
       // トリガーが存在するか確認してからDROP
       const exists = db
-        .prepare(`SELECT name FROM sqlite_master WHERE type='trigger' AND name=?`)
-        .get(name);
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='trigger' AND name=?`
+        )
+        .get(name)
       if (exists) {
-        db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`);
-        triggers.push(name);
+        db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`)
+        triggers.push(name)
       }
     }
   }
-  return triggers;
+  return triggers
 }
 
 /**
@@ -57,11 +59,11 @@ export function reEnableTriggers(
   tables: TableConfig[],
   primaryKey: string
 ): void {
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedPk = escapeIdentifier(primaryKey)
 
   for (const tableConfig of tables) {
-    const table = tableConfig.name;
-    const escapedTable = escapeIdentifier(table);
+    const table = tableConfig.name
+    const escapedTable = escapeIdentifier(table)
 
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_insert_${table}
@@ -70,7 +72,7 @@ export function reEnableTriggers(
         INSERT INTO _changelog (tableName, recordId, operation, changedAt)
         VALUES ('${table}', NEW.${escapedPk}, 'INSERT', ${NOW_SQL});
       END
-    `);
+    `)
 
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_update_${table}
@@ -79,7 +81,7 @@ export function reEnableTriggers(
         INSERT INTO _changelog (tableName, recordId, operation, changedAt)
         VALUES ('${table}', NEW.${escapedPk}, 'UPDATE', ${NOW_SQL});
       END
-    `);
+    `)
 
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_delete_${table}
@@ -90,6 +92,6 @@ export function reEnableTriggers(
         INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt)
         VALUES ('${table}', OLD.${escapedPk}, ${NOW_SQL});
       END
-    `);
+    `)
   }
 }
