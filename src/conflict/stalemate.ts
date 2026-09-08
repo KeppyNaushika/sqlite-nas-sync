@@ -4,7 +4,7 @@
  * @module conflict/stalemate
  * @internal
  */
-import { isSameIdentifier } from './schema';
+import { isSameIdentifier } from './schema'
 
 /**
  * 「同じ行なのに、同じ時刻で中身が違う」——どちらも勝てない食い違いを言葉にする。
@@ -42,27 +42,27 @@ export function describeStalemate(
   // 許す表で両側とも NULL のまま中身が違う——**本物の膠着**——まで一緒に握り潰し、
   // 収束しない食い違いが誰にも知らされないまま残る。
   if (!columns.some((column) => isSameIdentifier(column, timestampColumn))) {
-    return null;
+    return null
   }
 
   const differing = columns.filter((column) => {
-    if (isSameIdentifier(column, timestampColumn)) return false;
-    return !isSameStoredValue(record[column], localRecord[column]);
-  });
-  if (differing.length === 0) return null;
+    if (isSameIdentifier(column, timestampColumn)) return false
+    return !isSameStoredValue(record[column], localRecord[column])
+  })
+  if (differing.length === 0) return null
 
   // 列が多い表では全部並べると読めない（実測: 40列で844文字）。人が最初に見るのは
   // 「どの行か」と「どのあたりが違うか」なので、先頭数列だけ挙げて残りは数で畳む。
-  const shown = differing.slice(0, STALEMATE_COLUMNS_SHOWN);
-  const rest = differing.length - shown.length;
+  const shown = differing.slice(0, STALEMATE_COLUMNS_SHOWN)
+  const rest = differing.length - shown.length
   const where =
-    rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(', ');
+    rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(', ')
 
   return (
     `Stalemate on ${tableName}:${recordId}: both sides are at ${timestamp} ` +
     `but ${where} differ, so neither can win. ` +
     `Edit the row on one side to break the tie.`
-  );
+  )
 }
 
 /**
@@ -72,8 +72,7 @@ export function describeStalemate(
  * 違うか」で、全列を並べても読めないため（実測: 40列で844文字）。
  * @internal
  */
-export const STALEMATE_COLUMNS_SHOWN = 5;
-
+export const STALEMATE_COLUMNS_SHOWN = 5
 
 /**
  * 2つの列の値が「同じものが入っている」と言えるか。
@@ -85,12 +84,11 @@ export const STALEMATE_COLUMNS_SHOWN = 5;
  * @internal
  */
 export function isSameStoredValue(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
+  if (a === b) return true
   if (a === null || a === undefined || b === null || b === undefined) {
     // 片方だけが空なら違う（両方空は上の === で通っている）
-    return (a ?? null) === (b ?? null);
+    return (a ?? null) === (b ?? null)
   }
-  if (Buffer.isBuffer(a) && Buffer.isBuffer(b)) return a.equals(b);
-  return String(a) === String(b);
+  if (Buffer.isBuffer(a) && Buffer.isBuffer(b)) return a.equals(b)
+  return String(a) === String(b)
 }
-

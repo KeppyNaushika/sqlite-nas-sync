@@ -16,19 +16,19 @@
  *
  * @module setup
  */
-import Database from 'better-sqlite3';
-import { TableConfig } from '../types';
-import { escapeIdentifier, dropStaleTrigger, NOW_SQL } from './sql';
-import { ensureTombstoneMergedIntoColumn } from './tombstone';
-import { collapseIdMergeChains } from './id-merge-repair';
+import Database from 'better-sqlite3'
+import { TableConfig } from '../types'
+import { escapeIdentifier, dropStaleTrigger, NOW_SQL } from './sql'
+import { ensureTombstoneMergedIntoColumn } from './tombstone'
+import { collapseIdMergeChains } from './id-merge-repair'
 
-export { NOW_SQL } from './sql';
-export { ensureTombstoneMergedIntoColumn } from './tombstone';
+export { NOW_SQL } from './sql'
+export { ensureTombstoneMergedIntoColumn } from './tombstone'
 export {
   computeSchemaHash,
   readSchemaVersion,
   writeSchemaVersion,
-} from './schema-version';
+} from './schema-version'
 
 /**
  * changelog追跡に必要なテーブルとトリガーをセットアップする。
@@ -64,10 +64,8 @@ export function setupChangelog(
       operation TEXT    NOT NULL,
       changedAt TEXT    NOT NULL DEFAULT (${NOW_SQL})
     )
-  `);
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_changelog_id ON _changelog(id)`
-  );
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_changelog_id ON _changelog(id)`)
 
   // _sync_state テーブル
   db.exec(`
@@ -76,7 +74,7 @@ export function setupChangelog(
       lastSeenId     INTEGER NOT NULL DEFAULT 0,
       lastSyncedAt   TEXT
     )
-  `);
+  `)
 
   // _tombstone テーブル（DELETE記録の長期保持）。
   // `mergedInto` は「この行は消えたのではなく、この行へ畳まれた」ことを表す。
@@ -91,9 +89,9 @@ export function setupChangelog(
       mergedInto TEXT,
       PRIMARY KEY (tableName, recordId)
     )
-  `);
+  `)
   // 既存DBには CREATE TABLE IF NOT EXISTS では列が増えないため、明示的に足す
-  ensureTombstoneMergedIntoColumn(db);
+  ensureTombstoneMergedIntoColumn(db)
 
   // _id_merge テーブル（畳んだ「敗者id → 勝者id」のローカル索引）。
   // 自分が勝った側のクライアントには敗者行が入らないため、あとから届く相手の子が
@@ -108,10 +106,10 @@ export function setupChangelog(
       mergedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
       PRIMARY KEY (tableName, losingId)
     )
-  `);
+  `)
 
   // 旧バージョンが書いた鎖（`A→C` と `C→B` が並ぶ形）をここで畳む。
-  collapseIdMergeChains(db, primaryKey);
+  collapseIdMergeChains(db, primaryKey)
 
   // _heartbeat テーブル（changelog延命用）
   db.exec(`
@@ -119,17 +117,17 @@ export function setupChangelog(
       id        TEXT PRIMARY KEY,
       updatedAt TEXT NOT NULL
     )
-  `);
+  `)
 
   // テーブルごとにトリガーを作成
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedPk = escapeIdentifier(primaryKey)
 
   for (const tableConfig of tables) {
-    const table = tableConfig.name;
-    const escapedTable = escapeIdentifier(table);
+    const table = tableConfig.name
+    const escapedTable = escapeIdentifier(table)
 
     // INSERT トリガー
-    dropStaleTrigger(db, `_changelog_after_insert_${table}`);
+    dropStaleTrigger(db, `_changelog_after_insert_${table}`)
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_insert_${table}
       AFTER INSERT ON ${escapedTable} FOR EACH ROW
@@ -137,10 +135,10 @@ export function setupChangelog(
         INSERT INTO _changelog (tableName, recordId, operation, changedAt)
         VALUES ('${table}', NEW.${escapedPk}, 'INSERT', ${NOW_SQL});
       END
-    `);
+    `)
 
     // UPDATE トリガー
-    dropStaleTrigger(db, `_changelog_after_update_${table}`);
+    dropStaleTrigger(db, `_changelog_after_update_${table}`)
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_update_${table}
       AFTER UPDATE ON ${escapedTable} FOR EACH ROW
@@ -148,10 +146,10 @@ export function setupChangelog(
         INSERT INTO _changelog (tableName, recordId, operation, changedAt)
         VALUES ('${table}', NEW.${escapedPk}, 'UPDATE', ${NOW_SQL});
       END
-    `);
+    `)
 
     // DELETE トリガー（_tombstone にも記録）
-    dropStaleTrigger(db, `_changelog_after_delete_${table}`);
+    dropStaleTrigger(db, `_changelog_after_delete_${table}`)
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS _changelog_after_delete_${table}
       AFTER DELETE ON ${escapedTable} FOR EACH ROW
@@ -161,11 +159,11 @@ export function setupChangelog(
         INSERT OR REPLACE INTO _tombstone (tableName, recordId, deletedAt)
         VALUES ('${table}', OLD.${escapedPk}, ${NOW_SQL});
       END
-    `);
+    `)
   }
 
   // _heartbeat のchangelogトリガー
-  dropStaleTrigger(db, '_changelog_after_insert__heartbeat');
+  dropStaleTrigger(db, '_changelog_after_insert__heartbeat')
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS _changelog_after_insert__heartbeat
     AFTER INSERT ON _heartbeat FOR EACH ROW
@@ -173,8 +171,8 @@ export function setupChangelog(
       INSERT INTO _changelog (tableName, recordId, operation, changedAt)
       VALUES ('_heartbeat', NEW.id, 'INSERT', ${NOW_SQL});
     END
-  `);
-  dropStaleTrigger(db, '_changelog_after_update__heartbeat');
+  `)
+  dropStaleTrigger(db, '_changelog_after_update__heartbeat')
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS _changelog_after_update__heartbeat
     AFTER UPDATE ON _heartbeat FOR EACH ROW
@@ -182,7 +180,7 @@ export function setupChangelog(
       INSERT INTO _changelog (tableName, recordId, operation, changedAt)
       VALUES ('_heartbeat', NEW.id, 'UPDATE', ${NOW_SQL});
     END
-  `);
+  `)
 
   // _sync_meta テーブル（スキーマバージョン等のメタ情報）
   db.exec(`
@@ -190,8 +188,8 @@ export function setupChangelog(
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     )
-  `);
+  `)
 
   // WALモード設定
-  db.pragma('journal_mode = WAL');
+  db.pragma('journal_mode = WAL')
 }

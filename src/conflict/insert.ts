@@ -8,44 +8,43 @@
  *
  * @module conflict/insert
  */
-import Database from 'better-sqlite3';
-import { ConflictInfo, RecordFold } from '../types';
-import { escapeIdentifier, readColumn } from './schema';
+import Database from 'better-sqlite3'
+import { ConflictInfo, RecordFold } from '../types'
+import { escapeIdentifier, readColumn } from './schema'
 import {
   isLaterTimestamp,
   isSameTimestamp,
   TimestampColumnFor,
-} from './timestamp';
-import { describeStalemate } from './stalemate';
+} from './timestamp'
+import { describeStalemate } from './stalemate'
 import {
   findUniqueRivals,
   outranksAllRivals,
   readSecondaryUniqueKeys,
   selectSurvivingRival,
-} from './unique';
-import { recordFold } from './ledger';
-import { isShadowedByTombstone, ResurrectionProbe } from './tombstone';
-import { recordMergeWithoutLocalRow } from './fold-changelog';
-import { remapMergedForeignKeys } from './remap';
-import { foldAndReplace } from './fold';
-import { overwriteExistingRow } from './overwrite';
-
+} from './unique'
+import { recordFold } from './ledger'
+import { isShadowedByTombstone, ResurrectionProbe } from './tombstone'
+import { recordMergeWithoutLocalRow } from './fold-changelog'
+import { remapMergedForeignKeys } from './remap'
+import { foldAndReplace } from './fold'
+import { overwriteExistingRow } from './overwrite'
 
 /**
  * {@link applyInsert} の返り値。
  */
 export interface ApplyInsertResult {
-  action: 'inserted' | 'upserted' | 'skipped';
-  conflict?: ConflictInfo;
+  action: 'inserted' | 'upserted' | 'skipped'
+  conflict?: ConflictInfo
   /** 別id・同一ユニークキーの行を1つへ畳んだ記録（畳んでいなければ空） */
-  folds: RecordFold[];
+  folds: RecordFold[]
   /**
    * 利用者へ伝えるべきこと（`SyncResult.warnings` へ出る）。
    *
    * いま載るのは「読み替え先の親が消えていたので `ON DELETE` に従った」だけ
    * （行を採らなかった／外部キーの列を NULL にした）。**黙って捨てない**ための口。
    */
-  warnings: string[];
+  warnings: string[]
 }
 
 /**
@@ -85,10 +84,10 @@ export function applyInsert(
   isResurrected?: ResurrectionProbe,
   timestampColumnFor?: TimestampColumnFor
 ): ApplyInsertResult {
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedColumns = columns.map((c) => escapeIdentifier(c));
-  const placeholders = columns.map(() => '?').join(', ');
-  const folds: RecordFold[] = [];
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedColumns = columns.map((c) => escapeIdentifier(c))
+  const placeholders = columns.map(() => '?').join(', ')
+  const folds: RecordFold[] = []
 
   // より新しい削除(tombstone)が記録済みのスロットには再挿入しない（決定論的LWW: 削除が勝つ）
   if (
@@ -99,7 +98,7 @@ export function applyInsert(
       String(readColumn(remoteRecord, timestampColumn) ?? '')
     )
   ) {
-    return { action: 'skipped', folds, warnings: [] };
+    return { action: 'skipped', folds, warnings: [] }
   }
 
   // 既に畳まれて消えた行を指す外部キーを、吸収先へ向け直す。
@@ -112,31 +111,31 @@ export function applyInsert(
     timestampColumn,
     isResurrected,
     timestampColumnFor
-  );
-  const warnings = remap.warnings;
+  )
+  const warnings = remap.warnings
   if (remap.record === null) {
-    return { action: 'skipped', folds, warnings };
+    return { action: 'skipped', folds, warnings }
   }
 
-  const record = remap.record;
-  const values = columns.map((c) => record[c]);
+  const record = remap.record
+  const values = columns.map((c) => record[c])
 
   try {
     localDb
       .prepare(
         `INSERT INTO ${escapedTable} (${escapedColumns.join(', ')}) VALUES (${placeholders})`
       )
-      .run(...values);
-    return { action: 'inserted', folds, warnings };
+      .run(...values)
+    return { action: 'inserted', folds, warnings }
   } catch (err: unknown) {
-    const sqliteErr = err as { code?: string };
+    const sqliteErr = err as { code?: string }
     if (
       sqliteErr.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
       sqliteErr.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
     ) {
-      const escapedPk = escapeIdentifier(primaryKey);
-      const pkValue = readColumn(record, primaryKey);
-      const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '');
+      const escapedPk = escapeIdentifier(primaryKey)
+      const pkValue = readColumn(record, primaryKey)
+      const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '')
 
       // ケース1: 同一PKの行が存在する（PK重複）→ LWWで上書き。
       //
@@ -148,17 +147,19 @@ export function applyInsert(
       // `applyInsert` の外まで抜けて取り込みが丸ごと巻き戻る。
       const localRecord = localDb
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-        .get(pkValue) as Record<string, unknown> | undefined;
+        .get(pkValue) as Record<string, unknown> | undefined
 
       if (localRecord) {
-        const localUpdatedAt = String(readColumn(localRecord, timestampColumn) ?? '');
+        const localUpdatedAt = String(
+          readColumn(localRecord, timestampColumn) ?? ''
+        )
         // 同時刻かどうかは膠着の報告と競合の有無の**両方**が見る。`julianday` の
         // 問い合わせを1レコードにつき二度投げないよう、一度だけ引く
         const sameTimestamp = isSameTimestamp(
           localDb,
           remoteUpdatedAt,
           localUpdatedAt
-        );
+        )
         const conflictOf = (
           resolution: 'remote_wins' | 'local_wins'
         ): ConflictInfo => ({
@@ -167,7 +168,7 @@ export function applyInsert(
           localUpdatedAt,
           remoteUpdatedAt,
           resolution,
-        });
+        })
 
         if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
           const outcome = overwriteExistingRow(
@@ -178,7 +179,7 @@ export function applyInsert(
             localRecord,
             columns,
             timestampColumn
-          );
+          )
           return {
             // 届いた行を採らなかった場合は `upserted` と言ってはいけない。
             // 上書きに負けた側では**リモートの行は捨てられ、ローカルのPK行が
@@ -191,7 +192,7 @@ export function applyInsert(
             conflict: conflictOf(outcome.resolution),
             folds: outcome.folds,
             warnings,
-          };
+          }
         }
 
         // 同じ時刻で中身が違うなら、どちらも勝てない。解けないので**報告する**。
@@ -206,8 +207,8 @@ export function applyInsert(
             localRecord,
             columns,
             timestampColumn
-          );
-          if (stalemate !== null) warnings.push(stalemate);
+          )
+          if (stalemate !== null) warnings.push(stalemate)
         }
 
         // ローカルの方が新しい ＝ **届いた行は書いていない**。`upserted` は
@@ -224,7 +225,7 @@ export function applyInsert(
           conflict: sameTimestamp ? undefined : conflictOf('local_wins'),
           folds,
           warnings,
-        };
+        }
       }
 
       // ケース2: 別PK・同一ユニークキーの行が存在する（セカンダリUNIQUE違反）。
@@ -237,11 +238,11 @@ export function applyInsert(
         record,
         pkValue,
         readSecondaryUniqueKeys(localDb, tableName)
-      );
+      )
 
       if (rivalRows.length === 0) {
         // 競合行を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
-        throw err;
+        throw err
       }
 
       const survivingRival = selectSurvivingRival(
@@ -249,8 +250,10 @@ export function applyInsert(
         rivalRows,
         timestampColumn,
         primaryKey
-      );
-      const localUpdatedAt = String(readColumn(survivingRival, timestampColumn) ?? '');
+      )
+      const localUpdatedAt = String(
+        readColumn(survivingRival, timestampColumn) ?? ''
+      )
 
       // 同時刻は主キーの辞書順で決める（{@link isPreferredOverRival}）。ここを
       // 「同点ならローカルが勝つ」にすると、相手側の {@link applyUpdate} が同じ2行を
@@ -277,7 +280,7 @@ export function applyInsert(
           columns,
           timestampColumn,
           folds
-        );
+        )
 
         return {
           action: 'upserted',
@@ -290,7 +293,7 @@ export function applyInsert(
           },
           folds,
           warnings,
-        };
+        }
       }
 
       // ローカルが新しい → リモート行は採用しない。
@@ -305,7 +308,7 @@ export function applyInsert(
         String(pkValue),
         String(readColumn(survivingRival, primaryKey)),
         localUpdatedAt
-      );
+      )
 
       // 敗者行はそもそもローカルに無いので、行は消えていない（数には出さない）。
       // それでも「2つが1つになった」ことは利用者へ伝える。
@@ -318,7 +321,7 @@ export function applyInsert(
         // 敗者行をローカルに持っていないので、付け替える子も失う子も居ない
         0,
         0
-      );
+      )
 
       return {
         // 同一PKの経路と同じ理由で、ここでも `upserted` と名乗ってはいけない。
@@ -336,9 +339,9 @@ export function applyInsert(
         },
         folds,
         warnings,
-      };
+      }
     }
 
-    throw err;
+    throw err
   }
 }

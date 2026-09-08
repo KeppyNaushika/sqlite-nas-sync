@@ -8,21 +8,21 @@
  * @module conflict/fold-changelog
  * @internal
  */
-import Database from 'better-sqlite3';
-import { NOW_SQL } from '../setup';
-import { hasTable } from './schema';
-import { ensureIdMergeTable, lookupIdMerge, recordMerge } from './ledger';
+import Database from 'better-sqlite3'
+import { NOW_SQL } from '../setup'
+import { hasTable } from './schema'
+import { ensureIdMergeTable, lookupIdMerge, recordMerge } from './ledger'
 
 /**
  * `_changelog` の現在の最大id。`_changelog` を持たないDBでは null。
  * @internal
  */
 export function maxChangelogId(db: Database.Database): number | null {
-  if (!hasTable(db, '_changelog')) return null;
+  if (!hasTable(db, '_changelog')) return null
   const row = db.prepare(`SELECT MAX(id) AS maxId FROM _changelog`).get() as {
-    maxId: number | null;
-  };
-  return row.maxId ?? 0;
+    maxId: number | null
+  }
+  return row.maxId ?? 0
 }
 
 /**
@@ -38,15 +38,15 @@ export function hasChangelogDelete(
   recordId: string,
   sinceId: number = 0
 ): boolean {
-  if (!hasTable(db, '_changelog')) return false;
+  if (!hasTable(db, '_changelog')) return false
   const row = db
     .prepare(
       `SELECT 1 FROM _changelog
        WHERE tableName = ? COLLATE NOCASE AND recordId = ?
          AND operation = 'DELETE' AND id > ?`
     )
-    .get(tableName, recordId, sinceId);
-  return row !== undefined;
+    .get(tableName, recordId, sinceId)
+  return row !== undefined
 }
 
 /**
@@ -73,21 +73,21 @@ export function writeFoldDeletion(
   tableName: string,
   losingId: string
 ): void {
-  if (!hasTable(db, '_changelog')) return;
-  if (!hasTable(db, '_tombstone')) return;
+  if (!hasTable(db, '_changelog')) return
+  if (!hasTable(db, '_tombstone')) return
 
   const tombstone = db
     .prepare(
       `SELECT 1 FROM _tombstone
        WHERE tableName = ? COLLATE NOCASE AND recordId = ?`
     )
-    .get(tableName, losingId);
-  if (!tombstone) return;
+    .get(tableName, losingId)
+  if (!tombstone) return
 
   db.prepare(
     `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
      VALUES (?, ?, 'DELETE', ${NOW_SQL})`
-  ).run(tableName, losingId);
+  ).run(tableName, losingId)
 }
 
 /**
@@ -108,19 +108,17 @@ export function recordMergeWithoutLocalRow(
   winningTimestamp?: string
 ): void {
   // 参照する前に用意する（`_id_merge` がまだ無いDBでも動くように）
-  ensureIdMergeTable(db);
+  ensureIdMergeTable(db)
   const alreadyRecorded =
-    lookupIdMerge(db, tableName, losingId)?.winningId === winningId;
+    lookupIdMerge(db, tableName, losingId)?.winningId === winningId
 
-  recordMerge(db, tableName, losingId, winningId, winningTimestamp);
+  recordMerge(db, tableName, losingId, winningId, winningTimestamp)
 
   // 同じエントリが増え続けないように、既に公開済みなら書かない。
   // 「`_id_merge` に記録済み」だけを根拠にはしない — 記録が残ったまま `_changelog` の側が
   // 掃除で消えていたり、`_changelog` がまだ無いDBで記録だけ先に入っていたりして、
   // それだと畳みが二度と差分経路に載らなくなる。
-  if (alreadyRecorded && hasChangelogDelete(db, tableName, losingId)) return;
+  if (alreadyRecorded && hasChangelogDelete(db, tableName, losingId)) return
 
-  writeFoldDeletion(db, tableName, losingId);
+  writeFoldDeletion(db, tableName, losingId)
 }
-
-

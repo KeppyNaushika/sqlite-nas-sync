@@ -7,29 +7,29 @@
  * @module sync/pull
  * @internal
  */
-import Database from 'better-sqlite3';
-import { SyncConfig, SyncResult, TableConfig } from '../types';
+import Database from 'better-sqlite3'
+import { SyncConfig, SyncResult, TableConfig } from '../types'
 import {
   cleanupChangelog,
   getMaxChangelogId,
   hasChangelogGap,
   readChangelog,
-} from '../changelog';
-import { openRemoteDbViaLocalCopy } from '../nas';
-import { readSchemaVersion } from '../setup';
+} from '../changelog'
+import { openRemoteDbViaLocalCopy } from '../nas'
+import { readSchemaVersion } from '../setup'
 import {
   deduplicateEntries,
   getSyncState,
   recordSkippedRemote,
   updateSyncState,
-} from './state';
-import { processChangelogEntries } from './entries';
+} from './state'
+import { processChangelogEntries } from './entries'
 import {
   applyTombstones,
   mergeChangelog,
   performFullMergeData,
-} from './full-merge';
-import { disableTriggers, reEnableTriggers } from './triggers';
+} from './full-merge'
+import { disableTriggers, reEnableTriggers } from './triggers'
 
 /**
  * 通常のchangelogベース差分同期を実行する。
@@ -45,44 +45,44 @@ export function pullNormal(
   result: SyncResult
 ): void {
   for (const remote of remoteClients) {
-    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
+    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null
 
     try {
-      handle = openRemoteDbViaLocalCopy(remote.filePath);
+      handle = openRemoteDbViaLocalCopy(remote.filePath)
       if (!handle) {
         result.warnings.push(
           `Failed to open remote database: ${remote.clientId}`
-        );
-        continue;
+        )
+        continue
       }
-      const remoteDb = handle.db;
+      const remoteDb = handle.db
 
       // schemaVersionチェック
       if (config.schemaVersion) {
-        const remoteVersion = readSchemaVersion(remoteDb);
+        const remoteVersion = readSchemaVersion(remoteDb)
         if (remoteVersion !== config.schemaVersion) {
           recordSkippedRemote(
             result,
             remote.clientId,
             remoteVersion,
             config.schemaVersion
-          );
-          continue;
+          )
+          continue
         }
       }
 
-      const { lastSeenId } = getSyncState(localDb, remote.clientId);
+      const { lastSeenId } = getSyncState(localDb, remote.clientId)
 
       // changelog読み取り
-      const entries = readChangelog(remoteDb, lastSeenId);
+      const entries = readChangelog(remoteDb, lastSeenId)
       if (entries.length === 0) {
-        result.clientsSynced++;
-        continue;
+        result.clientsSynced++
+        continue
       }
 
       // エントリの重複排除
-      const deduplicated = deduplicateEntries(entries);
-      const maxId = entries[entries.length - 1].id;
+      const deduplicated = deduplicateEntries(entries)
+      const maxId = entries[entries.length - 1].id
 
       // 適用と lastSeenId 更新を 1 つのトランザクションで原子的に。
       // ここで例外が出れば全てロールバックされ、次回 sync で同じ差分を再試行できる。
@@ -94,7 +94,7 @@ export function pullNormal(
         // 取り込み全体が巻き戻り、その相手からの同期が永久に止まる。
         // 制約を切るのではなく検査を遅らせるだけなので、COMMIT時に矛盾が残っていれば
         // 通常どおり失敗する。この pragma はCOMMIT/ROLLBACKで自動的に戻る。
-        localDb.pragma('defer_foreign_keys = ON');
+        localDb.pragma('defer_foreign_keys = ON')
         processChangelogEntries(
           localDb,
           remoteDb,
@@ -102,19 +102,17 @@ export function pullNormal(
           primaryKey,
           tables,
           result
-        );
-        updateSyncState(localDb, remote.clientId, maxId);
-      });
-      transaction();
+        )
+        updateSyncState(localDb, remote.clientId, maxId)
+      })
+      transaction()
 
-      result.clientsSynced++;
+      result.clientsSynced++
     } catch (err) {
-      result.warnings.push(
-        `Sync failed for client ${remote.clientId}: ${err}`
-      );
+      result.warnings.push(`Sync failed for client ${remote.clientId}: ${err}`)
     } finally {
       if (handle) {
-        handle.cleanup();
+        handle.cleanup()
       }
     }
   }
@@ -141,36 +139,36 @@ export function pullFullMerge(
 ): void {
   result.warnings.push(
     'Changelog gap detected, performing full merge with tombstone support'
-  );
+  )
 
   // トリガー無効化
-  disableTriggers(localDb, tables);
+  disableTriggers(localDb, tables)
 
   try {
     for (const remote of remoteClients) {
-      let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
+      let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null
 
       try {
-        handle = openRemoteDbViaLocalCopy(remote.filePath);
+        handle = openRemoteDbViaLocalCopy(remote.filePath)
         if (!handle) {
           result.warnings.push(
             `Failed to open remote database: ${remote.clientId}`
-          );
-          continue;
+          )
+          continue
         }
-        const remoteDb = handle.db;
+        const remoteDb = handle.db
 
         // schemaVersionチェック
         if (config.schemaVersion) {
-          const remoteVersion = readSchemaVersion(remoteDb);
+          const remoteVersion = readSchemaVersion(remoteDb)
           if (remoteVersion !== config.schemaVersion) {
             recordSkippedRemote(
               result,
               remote.clientId,
               remoteVersion,
               config.schemaVersion
-            );
-            continue;
+            )
+            continue
           }
         }
 
@@ -182,28 +180,28 @@ export function pullFullMerge(
           // 外部キーの検査をトランザクション終端まで遅らせる（pullNormal と同じ理由。
           // フルマージはテーブル名順に全行を流し込むため、親より先に子を入れる場面が
           // 通常フローよりさらに多い）。
-          localDb.pragma('defer_foreign_keys = ON');
-          performFullMergeData(localDb, remoteDb, tables, primaryKey, result);
-          applyTombstones(localDb, remoteDb, tables, primaryKey, result);
-          mergeChangelog(localDb, remoteDb, retentionDays);
-          const maxId = getMaxChangelogId(remoteDb);
-          updateSyncState(localDb, remote.clientId, maxId);
-        });
-        transaction();
+          localDb.pragma('defer_foreign_keys = ON')
+          performFullMergeData(localDb, remoteDb, tables, primaryKey, result)
+          applyTombstones(localDb, remoteDb, tables, primaryKey, result)
+          mergeChangelog(localDb, remoteDb, retentionDays)
+          const maxId = getMaxChangelogId(remoteDb)
+          updateSyncState(localDb, remote.clientId, maxId)
+        })
+        transaction()
 
-        result.clientsSynced++;
+        result.clientsSynced++
       } catch (err) {
         result.warnings.push(
           `Full merge failed for client ${remote.clientId}: ${err}`
-        );
+        )
       } finally {
         if (handle) {
-          handle.cleanup();
+          handle.cleanup()
         }
       }
     }
   } finally {
     // トリガー再有効化（必ず実行）
-    reEnableTriggers(localDb, tables, primaryKey);
+    reEnableTriggers(localDb, tables, primaryKey)
   }
 }
