@@ -46,17 +46,32 @@ export function readTombstoneClaim(
   if (!hasTable(db, '_tombstone')) return null;
   ensureTombstoneMergedIntoColumn(db);
 
+  // **1行を選ぶのではなく、合成する。**
+  // 綴り違いの2行は「同じ id についての別々の主張の断片」であって、どちらか一方が
+  // 正しいわけではない。実測では、同期経路が相手の綴りで書いた
+  // `('Users', L, mergedInto: W, 1月)` と、ローカルのDELETEトリガが
+  // `INSERT OR REPLACE` で書いた `('users', L, mergedInto: NULL, 6月)` が並び、
+  // 「新しい方」を採ると**畳み先を持たない方**が返る。受け取った側はそれを
+  // ただの削除として適用し、L の子を道連れにする。
+  // 削除時刻は最も新しいものを、畳み先は**主張されている中でいちばん新しいもの**を採る。
   const row = db
     .prepare(
-      `SELECT deletedAt, mergedInto FROM _tombstone
-       WHERE tableName = ? COLLATE NOCASE AND recordId = ?
-       ORDER BY julianday(deletedAt) DESC, deletedAt DESC
-       LIMIT 1`
+      `SELECT
+         (SELECT deletedAt FROM _tombstone
+           WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+           ORDER BY julianday(deletedAt) DESC, deletedAt DESC
+           LIMIT 1) AS deletedAt,
+         (SELECT mergedInto FROM _tombstone
+           WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+             AND mergedInto IS NOT NULL
+           ORDER BY julianday(deletedAt) DESC, deletedAt DESC
+           LIMIT 1) AS mergedInto`
     )
-    .get(tableName, recordId) as
-    | { deletedAt: string; mergedInto: string | null }
-    | undefined;
-  if (row === undefined) return null;
+    .get(tableName, recordId, tableName, recordId) as {
+    deletedAt: string | null;
+    mergedInto: string | null;
+  };
+  if (row.deletedAt === null) return null;
 
   return {
     deletedAt: String(row.deletedAt),

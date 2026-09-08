@@ -10,7 +10,7 @@
  */
 import Database from 'better-sqlite3';
 import { ConflictInfo, RecordFold } from '../types';
-import { escapeIdentifier } from './schema';
+import { escapeIdentifier, readColumn } from './schema';
 import {
   isLaterTimestamp,
   isSameTimestamp,
@@ -95,8 +95,8 @@ export function applyInsert(
     isShadowedByTombstone(
       localDb,
       tableName,
-      String(remoteRecord[primaryKey]),
-      String(remoteRecord[timestampColumn] ?? '')
+      String(readColumn(remoteRecord, primaryKey)),
+      String(readColumn(remoteRecord, timestampColumn) ?? '')
     )
   ) {
     return { action: 'skipped', folds, warnings: [] };
@@ -135,8 +135,8 @@ export function applyInsert(
       sqliteErr.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
     ) {
       const escapedPk = escapeIdentifier(primaryKey);
-      const pkValue = record[primaryKey];
-      const remoteUpdatedAt = String(record[timestampColumn] ?? '');
+      const pkValue = readColumn(record, primaryKey);
+      const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '');
 
       // ケース1: 同一PKの行が存在する（PK重複）→ LWWで上書き。
       //
@@ -151,7 +151,7 @@ export function applyInsert(
         .get(pkValue) as Record<string, unknown> | undefined;
 
       if (localRecord) {
-        const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
+        const localUpdatedAt = String(readColumn(localRecord, timestampColumn) ?? '');
         // 同時刻かどうかは膠着の報告と競合の有無の**両方**が見る。`julianday` の
         // 問い合わせを1レコードにつき二度投げないよう、一度だけ引く
         const sameTimestamp = isSameTimestamp(
@@ -250,7 +250,7 @@ export function applyInsert(
         timestampColumn,
         primaryKey
       );
-      const localUpdatedAt = String(survivingRival[timestampColumn] ?? '');
+      const localUpdatedAt = String(readColumn(survivingRival, timestampColumn) ?? '');
 
       // 同時刻は主キーの辞書順で決める（{@link isPreferredOverRival}）。ここを
       // 「同点ならローカルが勝つ」にすると、相手側の {@link applyUpdate} が同じ2行を
@@ -303,7 +303,7 @@ export function applyInsert(
         localDb,
         tableName,
         String(pkValue),
-        String(survivingRival[primaryKey]),
+        String(readColumn(survivingRival, primaryKey)),
         localUpdatedAt
       );
 
@@ -313,7 +313,7 @@ export function applyInsert(
         folds,
         tableName,
         String(pkValue),
-        String(survivingRival[primaryKey]),
+        String(readColumn(survivingRival, primaryKey)),
         false,
         // 敗者行をローカルに持っていないので、付け替える子も失う子も居ない
         0,
@@ -329,7 +329,7 @@ export function applyInsert(
         action: 'skipped',
         conflict: {
           table: tableName,
-          recordId: String(survivingRival[primaryKey]),
+          recordId: String(readColumn(survivingRival, primaryKey)),
           localUpdatedAt,
           remoteUpdatedAt,
           resolution: 'local_wins',

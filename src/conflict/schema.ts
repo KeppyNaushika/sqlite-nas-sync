@@ -64,11 +64,61 @@ export interface ColumnInfo {
 }
 
 /**
- * SQLiteの識別子は大文字小文字を区別しないため、テーブル名を畳んで比較する。
+ * SQLiteの識別子は大文字小文字を区別しないため、名前を畳んで比較する。
+ *
+ * `PRAGMA` は宣言どおりの綴りを返し、設定は利用者が書いた綴りを持つ。
+ * **字面で突き合わせると、綴りが違うだけで判断が丸ごと素通りする。**
+ *
+ * 畳むのは **ASCII の A–Z だけ**。SQLite の既定の照合順序（`BINARY` / `NOCASE`）が
+ * そうだからで、`toLowerCase()` を使うと全 Unicode を畳んでしまい、SQLite にとっては
+ * **別の識別子**である組（ケルビン記号 `K` U+212A と `k` など）を同じものと答える。
+ * ここでの答えは「SQLiteがこの2つを同じ列とみなすか」でなければならない。
  * @internal
  */
 export function isSameIdentifier(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
+  return foldIdentifier(a) === foldIdentifier(b);
+}
+
+/**
+ * 識別子を、比較や**マップのキー**に使える形へ畳む。
+ *
+ * 畳む範囲は {@link isSameIdentifier} と同じ ASCII の A–Z だけ。
+ * キーの作り方と比較の仕方が食い違うと、「マップでは同じ、比較では別」という
+ * ねじれが生まれるので、**どちらもここを通す**。
+ * @internal
+ */
+export function foldIdentifier(value: string): string {
+  return value.replace(/[A-Z]/g, (char) =>
+    String.fromCharCode(char.charCodeAt(0) + 32)
+  );
+}
+
+/**
+ * レコード（`SELECT *` の1行）から、**設定に書かれた綴り**で列の値を取り出す。
+ *
+ * SQLの側は識別子の大小を区別しないので `WHERE` もトリガも綴り違いで動くが、
+ * `SELECT *` が返すオブジェクトの**キーは表が宣言したとおりの綴り**である。
+ * 設定の `primaryKey` / `timestampColumn` をそのままキーにすると、綴りが違うだけで
+ * `undefined` になり、しかも**例外にならない**:
+ *
+ * - 時刻列を取り逃がすと両辺が空文字になり、LWWの比較が常に偽 ——
+ *   **届いた更新が全部黙って捨てられ、カーソルだけ進む**
+ * - 主キーを取り逃がすと `.get(undefined)` が例外になり、その相手ぶんの取り込みが
+ *   丸ごと巻き戻る
+ *
+ * 綴りが合っていれば直接引く（ほぼ全ての呼び出しがこちら）。合わないときだけ
+ * キーを走査して畳んで探す。
+ * @internal
+ */
+export function readColumn(
+  record: Record<string, unknown>,
+  columnName: string
+): unknown {
+  if (columnName in record) return record[columnName];
+  const key = Object.keys(record).find((candidate) =>
+    isSameIdentifier(candidate, columnName)
+  );
+  return key === undefined ? undefined : record[key];
 }
 
 /**
@@ -140,7 +190,7 @@ export function readForeignKeys(
 ): ForeignKeyRef[] {
   return cachedBySchema(
     db,
-    `fk:${childTable.toLowerCase()}:${primaryKey}`,
+    `fk:${foldIdentifier(childTable)}:${primaryKey}`,
     () => {
       const rows = db
         .prepare(`PRAGMA foreign_key_list(${escapeIdentifier(childTable)})`)
@@ -184,7 +234,7 @@ export function findReferencingForeignKeys(
 ): ForeignKeyRef[] {
   return cachedBySchema(
     db,
-    `refs:${parentTable.toLowerCase()}:${primaryKey}`,
+    `refs:${foldIdentifier(parentTable)}:${primaryKey}`,
     () => {
       const tables = db
         .prepare(
@@ -213,7 +263,7 @@ export function readColumnInfo(
   db: Database.Database,
   tableName: string
 ): ColumnInfo[] {
-  return cachedBySchema(db, `colinfo:${tableName.toLowerCase()}`, () => {
+  return cachedBySchema(db, `colinfo:${foldIdentifier(tableName)}`, () => {
     return db
       .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
       .all() as ColumnInfo[];
@@ -225,7 +275,7 @@ export function readColumnInfo(
  * @internal
  */
 export function getTableColumns(db: Database.Database, tableName: string): string[] {
-  return cachedBySchema(db, `cols:${tableName.toLowerCase()}`, () =>
+  return cachedBySchema(db, `cols:${foldIdentifier(tableName)}`, () =>
     readColumnInfo(db, tableName).map((column) => column.name)
   );
 }
@@ -345,7 +395,7 @@ export function foreignKeysEnforced(db: Database.Database): boolean {
  * @internal
  */
 export function rowKeyColumns(db: Database.Database, tableName: string): string[] {
-  return cachedBySchema(db, `rowkey:${tableName.toLowerCase()}`, () => {
+  return cachedBySchema(db, `rowkey:${foldIdentifier(tableName)}`, () => {
     const keyColumns = readColumnInfo(db, tableName)
       .filter((column) => column.pk > 0)
       .sort((a, b) => a.pk - b.pk)

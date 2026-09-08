@@ -10,6 +10,11 @@
  */
 import Database from 'better-sqlite3';
 
+// 識別子の比較は**1か所だけ**に置く。同じ規則の実装が2つあると、片方だけ直したときに
+// もう片方が古い意味のまま残る（この規則を1か所へ集めるための変更で、実装を2つに
+// 増やしてしまったことがある）。
+export { isSameIdentifier } from '../conflict/schema';
+
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
 export interface ColumnInfo {
   cid: number;

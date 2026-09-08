@@ -8,7 +8,7 @@
  */
 import Database from 'better-sqlite3';
 import { ConflictInfo, RecordFold } from '../types';
-import { escapeIdentifier } from './schema';
+import { escapeIdentifier, readColumn } from './schema';
 import {
   isLaterTimestamp,
   isSameTimestamp,
@@ -87,7 +87,7 @@ export function applyUpdate(
   }
 
   const record = remap.record;
-  const pkValue = record[primaryKey];
+  const pkValue = readColumn(record, primaryKey);
 
   const localRecord = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
@@ -126,8 +126,8 @@ export function applyUpdate(
   }
 
   // LWW比較
-  const remoteUpdatedAt = String(record[timestampColumn] ?? '');
-  const localUpdatedAt = String(localRecord[timestampColumn] ?? '');
+  const remoteUpdatedAt = String(readColumn(record, timestampColumn) ?? '');
+  const localUpdatedAt = String(readColumn(localRecord, timestampColumn) ?? '');
 
   if (isLaterTimestamp(localDb, remoteUpdatedAt, localUpdatedAt)) {
     const outcome = overwriteExistingRow(

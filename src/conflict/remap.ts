@@ -13,6 +13,8 @@ import {
   foreignKeysEnforced,
   hasTable,
   includesPrimaryKeyColumn,
+  isSameIdentifier,
+  readColumn,
   readForeignKeys,
 } from './schema';
 import { hasIdMerges, isFoldRecordStale, lookupIdMerge } from './ledger';
@@ -150,7 +152,7 @@ export function remapMergedForeignKeys(
   if (!hasIdMerges(db)) return { record, warnings: [] };
 
   const warnings: string[] = [];
-  const recordId = String(record[primaryKey]);
+  const recordId = String(readColumn(record, primaryKey));
   let remapped: Record<string, unknown> | null = null;
   // 「読み替え先が消えていた」外部キーの後始末。**全部の外部キーを見終えてから**行う。
   // 1つの表が `CASCADE` の親と `SET NULL` の親を両方持つとき、途中で結論を出すと
@@ -166,7 +168,13 @@ export function remapMergedForeignKeys(
     let repointedTo: string | null = null;
 
     for (const { childColumn, parentColumn } of foreignKey.columns) {
-      if (parentColumn !== primaryKey) continue;
+      // **列名の比較は大小を畳む。** `PRAGMA foreign_key_list` は `REFERENCES` 句に
+      // 書かれたとおりの綴りを返すので、`REFERENCES users(ID)` と設定の `id` は
+      // 字面では一致しない。素の比較にすると読み替えが**一度も走らず**、畳まれた親を
+      // 指す子がそのまま入って外部キー違反になる（その相手ぶんの取り込みが巻き戻る）。
+      // 暗黙の `REFERENCES users` は `readForeignKeys` が主キー名で埋めるので無事だが、
+      // 親の列を明示した宣言だけが落ちる、という見つけにくい形になる。
+      if (!isSameIdentifier(parentColumn, primaryKey)) continue;
       const current = record[childColumn];
       if (current === null || current === undefined) continue;
 

@@ -72,12 +72,18 @@ describe('畳みの伝播', () => {
   });
 
   it('古いtombstoneが既にあっても、畳みのDELETEが掃除で消えない', () => {
-    // 敗者idには「ずっと前に消して作り直した」履歴があり、tombstoneが保持期間より古い
+    // 敗者idには「ずっと前に消して作り直した」履歴があり、tombstoneが保持期間より古い。
+    //
+    // **時刻は固定値で書く。** `datetime('now','-30 days')` にすると、他の値
+    // （`2026-08-01` など）が固定なので、実時刻が進むだけで前提が入れ替わる ——
+    // 実際、この tombstone が届いたレコードより新しくなった日に
+    // `isShadowedByTombstone` が働き、畳みへ辿り着かずに落ちた。
+    // 相対と固定を混ぜないこと。
     const db = createParentsDb('retention');
     db.prepare(`INSERT INTO parents VALUES ('aaa', 'k1', '2026-08-19')`).run();
     db.prepare(
       `INSERT INTO _tombstone (tableName, recordId, deletedAt)
-       VALUES ('parents', 'bbb', datetime('now', '-30 days'))`
+       VALUES ('parents', 'bbb', '2026-01-01')`
     ).run();
     db.prepare(`DELETE FROM _changelog`).run();
 

@@ -10,6 +10,7 @@
  */
 import Database from 'better-sqlite3';
 import { ChangelogEntry, SyncResult } from '../types';
+import { foldIdentifier } from '../conflict/schema';
 import { NOW_SQL } from '../setup';
 
 /**
@@ -25,7 +26,9 @@ import { NOW_SQL } from '../setup';
 export function deduplicateEntries(entries: ChangelogEntry[]): ChangelogEntry[] {
   const map = new Map<string, ChangelogEntry>();
   for (const entry of entries) {
-    const key = `${entry.tableName}:${entry.recordId}`;
+    // 表名は大小を畳んで1件にまとめる（綴り違いで届いた同じ行を二度処理しない）。
+    // id の方は**データ**なので畳まない
+    const key = `${foldIdentifier(entry.tableName)}:${entry.recordId}`;
     map.set(key, entry);
   }
   return Array.from(map.values());

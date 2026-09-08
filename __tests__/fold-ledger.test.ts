@@ -16,7 +16,8 @@ import Database from 'better-sqlite3';
 import { setupChangelog } from '../src/setup';
 import { applyInsert, applyMergedDelete } from '../src/conflict';
 import { lookupIdMerge, recordMerge } from '../src/conflict/ledger';
-import { TableConfig } from '../src/types';
+import { SyncResult, TableConfig } from '../src/types';
+import { applyTombstoneDelete } from '../src/sync/entries';
 
 interface TombstoneRow {
   recordId: string;
@@ -578,5 +579,201 @@ describe('自分の手で起こした移動は、古い記録に断られない'
     // 実在しない勝者を指したまま、`writeFoldDeletion` だけが p1 の DELETE を
     // 公開する（受け取った端末は p1 の子を行き先の無い zz へ読み替えて捨てる）
     expect(lookupIdMerge(db, 'profiles', 'p1')?.winningId).toBe('p2');
+  });
+});
+
+describe('帳簿へ書く経路は、ぜんぶ同じ判断を通る', () => {
+  const TABLES: TableConfig[] = [{ name: 'items' }];
+
+  it('`applyTombstoneDelete` は判断を飛び越えて畳み先を書かない', () => {
+    // `_tombstone.mergedInto` の書き手は1つではない。`recordTombstoneMerge` を
+    // `foldClaimWins` の下に入れても、`applyTombstoneDelete` の upsert が判断より
+    // **前に**書いていれば、同じ食い違いが逆向きに起きる（ローカルは読み替えず、
+    // 他端末だけが畳む）。しかも公開される主張は「古い判断の畳み先」と「新しい削除
+    // 時刻」の組になるので、その畳みの影が全端末で広がる。
+    db = createDb('tombstone-delete-gate');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        ukey      TEXT NOT NULL UNIQUE,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 手元で普通に削除する（トリガが現在時刻の tombstone を書く。`_id_merge` は空）
+    db.prepare(
+      `INSERT INTO items VALUES ('B', 'k1', '2026-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(`DELETE FROM items WHERE id = 'B'`).run();
+
+    // そこへ、よそで 2020 年に決まった畳み B→C が届く
+    const remoteDb = new Database(':memory:');
+    const result: SyncResult = {
+      clientsSynced: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
+      skipped: 0,
+      conflictsResolved: 0,
+      folds: [],
+      warnings: [],
+      skippedRemotes: [],
+      hadChangelogGap: false,
+    };
+    applyTombstoneDelete(
+      db,
+      remoteDb,
+      'items',
+      'id',
+      'updatedAt',
+      ['id', 'ukey', 'updatedAt'],
+      'B',
+      '2020-01-01T00:00:00.000Z',
+      'C',
+      result,
+      () => false,
+      () => 'updatedAt'
+    );
+    remoteDb.close();
+
+    const tombstone = db
+      .prepare(
+        `SELECT deletedAt, mergedInto FROM _tombstone
+         WHERE tableName = 'items' AND recordId = 'B'`
+      )
+      .get() as { deletedAt: string; mergedInto: string | null };
+
+    // 断ったのなら、**どちらの帳簿にも**載っていないこと
+    expect(lookupIdMerge(db, 'items', 'B')).toBeNull();
+    expect(tombstone.mergedInto).toBeNull();
+    // 手元の削除時刻（新しい）は古い主張で巻き戻らない
+    expect(tombstone.deletedAt > '2020-01-01T00:00:00.000Z').toBe(true);
+  });
+});
+
+describe('表名の綴りが違っても、帳簿の引きは新しい方を採る', () => {
+  const TABLES: TableConfig[] = [{ name: 'items' }];
+
+  it('`_id_merge` に綴り違いの2行があっても、古い記録へ読み替えない', () => {
+    db = createDb('id-merge-collation');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      );
+      CREATE TABLE kids (
+        id        TEXT PRIMARY KEY,
+        parentId  TEXT REFERENCES items(id),
+        updatedAt TEXT NOT NULL
+      );
+    `);
+    setupChangelog(db, [...TABLES, { name: 'kids' }], 'id');
+
+    // 引くときは COLLATE NOCASE だが、主キーは BINARY なので2行が同居できる。
+    // 同期経路が自分でこの状況を作る（`recordMerge` は相手が使った綴りで書く）
+    db.prepare(
+      `INSERT INTO _id_merge (tableName, losingId, winningId, mergedAt)
+       VALUES ('Items', 'L', 'OLD', '2020-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO _id_merge (tableName, losingId, winningId, mergedAt)
+       VALUES ('items', 'L', 'NEW', '2026-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO items (id, updatedAt) VALUES ('NEW', '2026-01-01T00:00:00.000Z')`
+    ).run();
+
+    // 走査順まかせだと古い `OLD`（存在しない）へ読み替え、外部キー違反が
+    // `applyInsert` を抜けて取り込みごと巻き戻る
+    expect(lookupIdMerge(db, 'items', 'L')?.winningId).toBe('NEW');
+    const result = applyInsert(
+      db,
+      'kids',
+      'id',
+      { id: 'k1', parentId: 'L', updatedAt: '2026-02-01T00:00:00.000Z' },
+      ['id', 'parentId', 'updatedAt']
+    );
+    expect(result.action).toBe('inserted');
+    const kid = db
+      .prepare(`SELECT parentId FROM kids WHERE id = 'k1'`)
+      .get() as { parentId: string };
+    expect(kid.parentId).toBe('NEW');
+  });
+});
+
+describe('畳み主張の半分だけを公開しない', () => {
+  const TABLES: TableConfig[] = [{ name: 'items' }];
+
+  it('見送った畳みの `deletedAt` だけを進めない', () => {
+    // `mergedInto` を判断の下へ移しても、`deletedAt` を先に進めてしまうと
+    // **新しい削除時刻と古い判断の畳み先の組**が公開される。畳み先が元々無ければ
+    // 「新しい時刻にただ消された」となり、受け取った側は畳まずに DELETE して
+    // 子を道連れにする。
+    db = createDb('half-published-claim');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 敗者行 L は手元に在る（無いと「読み替えだけ先に覚える」経路になり、
+    // 見送りにならない）
+    db.prepare(
+      `INSERT INTO items (id, updatedAt) VALUES ('L', '2020-01-01T00:00:00.000Z')`
+    ).run();
+    db.prepare(`DELETE FROM _tombstone WHERE recordId = 'L'`).run();
+
+    // 手元は「1月に W1 へ畳まれた」を持っている
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+       VALUES ('items', 'L', '2026-01-01T00:00:00.000Z', 'W1')`
+    ).run();
+    // ローカルでは W2 が既に別の行へ畳まれている（＝届く主張の鎖が動いている）
+    recordMerge(db, 'items', 'W2', 'W3', '2026-02-01T00:00:00.000Z');
+
+    // そこへ「6月に W2 へ畳まれた」が届く。終端 W3 の行はどこにも無いので見送られる
+    const remoteDb = new Database(':memory:');
+    const result: SyncResult = {
+      clientsSynced: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
+      skipped: 0,
+      conflictsResolved: 0,
+      folds: [],
+      warnings: [],
+      skippedRemotes: [],
+      hadChangelogGap: false,
+    };
+    applyTombstoneDelete(
+      db,
+      remoteDb,
+      'items',
+      'id',
+      'updatedAt',
+      ['id', 'updatedAt'],
+      'L',
+      '2026-06-01T00:00:00.000Z',
+      'W2',
+      result,
+      () => false,
+      () => 'updatedAt'
+    );
+    remoteDb.close();
+
+    const tombstone = db
+      .prepare(
+        `SELECT deletedAt, mergedInto FROM _tombstone
+         WHERE tableName = 'items' AND recordId = 'L'`
+      )
+      .get() as { deletedAt: string; mergedInto: string | null };
+
+    // 見送ったのなら、主張は**まるごと**元のまま（時刻だけ進まない）
+    expect(tombstone.mergedInto).toBe('W1');
+    expect(tombstone.deletedAt).toBe('2026-01-01T00:00:00.000Z');
   });
 });

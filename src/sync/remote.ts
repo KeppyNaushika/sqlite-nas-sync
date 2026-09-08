@@ -12,6 +12,7 @@ import Database from 'better-sqlite3';
 import { TableConfig } from '../types';
 import { isLaterTimestamp } from '../conflict';
 import type { ResurrectionProbe, TimestampColumnFor } from '../conflict';
+import { foldIdentifier, isSameIdentifier } from '../conflict/schema';
 import { ColumnInfo, escapeIdentifier, getTableColumns } from './sql';
 
 /**
@@ -31,7 +32,7 @@ export function hasMergedIntoColumn(db: Database.Database): boolean {
   const columns = db
     .prepare(`PRAGMA table_info(_tombstone)`)
     .all() as ColumnInfo[];
-  return columns.some((column) => column.name === 'mergedInto');
+  return columns.some((column) => isSameIdentifier(column.name, 'mergedInto'));
 }
 
 /**
@@ -51,18 +52,32 @@ export function getRemoteTombstone(
     .get();
   if (!exists) return null;
 
-  const mergedIntoColumn = hasMergedIntoColumn(remoteDb)
-    ? 'mergedInto'
-    : 'NULL AS mergedInto';
+  // v0.14.0以前のクライアントには `mergedInto` 列が無い。その場合は「畳み先は無い」
+  // と読む（式として `NULL` を置く。`AS` は付けない —— 下では列名ではなく式として使う）
+  const mergedIntoColumn = hasMergedIntoColumn(remoteDb) ? 'mergedInto' : 'NULL';
+  // 取り込み元の `_tombstone` も、表名の綴り違いで2行ありうる（主キーは BINARY）。
+  // **1行を選ばず合成する** —— 削除時刻は最も新しいものを、畳み先は主張されている
+  // 中でいちばん新しいものを採る。「新しい方の行」を丸ごと採ると、ローカルの
+  // DELETEトリガが `INSERT OR REPLACE` で書いた**畳み先の無い行**が勝ってしまい、
+  // 受け取った側が畳まずに DELETE して子を道連れにする（`readTombstoneClaim` と同じ）。
   const row = remoteDb
     .prepare(
-      `SELECT deletedAt, ${mergedIntoColumn} FROM _tombstone
-       WHERE tableName = ? AND recordId = ?`
+      `SELECT
+         (SELECT deletedAt FROM _tombstone
+           WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+           ORDER BY julianday(deletedAt) DESC, deletedAt DESC
+           LIMIT 1) AS deletedAt,
+         (SELECT ${mergedIntoColumn} FROM _tombstone
+           WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+             AND ${mergedIntoColumn} IS NOT NULL
+           ORDER BY julianday(deletedAt) DESC, deletedAt DESC
+           LIMIT 1) AS mergedInto`
     )
-    .get(tableName, recordId) as
-    | { deletedAt: string; mergedInto: string | null }
-    | undefined;
-  if (!row) return null;
+    .get(tableName, recordId, tableName, recordId) as {
+    deletedAt: string | null;
+    mergedInto: string | null;
+  };
+  if (row.deletedAt === null) return null;
 
   return {
     deletedAt: String(row.deletedAt),
@@ -107,6 +122,28 @@ export function readRemoteRecord(
 }
 
 /**
+ * 表の名前から `TableConfig` を引く索引を作る。**大小は畳む。**
+ *
+ * `_changelog` / `_tombstone` のエントリが名乗る表名は**相手の設定どおりの綴り**である
+ * （相手のトリガが自分の設定を `'${table}'` として埋め込む）。素の `Map` で引くと、
+ * 相手が `Users`・こちらが `users` というだけで**全エントリが素通りし**、しかも
+ * `_sync_state` のカーソルは進むので、その変更は二度と提供されない（`clientsSynced` は
+ * 成功として報告される）。このライブラリは他のあらゆる場所で表名の大小を畳んでいる
+ * （`readTombstoneClaim` / `lookupIdMerge` / `hasChangelogDelete` /
+ * `findReferencingForeignKeys`）ので、ここだけ字面で引いてはいけない。
+ * @internal
+ */
+export function makeTableConfigLookup(
+  tables: TableConfig[]
+): (tableName: string) => TableConfig | undefined {
+  const byName = new Map<string, TableConfig>();
+  for (const tableConfig of tables) {
+    byName.set(foldIdentifier(tableConfig.name), tableConfig);
+  }
+  return (tableName) => byName.get(foldIdentifier(tableName));
+}
+
+/**
  * 表の名前から、その表の時刻列を答える手続きを作る。
  *
  * **時刻列は表ごとに違う**（`TableConfig.timestampColumn`）。子の設定を親の表に
@@ -119,11 +156,11 @@ export function makeTimestampColumnFor(tables: TableConfig[]): TimestampColumnFo
   const byName = new Map<string, string>();
   for (const tableConfig of tables) {
     byName.set(
-      tableConfig.name.toLowerCase(),
+      foldIdentifier(tableConfig.name),
       tableConfig.timestampColumn ?? 'updatedAt'
     );
   }
-  return (tableName) => byName.get(tableName.toLowerCase()) ?? 'updatedAt';
+  return (tableName) => byName.get(foldIdentifier(tableName)) ?? 'updatedAt';
 }
 
 /**
@@ -157,13 +194,13 @@ export function makeResurrectionProbe(
 
     let statement: Database.Statement | null = null;
     try {
+      // 列名の比較は大小を畳む（取り込み元の綴りと設定の綴りが揃うとは限らない）。
+      // 取り逃がすと「作り直された親」を認識できず、届いた子を捨ててしまう
       const columns = getTableColumns(remoteDb, tableName);
       const preferred = timestampColumnFor(tableName);
-      const column = columns.includes(preferred)
-        ? preferred
-        : columns.includes('updatedAt')
-          ? 'updatedAt'
-          : null;
+      const match = (name: string): string | undefined =>
+        columns.find((candidate) => isSameIdentifier(candidate, name));
+      const column = match(preferred) ?? match('updatedAt') ?? null;
       if (column !== null) {
         statement = remoteDb.prepare(
           `SELECT ${escapeIdentifier(column)} AS ts

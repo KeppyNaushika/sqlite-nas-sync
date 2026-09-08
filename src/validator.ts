@@ -7,7 +7,13 @@
  * @module validator
  */
 import Database from 'better-sqlite3';
-import { DiscoverOptions, TableConfig, DEFAULTS } from './types';
+import {
+  DiscoverOptions,
+  TableConfig,
+  TableOptions,
+  DEFAULTS,
+} from './types';
+import { foldIdentifier, isSameIdentifier } from './conflict/schema';
 
 /**
  * バリデーションエラーの詳細。
@@ -89,7 +95,7 @@ export function validateDatabase(
       .all() as ColumnInfo[];
 
     // PKカラム確認
-    const pkColumn = columns.find((col) => col.name === primaryKey);
+    const pkColumn = columns.find((col) => isSameIdentifier(col.name, primaryKey));
     if (!pkColumn) {
       errors.push({
         table,
@@ -107,7 +113,9 @@ export function validateDatabase(
     }
 
     // タイムスタンプカラム確認
-    const hasTimestamp = columns.some((col) => col.name === timestampColumn);
+    const hasTimestamp = columns.some((col) =>
+      isSameIdentifier(col.name, timestampColumn)
+    );
     if (!hasTimestamp) {
       errors.push({
         table,
@@ -163,8 +171,20 @@ export function discoverTables(
   options: DiscoverOptions = {}
 ): TableConfig[] {
   const primaryKey = options.primaryKey ?? DEFAULTS.primaryKey;
-  const excludeSet = new Set(options.excludeTables ?? []);
+  // **表名の照合も大小を畳む。** `sqlite_master` は宣言どおりの綴りを返し、
+  // `excludeTables` / `tableOptions` は利用者が書いた綴りを持つ。字面で突き合わせると
+  // `excludeTables: ['Users']` が `users` を除外できず、その表の `tableOptions`
+  // （`timestampColumn` の指定など）も黙って効かないまま既定値で同期される。
+  const excludeSet = new Set(
+    (options.excludeTables ?? []).map(foldIdentifier)
+  );
   const tableOptions = options.tableOptions ?? {};
+  const optionsFor = (name: string): TableOptions | undefined => {
+    const key = Object.keys(tableOptions).find((candidate) =>
+      isSameIdentifier(candidate, name)
+    );
+    return key === undefined ? undefined : tableOptions[key];
+  };
   const warn =
     options.onWarning ??
     ((msg: string) => {
@@ -180,7 +200,7 @@ export function discoverTables(
 
   for (const { name } of rows) {
     if (isInternalTable(name)) continue;
-    if (excludeSet.has(name)) continue;
+    if (excludeSet.has(foldIdentifier(name))) continue;
 
     const columns = db
       .prepare(`PRAGMA table_info(${escapeIdentifier(name)})`)
@@ -188,15 +208,21 @@ export function discoverTables(
 
     // 主キーカラムが無いテーブルは静かにスキップ
     // （複合キー等で同期対象外を意図しているケースを尊重）
-    const hasPk = columns.some((c) => c.name === primaryKey);
+    const hasPk = columns.some((c) => isSameIdentifier(c.name, primaryKey));
     if (!hasPk) continue;
 
     // tableOptions で timestampColumn が上書きされていればそれを優先
-    const overrides = tableOptions[name];
+    const overrides = optionsFor(name);
     const timestampColumn = overrides?.timestampColumn ?? 'updatedAt';
 
-    const hasTimestamp = columns.some((c) => c.name === timestampColumn);
-    if (!hasTimestamp) {
+    // **表が宣言している綴りへ解決してから載せる。** 以降の処理は、この名前を
+    // SQLにも**レコードのキーにも**使う。`SELECT *` が返すキーは宣言どおりの綴りな
+    // ので、設定の綴りのまま運ぶと値が取れず、LWWの比較が黙って壊れる
+    // （{@link readColumn} が最後の防波堤だが、名前は入口で揃えておく方が良い）。
+    const declaredTimestamp = columns.find((c) =>
+      isSameIdentifier(c.name, timestampColumn)
+    );
+    if (!declaredTimestamp) {
       warn(
         `Table "${name}" has "${primaryKey}" but no "${timestampColumn}" column — ` +
           `excluded from sync. Add the column or list it in excludeTables to silence this warning.`
@@ -206,7 +232,7 @@ export function discoverTables(
 
     const config: TableConfig = { name };
     if (overrides?.timestampColumn !== undefined) {
-      config.timestampColumn = overrides.timestampColumn;
+      config.timestampColumn = declaredTimestamp.name;
     }
     if (overrides?.deleteProtected !== undefined) {
       config.deleteProtected = overrides.deleteProtected;

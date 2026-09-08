@@ -5,7 +5,12 @@
  * @internal
  */
 import Database from 'better-sqlite3';
-import { cachedBySchema, escapeIdentifier } from './schema';
+import {
+  cachedBySchema,
+  escapeIdentifier,
+  foldIdentifier,
+  readColumn,
+} from './schema';
 import { isPreferredOverRival } from './timestamp';
 
 /** @internal SQLiteの `PRAGMA index_list` が返す行 */
@@ -80,7 +85,7 @@ export function readSecondaryUniqueKeys(
   db: Database.Database,
   tableName: string
 ): UniqueKey[] {
-  return cachedBySchema(db, `uniq:${tableName.toLowerCase()}`, () => {
+  return cachedBySchema(db, `uniq:${foldIdentifier(tableName)}`, () => {
     const indexes = db
       .prepare(`PRAGMA index_list(${escapeIdentifier(tableName)})`)
       .all() as IndexListRow[];
@@ -173,7 +178,7 @@ export function findUniqueRivals(
       .all(...values, selfId) as Record<string, unknown>[];
 
     for (const row of rows) {
-      rivalsById.set(String(row[primaryKey]), row);
+      rivalsById.set(String(readColumn(row, primaryKey)), row);
     }
   }
 
