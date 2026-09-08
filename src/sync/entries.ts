@@ -21,6 +21,7 @@ import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup';
 import { escapeIdentifier, getTableColumns } from './sql';
 import {
   getRemoteTombstone,
+  makeTableConfigLookup,
   makeResurrectionProbe,
   makeTimestampColumnFor,
   readRemoteRecord,
@@ -79,28 +80,17 @@ export function applyTombstoneDelete(
       `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
     )
     .get();
-  if (hasTombstone) {
-    ensureTombstoneMergedIntoColumn(localDb);
-    // deletedAt は新しいときだけ進め、畳み先は一度載ったら消さない
-    // （畳まれた事実は削除時刻のLWWとは独立に、永久に正しいため）
-    localDb
-      .prepare(
-        `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(tableName, recordId) DO UPDATE SET
-           deletedAt = CASE
-             WHEN COALESCE(
-                    julianday(excluded.deletedAt) > julianday(_tombstone.deletedAt),
-                    excluded.deletedAt > _tombstone.deletedAt
-                  )
-             THEN excluded.deletedAt
-             ELSE _tombstone.deletedAt
-           END,
-           mergedInto = COALESCE(excluded.mergedInto, _tombstone.mergedInto)`
-      )
-      .run(tableName, recordId, deletedAt, mergedInto);
-  }
-
+  // **畳み先が分かっている削除は、`deletedAt` もここでは書かない。**
+  //
+  // 「この畳みの主張を受け入れるか」は `foldClaimWins` が2つの帳簿を見て一度だけ
+  // 決める。`mergedInto` だけを判断の下へ移しても、`deletedAt` を先に進めてしまうと
+  // **主張の半分だけが公開される**。実測: 手元が `(deletedAt: 1月, mergedInto: W1)` の
+  // ところへ `(deletedAt: 6月, mergedInto: W2)` が届き、W2 の鎖が動いていて
+  // `applyMergedDelete` が見送ると、手元は `(6月, W1)` になる —— **新しい削除時刻と
+  // 古い判断の畳み先の組**で、これがそのまま全端末へ渡る。畳み先が元々無ければ
+  // 「6月にただ消された」となり、受け取った側は畳まずに DELETE して子を道連れにする。
+  //
+  // 畳みとして届いた削除の記録は、まるごと `applyMergedDelete` に任せる。
   if (mergedInto !== null && mergedInto !== recordId) {
     // 畳み先が分かっている削除。消す前に子を引き取る。
     // `deletedAt` を渡すのは、畳みより後に更新された行にまで及ばせないため
@@ -121,6 +111,28 @@ export function applyTombstoneDelete(
     recordFolds(result, folds);
     result.warnings.push(...warnings);
     return;
+  }
+
+  // ここから先は**畳み先の無い、ただの削除**。
+  // 「この id は消えた」という事実は畳みの判断とは独立なので、新しいときだけ進める
+  // （既存の畳み先には触らないので消えない）。
+  if (hasTombstone) {
+    ensureTombstoneMergedIntoColumn(localDb);
+    localDb
+      .prepare(
+        `INSERT INTO _tombstone (tableName, recordId, deletedAt)
+         VALUES (?, ?, ?)
+         ON CONFLICT(tableName, recordId) DO UPDATE SET
+           deletedAt = CASE
+             WHEN COALESCE(
+                    julianday(excluded.deletedAt) > julianday(_tombstone.deletedAt),
+                    excluded.deletedAt > _tombstone.deletedAt
+                  )
+             THEN excluded.deletedAt
+             ELSE _tombstone.deletedAt
+           END`
+      )
+      .run(tableName, recordId, deletedAt);
   }
 
   const escapedTable = escapeIdentifier(tableName);
@@ -162,10 +174,9 @@ export function processChangelogEntries(
   // テーブルごとのカラム情報をキャッシュ
   const columnCache = new Map<string, string[]>();
   // テーブル名 → TableConfig のマップ
-  const tableConfigMap = new Map<string, TableConfig>();
-  for (const tc of configTables) {
-    tableConfigMap.set(tc.name, tc);
-  }
+  // 表名は**相手の設定どおりの綴り**で届く。大小を畳んで引く
+  // （{@link makeTableConfigLookup}）
+  const tableConfigFor = makeTableConfigLookup(configTables);
   // 表をまたいで時刻列を引く手続きと、作り直し判定。**取り込み1回につき1つ**
   // （レコードごとに作り直すと、表ごとの `prepare` が毎回やり直しになる）
   const timestampColumnFor = makeTimestampColumnFor(configTables);
@@ -193,15 +204,23 @@ export function processChangelogEntries(
     }
 
     // config.tables に含まれないテーブルはスキップ
-    const tableConfig = tableConfigMap.get(entry.tableName);
+    const tableConfig = tableConfigFor(entry.tableName);
     if (!tableConfig) continue;
+
+    // **ここから先は、こちらの設定どおりの綴りだけを使う。**
+    // `entry.tableName` は**相手の設定どおりの綴り**（相手のトリガが自分の設定を
+    // 埋め込む）。そのまま帳簿へ書くと、綴りが違う相手が増えるたびに
+    // `_id_merge` / `_tombstone` の重複行が増える（引く側の `COLLATE NOCASE` と
+    // `ORDER BY` は、その後始末をしているにすぎない）。入口で自分の綴りへ揃えれば、
+    // 重複はそもそも生まれない。
+    const table = tableConfig.name;
 
     const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
 
-    let columns = columnCache.get(entry.tableName);
+    let columns = columnCache.get(table);
     if (!columns) {
-      columns = getTableColumns(localDb, entry.tableName);
-      columnCache.set(entry.tableName, columns);
+      columns = getTableColumns(localDb, table);
+      columnCache.set(table, columns);
     }
 
     if (entry.operation === 'DELETE') {
@@ -210,7 +229,7 @@ export function processChangelogEntries(
       // tombstoneに畳み先が載っていれば、削除ではなく畳みとして適用される。
       const remoteTombstone = getRemoteTombstone(
         remoteDb,
-        entry.tableName,
+        table,
         entry.recordId
       );
       const mergedInto = resolveFoldTarget(
@@ -227,7 +246,7 @@ export function processChangelogEntries(
       applyTombstoneDelete(
         localDb,
         remoteDb,
-        entry.tableName,
+        table,
         primaryKey,
         timestampColumn,
         columns,
@@ -240,7 +259,7 @@ export function processChangelogEntries(
       );
     } else {
       // INSERT or UPDATE: リモートからレコード取得
-      const escapedTable = escapeIdentifier(entry.tableName);
+      const escapedTable = escapeIdentifier(table);
       const escapedPk = escapeIdentifier(primaryKey);
       const remoteRecord = remoteDb
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
@@ -251,7 +270,7 @@ export function processChangelogEntries(
       if (entry.operation === 'INSERT') {
         const { action, conflict, folds, warnings } = applyInsert(
           localDb,
-          entry.tableName,
+          table,
           primaryKey,
           remoteRecord,
           columns,
@@ -269,14 +288,14 @@ export function processChangelogEntries(
         result.warnings.push(...warnings);
         if (conflict) {
           result.warnings.push(
-            `Conflict on ${entry.tableName}:${entry.recordId} resolved as ${conflict.resolution}`
+            `Conflict on ${table}:${entry.recordId} resolved as ${conflict.resolution}`
           );
         }
       } else {
         // UPDATE
         const { action, conflict, folds, warnings } = applyUpdate(
           localDb,
-          entry.tableName,
+          table,
           primaryKey,
           remoteRecord,
           columns,
@@ -294,7 +313,7 @@ export function processChangelogEntries(
         recordFolds(result, folds);
         if (conflict) {
           result.warnings.push(
-            `Conflict on ${entry.tableName}:${entry.recordId} resolved as ${conflict.resolution}`
+            `Conflict on ${table}:${entry.recordId} resolved as ${conflict.resolution}`
           );
         }
       }

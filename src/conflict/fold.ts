@@ -20,7 +20,9 @@ import {
   findReferencingForeignKeys,
   ForeignKeyRef,
   getTableColumns,
+  foldIdentifier,
   isSameIdentifier,
+  readColumn,
 } from './schema';
 import { foldTimestampOf, resolveTimestampColumn } from './timestamp';
 import {
@@ -167,7 +169,7 @@ export function overwriteRow(
     `UPDATE ${escapeIdentifier(tableName)} SET ${updateColumns
       .map((column) => `${escapeIdentifier(column)} = ?`)
       .join(', ')} WHERE ${escapeIdentifier(primaryKey)} = ?`
-  ).run(...updateColumns.map((column) => row[column]), row[primaryKey]);
+  ).run(...updateColumns.map((column) => row[column]), readColumn(row, primaryKey));
 }
 
 /**
@@ -215,13 +217,13 @@ export function repointChild(
     const changelogIdBefore = maxChangelogId(db) ?? 0;
     const { changes } = updateStatement.run(
       ...winningValues,
-      childRow[primaryKey]
+      readColumn(childRow, primaryKey)
     );
 
     // 親と主キーを共有する1:1のテーブルでは、外部キーが主キーそのものなので
     // 付け替えで子のidが動く。孫は古いidを指したままになるため、ここで引き取る。
-    const previousId = String(childRow[primaryKey]);
-    const nextId = String(repointedRow[primaryKey]);
+    const previousId = String(readColumn(childRow, primaryKey));
+    const nextId = String(readColumn(repointedRow, primaryKey));
     if (previousId !== nextId) {
       // 孫がここで動いた数は、どの `RecordFold` にも載らない（行が消えたのではなく
       // 1行のidが動いただけなので、畳みとして記録されないため）。
@@ -296,7 +298,7 @@ export function repointChild(
       foreignKey.childTable,
       primaryKey,
       repointedRow,
-      childRow[primaryKey],
+      readColumn(childRow, primaryKey),
       [
         primaryKeyAsUniqueKey(primaryKey),
         ...readSecondaryUniqueKeys(db, foreignKey.childTable),
@@ -316,9 +318,9 @@ export function repointChild(
     //
     // 席は1つしか無いのだから、**どちらが勝っても残る行はこの席の行1つ**。
     // 勝敗が決めるのは中身であって、どちらの行が消えるかではない。
-    const nextId = String(repointedRow[primaryKey]);
+    const nextId = String(readColumn(repointedRow, primaryKey));
     const slotOccupant = rivalRows.find(
-      (rivalRow) => String(rivalRow[primaryKey]) === nextId
+      (rivalRow) => String(readColumn(rivalRow, primaryKey)) === nextId
     );
     const foldableRivals = rivalRows.filter(
       (rivalRow) => rivalRow !== slotOccupant
@@ -448,8 +450,8 @@ export function foldRowInto(
   folds: RecordFold[],
   foldedAt: string | undefined
 ): boolean {
-  const losingId = String(losingRow[primaryKey]);
-  const winningId = String(winningRow[primaryKey]);
+  const losingId = String(readColumn(losingRow, primaryKey));
+  const winningId = String(readColumn(winningRow, primaryKey));
   if (losingId === winningId) return false;
 
   // 自己参照する外部キーがあると同じ行へ戻ってくる可能性があるため、
@@ -457,7 +459,7 @@ export function foldRowInto(
   // 削除と記録は再入のたびに行う — ここへ再入するのは「この行は消える」と二度決まった
   // ときであり、何もせず戻ると、畳まれて消える親を指したままの子が残って
   // COMMIT時に外部キー違反になる（その相手ぶんの取り込みが丸ごと巻き戻る）。
-  const marker = `${tableName.toLowerCase()}:${losingId}`;
+  const marker = `${foldIdentifier(tableName)}:${losingId}`;
   const revisited = folded.has(marker);
   folded.add(marker);
 
@@ -482,7 +484,7 @@ export function foldRowInto(
 
   db.prepare(
     `DELETE FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
-  ).run(losingRow[primaryKey]);
+  ).run(readColumn(losingRow, primaryKey));
 
   // 削除を越えて子を引き継ぐ後始末（外した参照を戻す・失われた数を数える）。
   // ここで `carry` の数が確定する。

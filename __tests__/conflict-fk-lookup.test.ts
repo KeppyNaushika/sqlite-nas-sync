@@ -9,8 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
 import { setupChangelog } from '../src/setup';
-import { applyInsert } from '../src/conflict';
+import { applyInsert, applyUpdate } from '../src/conflict';
 import { recordMerge } from '../src/conflict/ledger';
+import { readTombstoneClaim } from '../src/conflict/tombstone';
 import { TableConfig } from '../src/types';
 
 const testDir = path.join(__dirname, 'test-data-conflict-fk-lookup');
@@ -216,5 +217,138 @@ describe('表名の綴りが違う tombstone が2行あっても、新しい方�
     );
     expect(result.action).toBe('skipped');
     expect(db.prepare(`SELECT id FROM Items`).all()).toHaveLength(0);
+  });
+});
+
+describe('親の列を明示した外部キーでも、綴りが違えば読み替える', () => {
+  const TABLES: TableConfig[] = [{ name: 'parents' }, { name: 'kids' }];
+
+  it('`REFERENCES parents(ID)` と設定の `id` を、字面で突き合わせない', () => {
+    db = createDb('fk-parent-column-case');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
+      CREATE TABLE parents (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      );
+      CREATE TABLE kids (
+        id        TEXT PRIMARY KEY,
+        parentId  TEXT REFERENCES parents(ID),
+        updatedAt TEXT NOT NULL
+      );
+    `);
+    setupChangelog(db, TABLES, 'id');
+
+    // 親 A は B へ畳まれている（B は手元に在る）
+    db.prepare(
+      `INSERT INTO parents (id, updatedAt) VALUES ('B', '2026-01-01T00:00:00.000Z')`
+    ).run();
+    recordMerge(db, 'parents', 'A', 'B', '2026-01-01T00:00:00.000Z');
+
+    // `PRAGMA foreign_key_list` は `REFERENCES` 句の綴り（`ID`）をそのまま返す。
+    // 字面で比べると読み替えが**一度も走らず**、存在しない A を指したまま入って
+    // 外部キー違反になり、その相手ぶんの取り込みが丸ごと巻き戻る
+    const result = applyInsert(
+      db,
+      'kids',
+      'id',
+      { id: 'k1', parentId: 'A', updatedAt: '2026-02-01T00:00:00.000Z' },
+      ['id', 'parentId', 'updatedAt']
+    );
+    expect(result.action).toBe('inserted');
+    const kid = db
+      .prepare(`SELECT parentId FROM kids WHERE id = 'k1'`)
+      .get() as { parentId: string };
+    expect(kid.parentId).toBe('B');
+  });
+});
+
+describe('設定の綴りが表の宣言と違っても、レコードから値を引ける', () => {
+  it('`timestampColumn: "updatedat"` でも、届いた更新を捨てない', () => {
+    // SQL は大小を区別しないので `WHERE` もトリガも動くが、`SELECT *` が返す
+    // オブジェクトの**キーは表が宣言したとおりの綴り**。設定の綴りでキーを引くと
+    // `undefined` になり、両辺が空文字になって LWW の比較が常に偽 ——
+    // **届いた更新が全部黙って捨てられ、カーソルだけ進む**（例外にならない）。
+    db = createDb('record-key-timestamp-case');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        note      TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, [{ name: 'items', timestampColumn: 'updatedat' }], 'id');
+    db.prepare(
+      `INSERT INTO items VALUES ('A', 'local', '2026-01-01T00:00:00.000Z')`
+    ).run();
+
+    const result = applyUpdate(
+      db,
+      'items',
+      'id',
+      { id: 'A', note: 'remote', updatedAt: '2026-06-01T00:00:00.000Z' },
+      ['id', 'note', 'updatedAt'],
+      'updatedat'
+    );
+
+    expect(result.action).toBe('updated');
+    const row = db.prepare(`SELECT note FROM items WHERE id = 'A'`).get() as {
+      note: string;
+    };
+    expect(row.note).toBe('remote');
+  });
+
+  it('`primaryKey: "ID"` でも例外にならない', () => {
+    // 主キーを取り逃がすと `.get(undefined)` が better-sqlite3 で例外になり、
+    // その相手ぶんの取り込みが丸ごと巻き戻る
+    db = createDb('record-key-pk-case');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, [{ name: 'items' }], 'ID');
+    db.prepare(
+      `INSERT INTO items VALUES ('A', '2026-01-01T00:00:00.000Z')`
+    ).run();
+
+    const result = applyUpdate(
+      db,
+      'items',
+      'ID',
+      { id: 'A', updatedAt: '2026-06-01T00:00:00.000Z' },
+      ['id', 'updatedAt']
+    );
+    expect(result.action).toBe('updated');
+  });
+});
+
+describe('綴り違いの tombstone は、1行を選ばず合成して読む', () => {
+  it('畳み先を持たない新しい行が、畳み先を持つ行を隠さない', () => {
+    // 同期経路が相手の綴りで書いた `('Items', L, mergedInto: W, 1月)` と、
+    // ローカルの DELETE トリガが `INSERT OR REPLACE` で書いた
+    // `('items', L, mergedInto: NULL, 6月)` が並ぶ。「新しい方の行」を丸ごと採ると
+    // 畳み先を持たない方が返り、受け取った側は畳まずに DELETE して子を道連れにする。
+    db = createDb('tombstone-coalesce');
+    db.exec(`
+      CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, [{ name: 'items' }], 'id');
+
+    const insert = db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+       VALUES (?, 'L', ?, ?)`
+    );
+    insert.run('Items', '2026-01-01T00:00:00.000Z', 'W');
+    insert.run('items', '2026-06-01T00:00:00.000Z', null);
+
+    const claim = readTombstoneClaim(db, 'items', 'L');
+    // 削除時刻はいちばん新しいもの、畳み先は主張されている中でいちばん新しいもの
+    expect(claim?.deletedAt).toBe('2026-06-01T00:00:00.000Z');
+    expect(claim?.mergedInto).toBe('W');
   });
 });

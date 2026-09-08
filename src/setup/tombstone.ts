@@ -8,7 +8,7 @@
  * @internal
  */
 import Database from 'better-sqlite3';
-import { ColumnInfo } from './sql';
+import { ColumnInfo, isSameIdentifier } from './sql';
 
 /**
  * `_tombstone` に `mergedInto` 列が無ければ追加する（冪等）。
@@ -30,7 +30,7 @@ export function ensureTombstoneMergedIntoColumn(db: Database.Database): void {
   const columns = db
     .prepare(`PRAGMA table_info(_tombstone)`)
     .all() as ColumnInfo[];
-  if (columns.some((column) => column.name === 'mergedInto')) return;
+  if (columns.some((column) => isSameIdentifier(column.name, 'mergedInto'))) return;
 
   db.exec(`ALTER TABLE _tombstone ADD COLUMN mergedInto TEXT`);
 }

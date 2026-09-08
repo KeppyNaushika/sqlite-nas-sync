@@ -15,7 +15,7 @@
 import Database from 'better-sqlite3';
 import { RecordFold } from '../types';
 import { NOW_SQL } from '../setup';
-import { escapeIdentifier, hasTable } from './schema';
+import { escapeIdentifier, hasTable, isSameIdentifier } from './schema';
 import { isLaterTimestamp, resolveTimestampColumn } from './timestamp';
 import { readTombstoneClaim, recordTombstoneMerge } from './tombstone';
 
@@ -194,13 +194,15 @@ export function recordFold(
   if (losingId === winningId) return;
 
   for (const fold of folds) {
-    if (fold.tableName === tableName && fold.winningId === losingId) {
+    // 表名は大小を畳んで比べる（id の方は**データ**なので畳まない）
+    if (isSameIdentifier(fold.tableName, tableName) && fold.winningId === losingId) {
       fold.winningId = winningId;
     }
   }
 
   const existing = folds.find(
-    (fold) => fold.tableName === tableName && fold.losingId === losingId
+    (fold) =>
+      isSameIdentifier(fold.tableName, tableName) && fold.losingId === losingId
   );
   if (existing) {
     existing.winningId = winningId;
@@ -257,10 +259,20 @@ export function lookupIdMerge(
   tableName: string,
   losingId: string
 ): IdMergeRecord | null {
+  // **綴り違いの2行がありうるので、新しい方を採る。**
+  // 引くときは `COLLATE NOCASE` だが、`PRIMARY KEY (tableName, losingId)` は BINARY で
+  // 照合されるので、`('Users','L')` と `('users','L')` は別の行として同居できる。
+  // しかも**同期経路が自分でその状況を作る** ——`recordMerge` は相手が使った綴りで
+  // 書くため、設定の綴りが端末間で違えば両方が入る。どちらが返るかを走査順まかせに
+  // すると古い記録を拾い、遅れて届いた子が**既に死んだ id** へ読み替えられて、
+  // COMMIT時の外部キー違反でその相手ぶんの取り込みが丸ごと巻き戻る（＝同期が止まる）。
+  // `_tombstone` 側（{@link readTombstoneClaim}）と同じく、時刻で並べて新しい方を採る。
   const row = db
     .prepare(
       `SELECT winningId, mergedAt FROM _id_merge
-       WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
+       WHERE tableName = ? COLLATE NOCASE AND losingId = ?
+       ORDER BY julianday(mergedAt) DESC, mergedAt DESC
+       LIMIT 1`
     )
     .get(tableName, losingId) as
     | { winningId: string; mergedAt: string }

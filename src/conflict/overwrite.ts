@@ -11,7 +11,7 @@
  */
 import Database from 'better-sqlite3';
 import { RecordFold } from '../types';
-import { escapeIdentifier } from './schema';
+import { escapeIdentifier, isSameIdentifier, readColumn } from './schema';
 import { foldTimestampOf } from './timestamp';
 import {
   findUniqueRivals,
@@ -75,8 +75,12 @@ export function overwriteExistingRow(
   columns: string[],
   timestampColumn: string
 ): OverwriteOutcome {
-  const pkValue = record[primaryKey];
-  const updateColumns = columns.filter((column) => column !== primaryKey);
+  const pkValue = readColumn(record, primaryKey);
+  // 主キーの列だけは書かない（行の同定に使っている）。列名の比較は大小を畳む ——
+  // `columns` は `PRAGMA` 由来、`primaryKey` は設定由来で、綴りが揃うとは限らない
+  const updateColumns = columns.filter(
+    (column) => !isSameIdentifier(column, primaryKey)
+  );
 
   // 主キー以外に書く列が無いと `SET` 句が空になり、SQLite は原因を指さない
   // `near "WHERE": syntax error` を投げる（実測）。**同期経路からはここへ来ない** —
