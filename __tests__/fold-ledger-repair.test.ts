@@ -11,7 +11,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
 import { setupChangelog } from '../src/setup'
-import { lookupIdMerge, recordMerge } from '../src/conflict/ledger'
+import { lookupIdMerge } from '../src/conflict/ledger'
 import { TableConfig } from '../src/types'
 
 interface TombstoneRow {

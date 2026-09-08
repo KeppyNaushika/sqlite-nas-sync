@@ -9,8 +9,9 @@ import Database from 'better-sqlite3'
 import { performSync } from '../src/sync'
 import { createSyncFixture, TABLES } from './helpers/sync-fixtures'
 
-const { nasDir, prepare, cleanup, createClientDb, makeConfig } =
-  createSyncFixture('test-data-sync-full')
+const { prepare, cleanup, createClientDb, makeConfig } = createSyncFixture(
+  'test-data-sync-full'
+)
 
 describe('フルマージ（ギャップ検出時）', () => {
   beforeEach(prepare)

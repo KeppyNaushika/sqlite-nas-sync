@@ -10,7 +10,7 @@
  */
 import Database from 'better-sqlite3'
 import { TableConfig } from '../types'
-import { NOW_SQL, setupChangelog } from '../setup'
+import { NOW_SQL } from '../setup'
 import { escapeIdentifier } from './sql'
 
 /**

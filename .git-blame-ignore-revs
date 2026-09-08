@@ -1,0 +1,10 @@
+# 中身を変えていない大きなコミット（整形など）を `git blame` から外す。
+#
+# GitHub はこのファイルを自動で読む。手元でも効かせるには一度だけ:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# 追加してよいのは**挙動を変えないコミットだけ**。判断に迷うものは入れない
+# （blame から消えると、そのコミットで入った変更を追う手立てが無くなる）。
+
+# style: Prettier と ESLint を導入し、全体を整形する
+5687ea93ab502c9ff5909e4e365b33c6729ea78e

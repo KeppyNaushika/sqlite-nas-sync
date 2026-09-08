@@ -5,8 +5,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import Database from 'better-sqlite3'
-import { applyDelete, applyInsert, applyUpdate } from '../src/conflict'
-import { setupChangelog } from '../src/setup'
+import { applyDelete, applyUpdate } from '../src/conflict'
 
 let db: Database.Database
 const columns = ['id', 'name', 'email', 'updatedAt']

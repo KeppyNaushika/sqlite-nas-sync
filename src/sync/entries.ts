@@ -17,7 +17,7 @@ import {
   isLaterTimestamp,
 } from '../conflict'
 import type { ResurrectionProbe, TimestampColumnFor } from '../conflict'
-import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup'
+import { ensureTombstoneMergedIntoColumn } from '../setup'
 import { escapeIdentifier, getTableColumns } from './sql'
 import {
   getRemoteTombstone,
@@ -190,7 +190,6 @@ export function processChangelogEntries(
     // _heartbeat エントリは特別扱い: 直接適用
     if (entry.tableName === '_heartbeat') {
       if (entry.operation === 'DELETE') continue
-      const escapedPk = escapeIdentifier(primaryKey)
       const remoteRecord = remoteDb
         .prepare(`SELECT * FROM _heartbeat WHERE id = ?`)
         .get(entry.recordId) as Record<string, unknown> | undefined

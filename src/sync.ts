@@ -31,17 +31,8 @@ import {
   listRemoteClients,
   openRemoteDbViaLocalCopy,
 } from './nas'
-import {
-  computeSchemaHash,
-  ensureTombstoneMergedIntoColumn,
-  readSchemaVersion,
-  writeSchemaVersion,
-} from './setup'
-import {
-  getSyncState,
-  recordSkippedRemote,
-  updateHeartbeat,
-} from './sync/state'
+import { readSchemaVersion, writeSchemaVersion } from './setup'
+import { getSyncState, updateHeartbeat } from './sync/state'
 import { pullFullMerge, pullNormal } from './sync/pull'
 
 /**

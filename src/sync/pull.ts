@@ -9,12 +9,7 @@
  */
 import Database from 'better-sqlite3'
 import { SyncConfig, SyncResult, TableConfig } from '../types'
-import {
-  cleanupChangelog,
-  getMaxChangelogId,
-  hasChangelogGap,
-  readChangelog,
-} from '../changelog'
+import { getMaxChangelogId, readChangelog } from '../changelog'
 import { openRemoteDbViaLocalCopy } from '../nas'
 import { readSchemaVersion } from '../setup'
 import {
