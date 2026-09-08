@@ -11,8 +11,9 @@ import { performSync } from '../src/sync'
 import { TableConfig } from '../src/types'
 import { createSyncFixture, TABLES } from './helpers/sync-fixtures'
 
-const { nasDir, prepare, cleanup, createClientDb, makeConfig } =
-  createSyncFixture('test-data-sync-unique')
+const { prepare, cleanup, createClientDb, makeConfig } = createSyncFixture(
+  'test-data-sync-unique'
+)
 
 describe('届いた更新がローカルの別の行のセカンダリUNIQUEに当たる', () => {
   beforeEach(prepare)
@@ -528,7 +529,7 @@ describe('届いた更新がローカルの別の行のセカンダリUNIQUEに�
   })
 
   it('届いた改名が勝つ畳みが、消えた行として SyncResult に出る', async () => {
-    const { dbA, pathA, dbB, pathB } = await seedRenameCollision(
+    const { dbA, dbB, pathB } = await seedRenameCollision(
       '2024-06-01T00:00:00Z',
       '2024-03-01T00:00:00Z'
     )
@@ -554,7 +555,7 @@ describe('届いた更新がローカルの別の行のセカンダリUNIQUEに�
   })
 
   it('ローカルの行が勝つ畳みも、消えた行として SyncResult に出る', async () => {
-    const { dbA, pathA, dbB, pathB } = await seedRenameCollision(
+    const { dbA, dbB, pathB } = await seedRenameCollision(
       '2024-03-01T00:00:00Z',
       '2024-06-01T00:00:00Z'
     )

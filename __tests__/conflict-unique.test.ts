@@ -11,7 +11,6 @@ import { applyInsert, applyUpdate } from '../src/conflict'
 import { setupChangelog } from '../src/setup'
 
 let db: Database.Database
-const columns = ['id', 'name', 'email', 'updatedAt']
 
 beforeEach(() => {
   db = new Database(':memory:')

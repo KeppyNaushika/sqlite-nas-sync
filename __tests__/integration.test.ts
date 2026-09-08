@@ -62,20 +62,6 @@ describe('Integration Tests', () => {
     db.close()
   }
 
-  function updateUserViaDb(
-    dbPath: string,
-    id: string,
-    name: string,
-    email: string,
-    updatedAt: string
-  ): void {
-    const db = new Database(dbPath)
-    db.prepare(
-      `UPDATE users SET name = ?, email = ?, updatedAt = ? WHERE id = ?`
-    ).run(name, email, updatedAt, id)
-    db.close()
-  }
-
   function getUser(
     dbPath: string,
     id: string

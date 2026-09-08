@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import * as fs from 'fs'
+import * as path from 'path'
 import Database from 'better-sqlite3'
 import { setupChangelog } from '../src/setup'
 
@@ -183,8 +185,6 @@ describe('setupChangelog', () => {
   })
 
   it('WALモードが設定される（ファイルDB）', () => {
-    const fs = require('fs')
-    const path = require('path')
     const tmpDir = path.join(__dirname, 'test-data-wal')
     fs.mkdirSync(tmpDir, { recursive: true })
     const tmpPath = path.join(tmpDir, 'wal-test.sqlite')
