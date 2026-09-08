@@ -244,7 +244,7 @@ describe('performSync', () => {
   })
 
   it('DELETEが_tombstoneに記録される', async () => {
-    const { db: dbA, dbPath: pathA } = createClientDb('client-a')
+    const { db: dbA } = createClientDb('client-a')
     dbA
       .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
       .run('u1', 'Alice', '2024-01-01T00:00:00Z')

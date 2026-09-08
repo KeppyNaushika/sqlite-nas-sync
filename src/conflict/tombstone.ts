@@ -11,7 +11,7 @@
  */
 import Database from 'better-sqlite3'
 import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup'
-import { escapeIdentifier, hasTable } from './schema'
+import { hasTable } from './schema'
 import { isLaterTimestamp } from './timestamp'
 
 /**
