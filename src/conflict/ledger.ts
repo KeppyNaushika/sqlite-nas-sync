@@ -12,12 +12,12 @@
  * @module conflict/ledger
  * @internal
  */
-import Database from 'better-sqlite3';
-import { RecordFold } from '../types';
-import { NOW_SQL } from '../setup';
-import { escapeIdentifier, hasTable, isSameIdentifier } from './schema';
-import { isLaterTimestamp, resolveTimestampColumn } from './timestamp';
-import { readTombstoneClaim, recordTombstoneMerge } from './tombstone';
+import Database from 'better-sqlite3'
+import { RecordFold } from '../types'
+import { NOW_SQL } from '../setup'
+import { escapeIdentifier, hasTable, isSameIdentifier } from './schema'
+import { isLaterTimestamp, resolveTimestampColumn } from './timestamp'
+import { readTombstoneClaim, recordTombstoneMerge } from './tombstone'
 
 /**
  * `_id_merge` テーブルを作成する（冪等）。
@@ -35,7 +35,7 @@ export function ensureIdMergeTable(db: Database.Database): void {
       mergedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
       PRIMARY KEY (tableName, losingId)
     )
-  `);
+  `)
 }
 
 /**
@@ -72,17 +72,17 @@ function foldClaimWins(
   foldedAt: string | undefined,
   replacesOwnDeletion: boolean
 ): boolean {
-  if (replacesOwnDeletion) return true;
-  if (foldedAt === undefined) return true;
+  if (replacesOwnDeletion) return true
+  if (foldedAt === undefined) return true
 
   // 2つの帳簿のうち**強い方**（新しい方）と比べる。片方しか見ないと、そちらに
   // 記録が無いだけで通ってしまい、もう片方が断って食い違う
   const claimedAt = [
     lookupIdMerge(db, tableName, losingId)?.mergedAt,
     readTombstoneClaim(db, tableName, losingId)?.deletedAt,
-  ].filter((value): value is string => value !== undefined);
+  ].filter((value): value is string => value !== undefined)
 
-  return !claimedAt.some((existing) => isLaterTimestamp(db, existing, foldedAt));
+  return !claimedAt.some((existing) => isLaterTimestamp(db, existing, foldedAt))
 }
 
 /**
@@ -108,13 +108,13 @@ export function recordMerge(
   foldedAt?: string,
   replacesOwnDeletion = false
 ): void {
-  if (losingId === winningId) return;
-  ensureIdMergeTable(db);
+  if (losingId === winningId) return
+  ensureIdMergeTable(db)
 
   // **古い主張は、どちらの帳簿にも書かない。** `_tombstone` 側だけが断ると、2つの
   // 帳簿が別々の勝者を名乗ることになる（理由は {@link foldClaimWins}）。
   if (!foldClaimWins(db, tableName, losingId, foldedAt, replacesOwnDeletion)) {
-    return;
+    return
   }
 
   // **勝者が既に畳まれていれば、終端まで辿ってから書く。**
@@ -122,11 +122,11 @@ export function recordMerge(
   // **あとから届いた記録の勝者が既に畳まれている**場合は直せない。そのまま書くと
   // `A→C` と `C→B` が並ぶ鎖ができ、読み替えが1段で終わらなくなる。実測では、その状態で
   // 届いた `A` の子が**既に消えている `C` へ向けられ、`ON DELETE` に従って捨てられた**。
-  winningId = resolveFoldChain(db, tableName, winningId, losingId);
+  winningId = resolveFoldChain(db, tableName, winningId, losingId)
   // 終端が自分自身なら、その畳みはもう意味を持たない
-  if (losingId === winningId) return;
+  if (losingId === winningId) return
 
-  const mergedAt = foldedAt ?? null;
+  const mergedAt = foldedAt ?? null
 
   // 畳み先の鎖を作らない（`A→B` のあとに `B→C` が来たら `A→C` へ張り替える）。
   // **張り替えても「A が畳まれた時刻」は動かさない。** 向き先が変わっただけで、
@@ -143,7 +143,7 @@ export function recordMerge(
     `UPDATE _id_merge
      SET winningId = ?
      WHERE tableName = ? COLLATE NOCASE AND winningId = ?`
-  ).run(winningId, tableName, losingId);
+  ).run(winningId, tableName, losingId)
 
   // ここへ来た時点で「この主張を置いてよい」は決まっている（{@link foldClaimWins}）。
   // **勝者と時刻は組で置く。** 片方だけ条件付きにすると、勝者だけが新しい主張、時刻は
@@ -155,16 +155,16 @@ export function recordMerge(
      DO UPDATE SET
        winningId = excluded.winningId,
        mergedAt = excluded.mergedAt`
-  ).run(tableName, losingId, winningId, mergedAt);
+  ).run(tableName, losingId, winningId, mergedAt)
 
   // 畳む向きが後から反転した場合（敗者idの方に新しい更新が届き、勝者を畳んだ場合）、
   // 上の張り替えで自分自身を指す記録が生まれる。意味を持たないので捨てる。
   db.prepare(
     `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = winningId`
-  ).run(tableName);
+  ).run(tableName)
 
   // 受け入れは上で決まっている。`_tombstone` 側は比べ直さず、同じ決定のまま書く
-  recordTombstoneMerge(db, tableName, losingId, winningId, foldedAt);
+  recordTombstoneMerge(db, tableName, losingId, winningId, foldedAt)
 }
 
 /**
@@ -191,25 +191,28 @@ export function recordFold(
   movedChildren: number,
   lostChildren: number
 ): void {
-  if (losingId === winningId) return;
+  if (losingId === winningId) return
 
   for (const fold of folds) {
     // 表名は大小を畳んで比べる（id の方は**データ**なので畳まない）
-    if (isSameIdentifier(fold.tableName, tableName) && fold.winningId === losingId) {
-      fold.winningId = winningId;
+    if (
+      isSameIdentifier(fold.tableName, tableName) &&
+      fold.winningId === losingId
+    ) {
+      fold.winningId = winningId
     }
   }
 
   const existing = folds.find(
     (fold) =>
       isSameIdentifier(fold.tableName, tableName) && fold.losingId === losingId
-  );
+  )
   if (existing) {
-    existing.winningId = winningId;
-    existing.removedLocalRow = existing.removedLocalRow || removedLocalRow;
-    existing.movedChildren += movedChildren;
-    existing.lostChildren += lostChildren;
-    return;
+    existing.winningId = winningId
+    existing.removedLocalRow = existing.removedLocalRow || removedLocalRow
+    existing.movedChildren += movedChildren
+    existing.lostChildren += lostChildren
+    return
   }
 
   folds.push({
@@ -219,10 +222,8 @@ export function recordFold(
     removedLocalRow,
     movedChildren,
     lostChildren,
-  });
+  })
 }
-
-
 
 /**
  * `_id_merge` に1件でも記録があるか。
@@ -231,8 +232,8 @@ export function recordFold(
  * @internal
  */
 export function hasIdMerges(db: Database.Database): boolean {
-  if (!hasTable(db, '_id_merge')) return false;
-  return db.prepare(`SELECT 1 FROM _id_merge LIMIT 1`).get() !== undefined;
+  if (!hasTable(db, '_id_merge')) return false
+  return db.prepare(`SELECT 1 FROM _id_merge LIMIT 1`).get() !== undefined
 }
 
 /**
@@ -241,9 +242,9 @@ export function hasIdMerges(db: Database.Database): boolean {
  */
 export interface IdMergeRecord {
   /** 吸収先のid */
-  winningId: string;
+  winningId: string
   /** 畳みが確定した時刻（＝勝った行の `updatedAt`。{@link recordMerge}） */
-  mergedAt: string;
+  mergedAt: string
 }
 
 /**
@@ -275,11 +276,10 @@ export function lookupIdMerge(
        LIMIT 1`
     )
     .get(tableName, losingId) as
-    | { winningId: string; mergedAt: string }
-    | undefined;
+    { winningId: string; mergedAt: string } | undefined
   return row
     ? { winningId: String(row.winningId), mergedAt: String(row.mergedAt) }
-    : null;
+    : null
 }
 
 /**
@@ -298,13 +298,13 @@ export function resolveFoldChain(
   winningId: string,
   losingId: string
 ): string {
-  const seen = new Set<string>([losingId, winningId]);
-  let terminal = winningId;
+  const seen = new Set<string>([losingId, winningId])
+  let terminal = winningId
   for (;;) {
-    const next = lookupIdMerge(db, tableName, terminal);
-    if (next === null || seen.has(next.winningId)) return terminal;
-    seen.add(next.winningId);
-    terminal = next.winningId;
+    const next = lookupIdMerge(db, tableName, terminal)
+    if (next === null || seen.has(next.winningId)) return terminal
+    seen.add(next.winningId)
+    terminal = next.winningId
   }
 }
 
@@ -328,14 +328,14 @@ export function isFoldRecordStale(
   mergedAt: string,
   timestampColumn: string
 ): boolean {
-  if (!hasTable(db, tableName)) return false;
+  if (!hasTable(db, tableName)) return false
 
   const losingTimestampColumn = resolveTimestampColumn(
     db,
     tableName,
     timestampColumn
-  );
-  if (!losingTimestampColumn) return false;
+  )
+  if (!losingTimestampColumn) return false
 
   const losingRow = db
     .prepare(
@@ -343,8 +343,8 @@ export function isFoldRecordStale(
        FROM ${escapeIdentifier(tableName)}
        WHERE ${escapeIdentifier(primaryKey)} = ?`
     )
-    .get(losingId) as { ts: unknown } | undefined;
-  if (!losingRow) return false;
+    .get(losingId) as { ts: unknown } | undefined
+  if (!losingRow) return false
 
-  return isLaterTimestamp(db, String(losingRow.ts ?? ''), mergedAt);
+  return isLaterTimestamp(db, String(losingRow.ts ?? ''), mergedAt)
 }

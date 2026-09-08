@@ -11,10 +11,10 @@
  * @module setup/id-merge-repair
  * @internal
  */
-import Database from 'better-sqlite3';
-import { isLaterTimestamp } from '../conflict/timestamp';
-import { foldIdentifier } from '../conflict/schema';
-import { escapeIdentifier } from './sql';
+import Database from 'better-sqlite3'
+import { isLaterTimestamp } from '../conflict/timestamp'
+import { foldIdentifier } from '../conflict/schema'
+import { escapeIdentifier } from './sql'
 
 /**
  * `_id_merge` に残っている**畳み先の鎖**を、終端まで畳み直す。
@@ -53,7 +53,7 @@ export function collapseIdMergeChains(
   // 1回の走査で直せるのは、その時点で見えている形だけ。刈り取りで形が変われば
   // もう一度見る（打ち切りの上限は、鎖が1回の走査で最低1段は縮むことから置いている）
   for (let pass = 0; pass < ID_MERGE_COLLAPSE_MAX_PASSES; pass++) {
-    if (!collapseIdMergeChainsOnce(db, primaryKey)) return;
+    if (!collapseIdMergeChainsOnce(db, primaryKey)) return
   }
 }
 
@@ -78,9 +78,9 @@ function rowIsPresent(
            WHERE ${escapeIdentifier(primaryKey)} = ?`
         )
         .get(recordId) !== undefined
-    );
+    )
   } catch {
-    return false;
+    return false
   }
 }
 
@@ -91,7 +91,7 @@ function rowIsPresent(
  * それでも上限を置くのは、記録が想定外の形でも**起動が止まらない**ようにするため。
  * @internal
  */
-const ID_MERGE_COLLAPSE_MAX_PASSES = 16;
+const ID_MERGE_COLLAPSE_MAX_PASSES = 16
 
 /**
  * {@link collapseIdMergeChains} の1回ぶんの走査。
@@ -106,27 +106,27 @@ function collapseIdMergeChainsOnce(
   const rows = db
     .prepare(`SELECT tableName, losingId, winningId, mergedAt FROM _id_merge`)
     .all() as {
-    tableName: string;
-    losingId: string;
-    winningId: string;
-    mergedAt: string;
-  }[];
-  if (rows.length === 0) return false;
+    tableName: string
+    losingId: string
+    winningId: string
+    mergedAt: string
+  }[]
+  if (rows.length === 0) return false
 
-  let changed = false;
+  let changed = false
 
   const byTable = new Map<
     string,
     Map<string, { winningId: string; mergedAt: string }>
-  >();
+  >()
   for (const row of rows) {
     // `_id_merge` の主キーは大小を区別するが、引くときは常に `COLLATE NOCASE` なので、
     // 表名の大小だけが違う2件は**同じ1件として扱われる**（下の UPDATE / DELETE も
     // 両方に当たる）。索引の側だけ後勝ちにすると、辿る鎖と書き換える対象がずれるので、
     // 他と同じ「新しい主張が勝つ」で1つに決める（同時刻なら先に読んだ方を残す）。
-    const key = foldIdentifier(row.tableName);
-    const records = byTable.get(key) ?? new Map();
-    const existing = records.get(row.losingId);
+    const key = foldIdentifier(row.tableName)
+    const records = byTable.get(key) ?? new Map()
+    const existing = records.get(row.losingId)
     // 時刻は**字面で比べない**。ここが掃除する相手は旧版が書いた記録で、
     // `datetime('now')` のスペース形式（`2026-06-01 10:00:00`）と `NOW_SQL` の
     // ISO-T形式（`2026-06-01T09:00:00.000Z`）が混在する。字面だと ' '(0x20) <
@@ -138,9 +138,9 @@ function collapseIdMergeChainsOnce(
       records.set(row.losingId, {
         winningId: row.winningId,
         mergedAt: row.mergedAt,
-      });
+      })
     }
-    byTable.set(key, records);
+    byTable.set(key, records)
   }
 
   // 畳み先は `_id_merge`（ローカル索引）と `_tombstone.mergedInto`（他クライアントへ
@@ -154,22 +154,22 @@ function collapseIdMergeChainsOnce(
       .prepare(
         `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
       )
-      .get() !== undefined;
+      .get() !== undefined
 
   const update = db.prepare(
     `UPDATE _id_merge SET winningId = ?
      WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
-  );
+  )
   const remove = db.prepare(
     `DELETE FROM _id_merge WHERE tableName = ? COLLATE NOCASE AND losingId = ?`
-  );
+  )
   const repointTombstone = hasTombstone
     ? db.prepare(
         `UPDATE _tombstone SET mergedInto = ?
          WHERE tableName = ? COLLATE NOCASE AND recordId = ?
            AND mergedInto IS NOT NULL`
       )
-    : null;
+    : null
   // 刈る循環の記録は `_tombstone` にも同じ主張として載っている。**その主張は捨てるが、
   // 「消えた」という事実まで捨ててはいけない。** 刈られる側の `recordId` について
   // この関数が知っているのは**帳簿の上で生き残る**ということだけで、その行が
@@ -194,46 +194,46 @@ function collapseIdMergeChainsOnce(
          WHERE tableName = ? COLLATE NOCASE AND recordId = ?
            AND mergedInto IS NOT NULL`
       )
-    : null;
+    : null
   const clearTombstoneClaim = hasTombstone
     ? db.prepare(
         `UPDATE _tombstone SET mergedInto = NULL
          WHERE tableName = ? COLLATE NOCASE AND recordId = ?
            AND mergedInto IS NOT NULL`
       )
-    : null;
+    : null
 
   /** 刈られた循環の主張を `_tombstone` からも落とす（上のコメントの2つの場合分け）。 */
   const dropCycleClaim = (tableName: string, recordId: string): void => {
     if (rowIsPresent(db, tableName, primaryKey, recordId)) {
-      dropTombstoneClaim?.run(tableName, recordId);
-      return;
+      dropTombstoneClaim?.run(tableName, recordId)
+      return
     }
-    clearTombstoneClaim?.run(tableName, recordId);
-  };
+    clearTombstoneClaim?.run(tableName, recordId)
+  }
 
   for (const row of rows) {
-    const records = byTable.get(foldIdentifier(row.tableName));
-    if (!records) continue;
+    const records = byTable.get(foldIdentifier(row.tableName))
+    if (!records) continue
 
     // 終端まで辿る。通った記録を控えておき、出発点へ戻ったら循環と分かる
     const walked: { losingId: string; mergedAt: string }[] = [
       { losingId: row.losingId, mergedAt: row.mergedAt },
-    ];
-    const seen = new Set<string>([row.losingId]);
-    let terminal = row.winningId;
-    let cycles = false;
+    ]
+    const seen = new Set<string>([row.losingId])
+    let terminal = row.winningId
+    let cycles = false
     for (;;) {
       if (terminal === row.losingId) {
-        cycles = true;
-        break;
+        cycles = true
+        break
       }
-      if (seen.has(terminal)) break;
-      seen.add(terminal);
-      const next = records.get(terminal);
-      if (next === undefined) break;
-      walked.push({ losingId: terminal, mergedAt: next.mergedAt });
-      terminal = next.winningId;
+      if (seen.has(terminal)) break
+      seen.add(terminal)
+      const next = records.get(terminal)
+      if (next === undefined) break
+      walked.push({ losingId: terminal, mergedAt: next.mergedAt })
+      terminal = next.winningId
     }
 
     if (cycles) {
@@ -244,24 +244,24 @@ function collapseIdMergeChainsOnce(
       // スペース形式と ISO-T 形式が混在するので、字面で比べると古い方が勝つ）
       const strongest = walked.reduce((best, candidate) => {
         if (isLaterTimestamp(db, candidate.mergedAt, best.mergedAt))
-          return candidate;
-        if (isLaterTimestamp(db, best.mergedAt, candidate.mergedAt)) return best;
-        return candidate.losingId < best.losingId ? candidate : best;
-      });
+          return candidate
+        if (isLaterTimestamp(db, best.mergedAt, candidate.mergedAt)) return best
+        return candidate.losingId < best.losingId ? candidate : best
+      })
       if (strongest.losingId !== row.losingId) {
-        remove.run(row.tableName, row.losingId);
-        dropCycleClaim(row.tableName, row.losingId);
-        changed = true;
+        remove.run(row.tableName, row.losingId)
+        dropCycleClaim(row.tableName, row.losingId)
+        changed = true
       }
-      continue;
+      continue
     }
 
     if (terminal !== row.winningId) {
-      update.run(terminal, row.tableName, row.losingId);
-      repointTombstone?.run(terminal, row.tableName, row.losingId);
-      changed = true;
+      update.run(terminal, row.tableName, row.losingId)
+      repointTombstone?.run(terminal, row.tableName, row.losingId)
+      changed = true
     }
   }
 
-  return changed;
+  return changed
 }

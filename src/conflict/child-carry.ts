@@ -11,7 +11,7 @@
  * @module conflict/child-carry
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 import {
   areColumnsNullable,
   escapeIdentifier,
@@ -19,7 +19,7 @@ import {
   foreignKeysEnforced,
   isSameIdentifier,
   rowKeyColumns,
-} from './schema';
+} from './schema'
 
 /**
  * 敗者の子をどう引き取ったかの集計。
@@ -31,16 +31,16 @@ import {
  */
 export interface ChildCarry {
   /** 敗者から勝者へ引き継げた直接の子の行数 */
-  movedChildren: number;
+  movedChildren: number
   /** 引き継げずに失われた直接の子の行数（{@link RecordFold.lostChildren}） */
-  lostChildren: number;
+  lostChildren: number
   /** 敗者行の DELETE 直後に走らせる後始末 */
-  afterDelete: (() => void)[];
+  afterDelete: (() => void)[]
 }
 
 /** @internal */
 export function emptyChildCarry(): ChildCarry {
-  return { movedChildren: 0, lostChildren: 0, afterDelete: [] };
+  return { movedChildren: 0, lostChildren: 0, afterDelete: [] }
 }
 
 /**
@@ -67,26 +67,32 @@ export function carryChildrenThroughDelete(
   referencedValues: unknown[],
   carry: ChildCarry
 ): void {
-  const childCount = countChildrenReferencing(db, foreignKey, referencedValues);
-  if (childCount === 0) return;
+  const childCount = countChildrenReferencing(db, foreignKey, referencedValues)
+  if (childCount === 0) return
 
   // 外部キーが効いていない接続、または削除が子に及ばない宣言なら、子は放っておいてよい
   // （検査は終端まで遅れており、そのときには勝者がこの値を持っている）
   if (foreignKey.onDelete === 'NO ACTION' || !foreignKeysEnforced(db)) {
-    carry.movedChildren += childCount;
-    return;
+    carry.movedChildren += childCount
+    return
   }
 
-  const detached = detachChildren(db, foreignKey, referencedValues);
+  const detached = detachChildren(db, foreignKey, referencedValues)
   if (!detached) {
-    countChildrenLostToDelete(db, foreignKey, referencedValues, childCount, carry);
-    return;
+    countChildrenLostToDelete(
+      db,
+      foreignKey,
+      referencedValues,
+      childCount,
+      carry
+    )
+    return
   }
 
   carry.afterDelete.push(() => {
-    detached.reattach();
-    carry.movedChildren += childCount;
-  });
+    detached.reattach()
+    carry.movedChildren += childCount
+  })
 }
 
 /**
@@ -107,53 +113,53 @@ export function detachChildren(
   foreignKey: ForeignKeyRef,
   referencedValues: unknown[]
 ): { reattach: () => void } | null {
-  const childColumns = foreignKey.columns.map((column) => column.childColumn);
-  if (!areColumnsNullable(db, foreignKey.childTable, childColumns)) return null;
+  const childColumns = foreignKey.columns.map((column) => column.childColumn)
+  if (!areColumnsNullable(db, foreignKey.childTable, childColumns)) return null
 
-  const keyColumns = rowKeyColumns(db, foreignKey.childTable);
+  const keyColumns = rowKeyColumns(db, foreignKey.childTable)
   if (
     childColumns.some((childColumn) =>
       keyColumns.some((keyColumn) => isSameIdentifier(keyColumn, childColumn))
     )
   ) {
-    return null;
+    return null
   }
 
-  const escapedChildTable = escapeIdentifier(foreignKey.childTable);
+  const escapedChildTable = escapeIdentifier(foreignKey.childTable)
   const matchClause = foreignKey.columns
     .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
-    .join(' AND ');
+    .join(' AND ')
   const escapedKeyColumns = keyColumns.map((keyColumn) =>
     escapeIdentifier(keyColumn)
-  );
+  )
 
   // 戻す行を指すための鍵を、外す前に控える
   const keyRows = db
     .prepare(
       `SELECT ${escapedKeyColumns.join(', ')} FROM ${escapedChildTable} WHERE ${matchClause}`
     )
-    .all(...referencedValues) as Record<string, unknown>[];
+    .all(...referencedValues) as Record<string, unknown>[]
 
   try {
     db.prepare(
       `UPDATE ${escapedChildTable} SET ${childColumns
         .map((childColumn) => `${escapeIdentifier(childColumn)} = NULL`)
         .join(', ')} WHERE ${matchClause}`
-    ).run(...referencedValues);
+    ).run(...referencedValues)
   } catch {
     // 外せないと分かっただけ。ここで投げて取り込みを止めてしまわない
     // （止めるとその相手からの同期が永久に止まる）。数えて伝える方へ落とす。
-    return null;
+    return null
   }
 
   const keyMatchClause = escapedKeyColumns
     .map((escapedKeyColumn) => `${escapedKeyColumn} = ?`)
-    .join(' AND ');
+    .join(' AND ')
   const reattachStatement = db.prepare(
     `UPDATE ${escapedChildTable} SET ${foreignKey.columns
       .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
       .join(', ')} WHERE ${keyMatchClause}`
-  );
+  )
 
   return {
     reattach: (): void => {
@@ -161,10 +167,10 @@ export function detachChildren(
         reattachStatement.run(
           ...referencedValues,
           ...keyColumns.map((keyColumn) => keyRow[keyColumn])
-        );
+        )
       }
     },
-  };
+  }
 }
 
 /**
@@ -182,13 +188,13 @@ export function countChildrenLostToDelete(
   childCountBefore: number,
   carry: ChildCarry
 ): void {
-  if (childCountBefore === 0) return;
+  if (childCountBefore === 0) return
 
   carry.afterDelete.push(() => {
-    const after = countChildrenReferencing(db, foreignKey, referencedValues);
-    carry.movedChildren += Math.min(after, childCountBefore);
-    carry.lostChildren += Math.max(childCountBefore - after, 0);
-  });
+    const after = countChildrenReferencing(db, foreignKey, referencedValues)
+    carry.movedChildren += Math.min(after, childCountBefore)
+    carry.lostChildren += Math.max(childCountBefore - after, 0)
+  })
 }
 
 /**
@@ -202,14 +208,12 @@ export function countChildrenReferencing(
 ): number {
   const matchClause = foreignKey.columns
     .map((column) => `${escapeIdentifier(column.childColumn)} = ?`)
-    .join(' AND ');
+    .join(' AND ')
   const row = db
     .prepare(
       `SELECT COUNT(*) AS childCount FROM ${escapeIdentifier(foreignKey.childTable)}
        WHERE ${matchClause}`
     )
-    .get(...referencedValues) as { childCount: number };
-  return row.childCount;
+    .get(...referencedValues) as { childCount: number }
+  return row.childCount
 }
-
-

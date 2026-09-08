@@ -7,14 +7,14 @@
  * @module conflict/schema
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
  * @internal
  */
 export function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+  return `"${identifier.replace(/"/g, '""')}"`
 }
 
 /**
@@ -26,11 +26,11 @@ export function escapeIdentifier(identifier: string): string {
  */
 export interface ForeignKeyRef {
   /** 外部キーを宣言している側（子）のテーブル名 */
-  childTable: string;
+  childTable: string
   /** 参照されている側（親）のテーブル名 */
-  parentTable: string;
+  parentTable: string
   /** 子の列と、それが指す親の列の対応 */
-  columns: { childColumn: string; parentColumn: string }[];
+  columns: { childColumn: string; parentColumn: string }[]
   /**
    * 親の行が消えたときに子へ及ぶ動作。
    * `NO ACTION` / `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`。
@@ -38,29 +38,29 @@ export interface ForeignKeyRef {
    * **`PRAGMA defer_foreign_keys` はこの動作を遅らせない**（遅れるのは検査だけ）。
    * 畳みで敗者行を消す前に、これを見て子を守る必要がある（{@link carryChildrenThroughDelete}）。
    */
-  onDelete: string;
+  onDelete: string
 }
 
 /** @internal SQLiteの `PRAGMA foreign_key_list` が返す行 */
 export interface ForeignKeyListRow {
-  id: number;
-  seq: number;
-  table: string;
-  from: string;
+  id: number
+  seq: number
+  table: string
+  from: string
   /** 親の列。`REFERENCES parent` のように省略された場合は null（＝親の主キー） */
-  to: string | null;
+  to: string | null
   /** 親の行が消えたときの動作（`NO ACTION` / `CASCADE` / `SET NULL` 等） */
-  on_delete: string;
+  on_delete: string
 }
 
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
 export interface ColumnInfo {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: unknown;
-  pk: number;
+  cid: number
+  name: string
+  type: string
+  notnull: number
+  dflt_value: unknown
+  pk: number
 }
 
 /**
@@ -76,7 +76,7 @@ export interface ColumnInfo {
  * @internal
  */
 export function isSameIdentifier(a: string, b: string): boolean {
-  return foldIdentifier(a) === foldIdentifier(b);
+  return foldIdentifier(a) === foldIdentifier(b)
 }
 
 /**
@@ -90,7 +90,7 @@ export function isSameIdentifier(a: string, b: string): boolean {
 export function foldIdentifier(value: string): string {
   return value.replace(/[A-Z]/g, (char) =>
     String.fromCharCode(char.charCodeAt(0) + 32)
-  );
+  )
 }
 
 /**
@@ -114,11 +114,11 @@ export function readColumn(
   record: Record<string, unknown>,
   columnName: string
 ): unknown {
-  if (columnName in record) return record[columnName];
+  if (columnName in record) return record[columnName]
   const key = Object.keys(record).find((candidate) =>
     isSameIdentifier(candidate, columnName)
-  );
-  return key === undefined ? undefined : record[key];
+  )
+  return key === undefined ? undefined : record[key]
 }
 
 /**
@@ -137,7 +137,7 @@ export function readColumn(
 const schemaCache = new WeakMap<
   Database.Database,
   { schemaVersion: number; entries: Map<string, unknown> }
->();
+>()
 
 /**
  * スキーマが変わっていない間だけ結果を使い回す。
@@ -150,18 +150,18 @@ export function cachedBySchema<T>(
 ): T {
   const schemaVersion = db.pragma('schema_version', {
     simple: true,
-  }) as number;
+  }) as number
 
-  let cache = schemaCache.get(db);
+  let cache = schemaCache.get(db)
   if (!cache || cache.schemaVersion !== schemaVersion) {
-    cache = { schemaVersion, entries: new Map<string, unknown>() };
-    schemaCache.set(db, cache);
+    cache = { schemaVersion, entries: new Map<string, unknown>() }
+    schemaCache.set(db, cache)
   }
 
-  if (cache.entries.has(key)) return cache.entries.get(key) as T;
-  const value = compute();
-  cache.entries.set(key, value);
-  return value;
+  if (cache.entries.has(key)) return cache.entries.get(key) as T
+  const value = compute()
+  cache.entries.set(key, value)
+  return value
 }
 
 /**
@@ -176,7 +176,7 @@ export function hasTable(db: Database.Database, tableName: string): boolean {
     db
       .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?`)
       .get(tableName) !== undefined
-  );
+  )
 }
 
 /**
@@ -194,30 +194,30 @@ export function readForeignKeys(
     () => {
       const rows = db
         .prepare(`PRAGMA foreign_key_list(${escapeIdentifier(childTable)})`)
-        .all() as ForeignKeyListRow[];
+        .all() as ForeignKeyListRow[]
 
-      const byId = new Map<number, ForeignKeyRef>();
+      const byId = new Map<number, ForeignKeyRef>()
       for (const row of rows) {
-        const existing = byId.get(row.id);
+        const existing = byId.get(row.id)
         const column = {
           childColumn: row.from,
           // `to` が null のときは親の主キーを指す
           parentColumn: row.to ?? primaryKey,
-        };
+        }
         if (existing) {
-          existing.columns.push(column);
+          existing.columns.push(column)
         } else {
           byId.set(row.id, {
             childTable,
             parentTable: row.table,
             columns: [column],
             onDelete: row.on_delete.toUpperCase(),
-          });
+          })
         }
       }
-      return Array.from(byId.values());
+      return Array.from(byId.values())
     }
-  );
+  )
 }
 
 /**
@@ -240,19 +240,19 @@ export function findReferencingForeignKeys(
         .prepare(
           `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
         )
-        .all() as { name: string }[];
+        .all() as { name: string }[]
 
-      const refs: ForeignKeyRef[] = [];
+      const refs: ForeignKeyRef[] = []
       for (const { name } of tables) {
         for (const foreignKey of readForeignKeys(db, name, primaryKey)) {
           if (isSameIdentifier(foreignKey.parentTable, parentTable)) {
-            refs.push(foreignKey);
+            refs.push(foreignKey)
           }
         }
       }
-      return refs;
+      return refs
     }
-  );
+  )
 }
 
 /**
@@ -266,18 +266,21 @@ export function readColumnInfo(
   return cachedBySchema(db, `colinfo:${foldIdentifier(tableName)}`, () => {
     return db
       .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-      .all() as ColumnInfo[];
-  });
+      .all() as ColumnInfo[]
+  })
 }
 
 /**
  * テーブルのカラム名一覧を返す。
  * @internal
  */
-export function getTableColumns(db: Database.Database, tableName: string): string[] {
+export function getTableColumns(
+  db: Database.Database,
+  tableName: string
+): string[] {
   return cachedBySchema(db, `cols:${foldIdentifier(tableName)}`, () =>
     readColumnInfo(db, tableName).map((column) => column.name)
-  );
+  )
 }
 
 /**
@@ -293,13 +296,13 @@ export function areColumnsNullable(
   tableName: string,
   columnNames: string[]
 ): boolean {
-  const columnInfo = readColumnInfo(db, tableName);
+  const columnInfo = readColumnInfo(db, tableName)
   return columnNames.every((columnName) => {
     const column = columnInfo.find((candidate) =>
       isSameIdentifier(candidate.name, columnName)
-    );
-    return column !== undefined && column.notnull === 0;
-  });
+    )
+    return column !== undefined && column.notnull === 0
+  })
 }
 
 /**
@@ -322,12 +325,12 @@ export function includesPrimaryKeyColumn(
   tableName: string,
   columnNames: string[]
 ): boolean {
-  const columnInfo = readColumnInfo(db, tableName);
+  const columnInfo = readColumnInfo(db, tableName)
   return columnNames.some((columnName) =>
     columnInfo.some(
       (column) => isSameIdentifier(column.name, columnName) && column.pk > 0
     )
-  );
+  )
 }
 
 /**
@@ -348,16 +351,16 @@ export function evaluateColumnDefaults(
   tableName: string,
   columnNames: string[]
 ): unknown[] | null {
-  const columnInfo = readColumnInfo(db, tableName);
+  const columnInfo = readColumnInfo(db, tableName)
   const expressions = columnNames.map((columnName) => {
     const column = columnInfo.find((candidate) =>
       isSameIdentifier(candidate.name, columnName)
-    );
-    const declared = column?.dflt_value;
+    )
+    const declared = column?.dflt_value
     return declared === null || declared === undefined
       ? 'NULL'
-      : String(declared);
-  });
+      : String(declared)
+  })
 
   try {
     const row = db
@@ -366,12 +369,12 @@ export function evaluateColumnDefaults(
           .map((expression, index) => `(${expression}) AS d${index}`)
           .join(', ')}`
       )
-      .get() as Record<string, unknown>;
-    return columnNames.map((_, index) => row[`d${index}`]);
+      .get() as Record<string, unknown>
+    return columnNames.map((_, index) => row[`d${index}`])
   } catch {
     // 壊れた式・利用者定義関数など、こちらでは評価できない形。
     // 憶測で値を入れず「再現できない」と答える
-    return null;
+    return null
   }
 }
 
@@ -383,9 +386,8 @@ export function evaluateColumnDefaults(
  * @internal
  */
 export function foreignKeysEnforced(db: Database.Database): boolean {
-  return db.pragma('foreign_keys', { simple: true }) === 1;
+  return db.pragma('foreign_keys', { simple: true }) === 1
 }
-
 
 /**
  * その表で1行を指すための列。宣言された主キー、無ければ `rowid`。
@@ -394,13 +396,15 @@ export function foreignKeysEnforced(db: Database.Database): boolean {
  * 限らないため（複合主キーの中間テーブルなど）。
  * @internal
  */
-export function rowKeyColumns(db: Database.Database, tableName: string): string[] {
+export function rowKeyColumns(
+  db: Database.Database,
+  tableName: string
+): string[] {
   return cachedBySchema(db, `rowkey:${foldIdentifier(tableName)}`, () => {
     const keyColumns = readColumnInfo(db, tableName)
       .filter((column) => column.pk > 0)
       .sort((a, b) => a.pk - b.pk)
-      .map((column) => column.name);
-    return keyColumns.length > 0 ? keyColumns : ['rowid'];
-  });
+      .map((column) => column.name)
+    return keyColumns.length > 0 ? keyColumns : ['rowid']
+  })
 }
-

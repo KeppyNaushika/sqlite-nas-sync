@@ -8,12 +8,12 @@
  * @module sync/remote
  * @internal
  */
-import Database from 'better-sqlite3';
-import { TableConfig } from '../types';
-import { isLaterTimestamp } from '../conflict';
-import type { ResurrectionProbe, TimestampColumnFor } from '../conflict';
-import { foldIdentifier, isSameIdentifier } from '../conflict/schema';
-import { ColumnInfo, escapeIdentifier, getTableColumns } from './sql';
+import Database from 'better-sqlite3'
+import { TableConfig } from '../types'
+import { isLaterTimestamp } from '../conflict'
+import type { ResurrectionProbe, TimestampColumnFor } from '../conflict'
+import { foldIdentifier, isSameIdentifier } from '../conflict/schema'
+import { ColumnInfo, escapeIdentifier, getTableColumns } from './sql'
 
 /**
  * DBの `_tombstone` が `mergedInto` 列を持つか。
@@ -27,12 +27,12 @@ export function hasMergedIntoColumn(db: Database.Database): boolean {
     .prepare(
       `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
     )
-    .get();
-  if (!exists) return false;
+    .get()
+  if (!exists) return false
   const columns = db
     .prepare(`PRAGMA table_info(_tombstone)`)
-    .all() as ColumnInfo[];
-  return columns.some((column) => isSameIdentifier(column.name, 'mergedInto'));
+    .all() as ColumnInfo[]
+  return columns.some((column) => isSameIdentifier(column.name, 'mergedInto'))
 }
 
 /**
@@ -49,12 +49,12 @@ export function getRemoteTombstone(
     .prepare(
       `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
     )
-    .get();
-  if (!exists) return null;
+    .get()
+  if (!exists) return null
 
   // v0.14.0以前のクライアントには `mergedInto` 列が無い。その場合は「畳み先は無い」
   // と読む（式として `NULL` を置く。`AS` は付けない —— 下では列名ではなく式として使う）
-  const mergedIntoColumn = hasMergedIntoColumn(remoteDb) ? 'mergedInto' : 'NULL';
+  const mergedIntoColumn = hasMergedIntoColumn(remoteDb) ? 'mergedInto' : 'NULL'
   // 取り込み元の `_tombstone` も、表名の綴り違いで2行ありうる（主キーは BINARY）。
   // **1行を選ばず合成する** —— 削除時刻は最も新しいものを、畳み先は主張されている
   // 中でいちばん新しいものを採る。「新しい方の行」を丸ごと採ると、ローカルの
@@ -74,15 +74,15 @@ export function getRemoteTombstone(
            LIMIT 1) AS mergedInto`
     )
     .get(tableName, recordId, tableName, recordId) as {
-    deletedAt: string | null;
-    mergedInto: string | null;
-  };
-  if (row.deletedAt === null) return null;
+    deletedAt: string | null
+    mergedInto: string | null
+  }
+  if (row.deletedAt === null) return null
 
   return {
     deletedAt: String(row.deletedAt),
     mergedInto: row.mergedInto === null ? null : String(row.mergedInto),
-  };
+  }
 }
 
 /**
@@ -95,8 +95,8 @@ export function resolveFoldTarget(
   recordId: string,
   mergedInto: string | null | undefined
 ): string | null {
-  if (mergedInto === null || mergedInto === undefined) return null;
-  return mergedInto === recordId ? null : mergedInto;
+  if (mergedInto === null || mergedInto === undefined) return null
+  return mergedInto === recordId ? null : mergedInto
 }
 
 /**
@@ -114,10 +114,10 @@ export function readRemoteRecord(
       .prepare(
         `SELECT * FROM ${escapeIdentifier(tableName)} WHERE ${escapeIdentifier(primaryKey)} = ?`
       )
-      .get(recordId) as Record<string, unknown> | undefined;
+      .get(recordId) as Record<string, unknown> | undefined
   } catch {
     // リモートに当該テーブルが無い（スキーマ違い）場合は読めないものとして扱う
-    return undefined;
+    return undefined
   }
 }
 
@@ -136,11 +136,11 @@ export function readRemoteRecord(
 export function makeTableConfigLookup(
   tables: TableConfig[]
 ): (tableName: string) => TableConfig | undefined {
-  const byName = new Map<string, TableConfig>();
+  const byName = new Map<string, TableConfig>()
   for (const tableConfig of tables) {
-    byName.set(foldIdentifier(tableConfig.name), tableConfig);
+    byName.set(foldIdentifier(tableConfig.name), tableConfig)
   }
-  return (tableName) => byName.get(foldIdentifier(tableName));
+  return (tableName) => byName.get(foldIdentifier(tableName))
 }
 
 /**
@@ -152,15 +152,17 @@ export function makeTableConfigLookup(
  * `updatedAt`。
  * @internal
  */
-export function makeTimestampColumnFor(tables: TableConfig[]): TimestampColumnFor {
-  const byName = new Map<string, string>();
+export function makeTimestampColumnFor(
+  tables: TableConfig[]
+): TimestampColumnFor {
+  const byName = new Map<string, string>()
   for (const tableConfig of tables) {
     byName.set(
       foldIdentifier(tableConfig.name),
       tableConfig.timestampColumn ?? 'updatedAt'
-    );
+    )
   }
-  return (tableName) => byName.get(foldIdentifier(tableName)) ?? 'updatedAt';
+  return (tableName) => byName.get(foldIdentifier(tableName)) ?? 'updatedAt'
 }
 
 /**
@@ -184,40 +186,40 @@ export function makeResurrectionProbe(
   primaryKey: string,
   timestampColumnFor: TimestampColumnFor
 ): ResurrectionProbe {
-  const escapedPk = escapeIdentifier(primaryKey);
+  const escapedPk = escapeIdentifier(primaryKey)
   // 表ごとの `SELECT`。レコードごとに `prepare` し直さない（null は「引けない表」）
-  const statements = new Map<string, Database.Statement | null>();
+  const statements = new Map<string, Database.Statement | null>()
 
   const statementFor = (tableName: string): Database.Statement | null => {
-    const cached = statements.get(tableName);
-    if (cached !== undefined) return cached;
+    const cached = statements.get(tableName)
+    if (cached !== undefined) return cached
 
-    let statement: Database.Statement | null = null;
+    let statement: Database.Statement | null = null
     try {
       // 列名の比較は大小を畳む（取り込み元の綴りと設定の綴りが揃うとは限らない）。
       // 取り逃がすと「作り直された親」を認識できず、届いた子を捨ててしまう
-      const columns = getTableColumns(remoteDb, tableName);
-      const preferred = timestampColumnFor(tableName);
+      const columns = getTableColumns(remoteDb, tableName)
+      const preferred = timestampColumnFor(tableName)
       const match = (name: string): string | undefined =>
-        columns.find((candidate) => isSameIdentifier(candidate, name));
-      const column = match(preferred) ?? match('updatedAt') ?? null;
+        columns.find((candidate) => isSameIdentifier(candidate, name))
+      const column = match(preferred) ?? match('updatedAt') ?? null
       if (column !== null) {
         statement = remoteDb.prepare(
           `SELECT ${escapeIdentifier(column)} AS ts
            FROM ${escapeIdentifier(tableName)} WHERE ${escapedPk} = ?`
-        );
+        )
       }
     } catch {
       // 取り込み元にその表が無い（スキーマ違い）なら、作り直しの証拠も無い
-      statement = null;
+      statement = null
     }
-    statements.set(tableName, statement);
-    return statement;
-  };
+    statements.set(tableName, statement)
+    return statement
+  }
 
   return (tableName, recordId, deletedAt) => {
-    const statement = statementFor(tableName);
-    if (statement === null) return false;
+    const statement = statementFor(tableName)
+    if (statement === null) return false
 
     try {
       // **「行がある」だけでは作り直しの証拠にならない。** 削除をまだ受け取っていない
@@ -225,21 +227,21 @@ export function makeResurrectionProbe(
       // 答え、消えた親を指す子をそのまま入れて外部キー違反を起こす（＝その相手ぶんの
       // 取り込みが丸ごと巻き戻り、同期がその相手から永久に止まる）。
       // 削除より**厳密に新しい**行だけを作り直しとみなす。
-      const row = statement.get(recordId) as { ts: unknown } | undefined;
-      if (!row) return false;
+      const row = statement.get(recordId) as { ts: unknown } | undefined
+      if (!row) return false
 
-      return isLaterTimestamp(remoteDb, String(row.ts ?? ''), deletedAt);
+      return isLaterTimestamp(remoteDb, String(row.ts ?? ''), deletedAt)
     } catch {
-      return false;
+      return false
     }
-  };
+  }
 }
 
 /** @internal tombstone エントリの型 */
 export interface TombstoneEntry {
-  tableName: string;
-  recordId: string;
-  deletedAt: string;
+  tableName: string
+  recordId: string
+  deletedAt: string
   /** 畳み先のid。普通の削除では null（v0.14.0以前のクライアントでも null） */
-  mergedInto: string | null;
+  mergedInto: string | null
 }

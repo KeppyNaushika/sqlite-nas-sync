@@ -8,10 +8,10 @@
  * @module setup/schema-version
  * @internal
  */
-import * as crypto from 'crypto';
-import Database from 'better-sqlite3';
-import { TableConfig } from '../types';
-import { ColumnInfo, escapeIdentifier } from './sql';
+import * as crypto from 'crypto'
+import Database from 'better-sqlite3'
+import { TableConfig } from '../types'
+import { ColumnInfo, escapeIdentifier } from './sql'
 
 /**
  * `_sync_meta` テーブルにスキーマバージョンを書き込む。
@@ -25,7 +25,7 @@ export function writeSchemaVersion(
 ): void {
   db.prepare(
     `INSERT OR REPLACE INTO _sync_meta (key, value) VALUES ('schemaVersion', ?)`
-  ).run(schemaVersion);
+  ).run(schemaVersion)
 }
 
 /**
@@ -34,17 +34,15 @@ export function writeSchemaVersion(
  * @param db - 対象のSQLiteデータベース接続
  * @returns スキーマバージョン文字列。未設定の場合は `null`
  */
-export function readSchemaVersion(
-  db: Database.Database
-): string | null {
+export function readSchemaVersion(db: Database.Database): string | null {
   // _sync_meta テーブルが存在しない場合も考慮
   try {
     const row = db
       .prepare(`SELECT value FROM _sync_meta WHERE key = 'schemaVersion'`)
-      .get() as { value: string } | undefined;
-    return row?.value ?? null;
+      .get() as { value: string } | undefined
+    return row?.value ?? null
   } catch {
-    return null;
+    return null
   }
 }
 
@@ -64,35 +62,32 @@ export function computeSchemaHash(
   db: Database.Database,
   tables: TableConfig[]
 ): string {
-  const parts: string[] = [];
+  const parts: string[] = []
 
   // テーブル名でソートして安定した順序にする
-  const sortedTables = [...tables].sort((a, b) => a.name.localeCompare(b.name));
+  const sortedTables = [...tables].sort((a, b) => a.name.localeCompare(b.name))
 
   for (const tableConfig of sortedTables) {
-    const tableName = tableConfig.name;
+    const tableName = tableConfig.name
 
     try {
       const columns = db
         .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-        .all() as ColumnInfo[];
+        .all() as ColumnInfo[]
 
       // カラムをcid順（定義順）で処理
       const colDescs = columns
         .sort((a, b) => a.cid - b.cid)
         .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.pk}`)
-        .join(',');
+        .join(',')
 
-      parts.push(`${tableName}(${colDescs})`);
+      parts.push(`${tableName}(${colDescs})`)
     } catch {
       // テーブルが存在しない場合はスキップ
     }
   }
 
-  const hash = crypto
-    .createHash('sha256')
-    .update(parts.join('|'))
-    .digest('hex');
+  const hash = crypto.createHash('sha256').update(parts.join('|')).digest('hex')
 
-  return hash.slice(0, 16);
+  return hash.slice(0, 16)
 }

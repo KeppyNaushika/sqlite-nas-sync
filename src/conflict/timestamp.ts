@@ -7,8 +7,8 @@
  * @module conflict/timestamp
  * @internal
  */
-import Database from 'better-sqlite3';
-import { getTableColumns, isSameIdentifier, readColumn } from './schema';
+import Database from 'better-sqlite3'
+import { getTableColumns, isSameIdentifier, readColumn } from './schema'
 
 /**
  * 2つのタイムスタンプを「時刻」として比較する。
@@ -33,11 +33,10 @@ export function isLaterTimestamp(
 ): boolean {
   const row = db
     .prepare(`SELECT julianday(?) AS ja, julianday(?) AS jb`)
-    .get(a, b) as { ja: number | null; jb: number | null };
-  if (row.ja != null && row.jb != null) return row.ja > row.jb;
-  return a > b;
+    .get(a, b) as { ja: number | null; jb: number | null }
+  if (row.ja != null && row.jb != null) return row.ja > row.jb
+  return a > b
 }
-
 
 /**
  * 2つのタイムスタンプが**同じ時刻を指しているか**。
@@ -55,12 +54,12 @@ export function isSameTimestamp(
   a: string,
   b: string
 ): boolean {
-  if (a === b) return true;
+  if (a === b) return true
   const row = db
     .prepare(`SELECT julianday(?) AS ja, julianday(?) AS jb`)
-    .get(a, b) as { ja: number | null; jb: number | null };
-  if (row.ja != null && row.jb != null) return row.ja === row.jb;
-  return false;
+    .get(a, b) as { ja: number | null; jb: number | null }
+  if (row.ja != null && row.jb != null) return row.ja === row.jb
+  return false
 }
 
 /**
@@ -73,7 +72,7 @@ export function isSameTimestamp(
  *
  * 渡されない場合（公開APIを直接呼ぶ場合）は、呼び出し元が持っている列名を使う。
  */
-export type TimestampColumnFor = (tableName: string) => string;
+export type TimestampColumnFor = (tableName: string) => string
 
 /**
  * LWW比較に使うタイムスタンプ列を決める。
@@ -91,12 +90,11 @@ export function resolveTimestampColumn(
   // 綴りが揃うとは限らない。**見つからないと黙って現在時刻へ落ちる**種類の判断が
   // この先にぶら下がっているので、字面で取り逃がしてはいけない。
   // 返すのは**表が実際に名乗っている綴り**（SQLへ埋めるのはこちら）。
-  const columns = getTableColumns(db, tableName);
+  const columns = getTableColumns(db, tableName)
   const match = (name: string): string | undefined =>
-    columns.find((column) => isSameIdentifier(column, name));
-  return match(preferred) ?? match('updatedAt') ?? null;
+    columns.find((column) => isSameIdentifier(column, name))
+  return match(preferred) ?? match('updatedAt') ?? null
 }
-
 
 /**
  * 行が名乗っている時刻を、畳みの記録に刻む値として取り出す。
@@ -111,13 +109,12 @@ export function foldTimestampOf(
   row: Record<string, unknown>,
   timestampColumn: string | null
 ): string | undefined {
-  if (!timestampColumn) return undefined;
-  const value = readColumn(row, timestampColumn);
-  if (value === null || value === undefined) return undefined;
-  const text = String(value);
-  return text === '' ? undefined : text;
+  if (!timestampColumn) return undefined
+  const value = readColumn(row, timestampColumn)
+  if (value === null || value === undefined) return undefined
+  const text = String(value)
+  return text === '' ? undefined : text
 }
-
 
 /**
  * 2つの行のうち、どちらを生かすかをLWWで決める。
@@ -140,12 +137,13 @@ export function isPreferredOverRival(
   primaryKey: string
 ): boolean {
   if (timestampColumn) {
-    const rowTimestamp = String(readColumn(row, timestampColumn) ?? '');
-    const rivalTimestamp = String(readColumn(rival, timestampColumn) ?? '');
+    const rowTimestamp = String(readColumn(row, timestampColumn) ?? '')
+    const rivalTimestamp = String(readColumn(rival, timestampColumn) ?? '')
     if (rowTimestamp !== rivalTimestamp) {
-      return isLaterTimestamp(db, rowTimestamp, rivalTimestamp);
+      return isLaterTimestamp(db, rowTimestamp, rivalTimestamp)
     }
   }
-  return String(readColumn(row, primaryKey)) < String(readColumn(rival, primaryKey));
+  return (
+    String(readColumn(row, primaryKey)) < String(readColumn(rival, primaryKey))
+  )
 }
-

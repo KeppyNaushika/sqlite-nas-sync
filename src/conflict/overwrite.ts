@@ -9,19 +9,18 @@
  * @module conflict/overwrite
  * @internal
  */
-import Database from 'better-sqlite3';
-import { RecordFold } from '../types';
-import { escapeIdentifier, isSameIdentifier, readColumn } from './schema';
-import { foldTimestampOf } from './timestamp';
+import Database from 'better-sqlite3'
+import { RecordFold } from '../types'
+import { escapeIdentifier, isSameIdentifier, readColumn } from './schema'
+import { foldTimestampOf } from './timestamp'
 import {
   findUniqueRivals,
   outranksAllRivals,
   readSecondaryUniqueKeys,
   selectSurvivingRival,
-} from './unique';
-import { foldRowInto } from './fold';
-import { runDeferringForeignKeys, runInSavepoint } from './transaction';
-
+} from './unique'
+import { foldRowInto } from './fold'
+import { runDeferringForeignKeys, runInSavepoint } from './transaction'
 
 /**
  * {@link overwriteExistingRow} の結果。
@@ -35,8 +34,8 @@ export interface OverwriteOutcome {
    * `remote_wins` — 届いた版を書けた（邪魔な相手が居れば畳んでから書いた）。
    * `local_wins` — 書けなかったので、**書き込み先の行の方**を勝者へ畳んだ。
    */
-  resolution: 'remote_wins' | 'local_wins';
-  folds: RecordFold[];
+  resolution: 'remote_wins' | 'local_wins'
+  folds: RecordFold[]
 }
 
 /**
@@ -75,12 +74,12 @@ export function overwriteExistingRow(
   columns: string[],
   timestampColumn: string
 ): OverwriteOutcome {
-  const pkValue = readColumn(record, primaryKey);
+  const pkValue = readColumn(record, primaryKey)
   // 主キーの列だけは書かない（行の同定に使っている）。列名の比較は大小を畳む ——
   // `columns` は `PRAGMA` 由来、`primaryKey` は設定由来で、綴りが揃うとは限らない
   const updateColumns = columns.filter(
     (column) => !isSameIdentifier(column, primaryKey)
-  );
+  )
 
   // 主キー以外に書く列が無いと `SET` 句が空になり、SQLite は原因を指さない
   // `near "WHERE": syntax error` を投げる（実測）。**同期経路からはここへ来ない** —
@@ -92,25 +91,25 @@ export function overwriteExistingRow(
     throw new Error(
       `Cannot write ${tableName}: "columns" holds only the primary key ` +
         `"${primaryKey}", leaving nothing to write. Pass every column of the row.`
-    );
+    )
   }
 
   const setClause = updateColumns
     .map((column) => `${escapeIdentifier(column)} = ?`)
-    .join(', ');
-  const values = [...updateColumns.map((column) => record[column]), pkValue];
+    .join(', ')
+  const values = [...updateColumns.map((column) => record[column]), pkValue]
   const updateStatement = db.prepare(
     `UPDATE ${escapeIdentifier(tableName)} SET ${setClause}
      WHERE ${escapeIdentifier(primaryKey)} = ?`
-  );
+  )
 
-  let rivalRows: Record<string, unknown>[];
+  let rivalRows: Record<string, unknown>[]
   try {
-    updateStatement.run(...values);
-    return { resolution: 'remote_wins', folds: [] };
+    updateStatement.run(...values)
+    return { resolution: 'remote_wins', folds: [] }
   } catch (err: unknown) {
-    const sqliteErr = err as { code?: string };
-    if (sqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+    const sqliteErr = err as { code?: string }
+    if (sqliteErr.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err
 
     // 書き込みがローカルの**別の行**のセカンダリUNIQUEに当たった
     // （利用者が編集できる名前の列で、両端末が独立に同じ名前へ辿り着いた場合など）。
@@ -122,11 +121,11 @@ export function overwriteExistingRow(
       record,
       pkValue,
       readSecondaryUniqueKeys(db, tableName)
-    );
+    )
 
     // 衝突相手を特定できない場合は黙って握りつぶさず呼び出し元に委ねる
     // （部分索引・式索引で張られたユニークなど、列の値から相手を引けない形）。
-    if (rivalRows.length === 0) throw err;
+    if (rivalRows.length === 0) throw err
   }
 
   // 同時刻は主キーの辞書順で決める（{@link isPreferredOverRival}）。ここを
@@ -136,11 +135,11 @@ export function overwriteExistingRow(
     // 届いた版が全員に勝つ → 邪魔なローカル行を全て書き込み先の行へ畳んでから書き直す。
     // 敗者の子は先に勝者へ付け替わるので、カスケードで道連れにならない。
     // 畳みと書き直しは1つの区切りで行う（片方だけ残さない）。
-    const folds: RecordFold[] = [];
+    const folds: RecordFold[] = []
     // 勝者は書き込む `record`。畳みが確定した時刻はその行が名乗る版の時刻
-    const foldedAt = foldTimestampOf(record, timestampColumn);
+    const foldedAt = foldTimestampOf(record, timestampColumn)
     runInSavepoint(db, () => {
-      const folded = new Set<string>();
+      const folded = new Set<string>()
       for (const rivalRow of rivalRows) {
         foldRowInto(
           db,
@@ -152,11 +151,11 @@ export function overwriteExistingRow(
           folded,
           folds,
           foldedAt
-        );
+        )
       }
-      updateStatement.run(...values);
-    });
-    return { resolution: 'remote_wins', folds };
+      updateStatement.run(...values)
+    })
+    return { resolution: 'remote_wins', folds }
   }
 
   // ローカル行が勝った → 届いた版は採用しない。ただし**黙って捨てない**。
@@ -167,13 +166,13 @@ export function overwriteExistingRow(
   //
   // 畳むのは**書き込み先の行だけ**にする。勝てなかった相手が複数居ても、それらは
   // 「採用しないと決めた版」を通してしか結び付いていないので、まとめて畳まない。
-  const folds: RecordFold[] = [];
+  const folds: RecordFold[] = []
   const survivingRival = selectSurvivingRival(
     db,
     rivalRows,
     timestampColumn,
     primaryKey
-  );
+  )
   runDeferringForeignKeys(db, () => {
     foldRowInto(
       db,
@@ -186,7 +185,7 @@ export function overwriteExistingRow(
       folds,
       // 勝者はローカルに残る相手の行。その行が名乗る版の時刻を刻む
       foldTimestampOf(survivingRival, timestampColumn)
-    );
-  });
-  return { resolution: 'local_wins', folds };
+    )
+  })
+  return { resolution: 'local_wins', folds }
 }

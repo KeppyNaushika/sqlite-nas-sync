@@ -22,23 +22,27 @@
  *
  * @module sync
  */
-import Database from 'better-sqlite3';
-import { DEFAULTS, SyncConfig, SyncResult, TableConfig } from './types';
-import { cleanupChangelog, hasChangelogGap } from './changelog';
+import Database from 'better-sqlite3'
+import { DEFAULTS, SyncConfig, SyncResult, TableConfig } from './types'
+import { cleanupChangelog, hasChangelogGap } from './changelog'
 import {
   copyToNas,
   ensureDirectory,
   listRemoteClients,
   openRemoteDbViaLocalCopy,
-} from './nas';
+} from './nas'
 import {
   computeSchemaHash,
   ensureTombstoneMergedIntoColumn,
   readSchemaVersion,
   writeSchemaVersion,
-} from './setup';
-import { getSyncState, recordSkippedRemote, updateHeartbeat } from './sync/state';
-import { pullFullMerge, pullNormal } from './sync/pull';
+} from './setup'
+import {
+  getSyncState,
+  recordSkippedRemote,
+  updateHeartbeat,
+} from './sync/state'
+import { pullFullMerge, pullNormal } from './sync/pull'
 
 /**
  * 同期処理を実行する。
@@ -69,10 +73,10 @@ export async function performSync(
   config: SyncConfig,
   tables: TableConfig[]
 ): Promise<SyncResult> {
-  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey;
+  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
   const retentionDays =
-    config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays;
-  const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled;
+    config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays
+  const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled
 
   const result: SyncResult = {
     clientsSynced: 0,
@@ -85,78 +89,86 @@ export async function performSync(
     warnings: [],
     skippedRemotes: [],
     hadChangelogGap: false,
-  };
+  }
 
   // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
   if (config.schemaVersion) {
-    writeSchemaVersion(localDb, config.schemaVersion);
+    writeSchemaVersion(localDb, config.schemaVersion)
   }
 
   // 1. NASディレクトリを確保し、リモートクライアントを列挙
-  ensureDirectory(config.nasPath);
-  const remoteClients = listRemoteClients(config.nasPath, config.clientId);
+  ensureDirectory(config.nasPath)
+  const remoteClients = listRemoteClients(config.nasPath, config.clientId)
 
   // 2. ギャップ事前チェック: いずれかのリモートにchangelogギャップがあるか確認
-  let hasAnyGap = false;
+  let hasAnyGap = false
   for (const remote of remoteClients) {
-    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null;
+    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null
     try {
-      handle = openRemoteDbViaLocalCopy(remote.filePath);
-      if (!handle) continue;
-      const remoteDb = handle.db;
+      handle = openRemoteDbViaLocalCopy(remote.filePath)
+      if (!handle) continue
+      const remoteDb = handle.db
 
       if (config.schemaVersion) {
-        const remoteVersion = readSchemaVersion(remoteDb);
-        if (remoteVersion !== config.schemaVersion) continue;
+        const remoteVersion = readSchemaVersion(remoteDb)
+        if (remoteVersion !== config.schemaVersion) continue
       }
 
-      const { lastSeenId } = getSyncState(localDb, remote.clientId);
+      const { lastSeenId } = getSyncState(localDb, remote.clientId)
       if (hasChangelogGap(remoteDb, lastSeenId)) {
-        hasAnyGap = true;
-        break;
+        hasAnyGap = true
+        break
       }
     } finally {
       if (handle) {
-        handle.cleanup();
+        handle.cleanup()
       }
     }
   }
 
   if (hasAnyGap) {
     // === Pull-first フルマージフロー ===
-    result.hadChangelogGap = true;
+    result.hadChangelogGap = true
 
     // 3a. トリガーOFFでフルマージ（データ + tombstone + changelog）
-    pullFullMerge(localDb, remoteClients, config, tables, primaryKey, retentionDays, result);
+    pullFullMerge(
+      localDb,
+      remoteClients,
+      config,
+      tables,
+      primaryKey,
+      retentionDays,
+      result
+    )
 
     // 3b. heartbeat更新（トリガーON状態 → changelogに1件 → changelog延命）
     if (heartbeatEnabled) {
-      updateHeartbeat(localDb);
+      updateHeartbeat(localDb)
     }
 
     // 3c. クリーンな状態をNASにアップロード
-    await copyToNas(localDb, config.nasPath, config.clientId);
+    await copyToNas(localDb, config.nasPath, config.clientId)
   } else {
     // === 通常フロー ===
     // 4a. ローカルDBをNASにコピー（schemaVersion込み）
-    await copyToNas(localDb, config.nasPath, config.clientId);
+    await copyToNas(localDb, config.nasPath, config.clientId)
 
     // 4b. リモートから変更をpull
-    pullNormal(localDb, remoteClients, config, tables, primaryKey, result);
+    pullNormal(localDb, remoteClients, config, tables, primaryKey, result)
 
     // 4c. heartbeat更新
     if (heartbeatEnabled) {
-      updateHeartbeat(localDb);
+      updateHeartbeat(localDb)
     }
   }
 
   // 5. 古い_changelogエントリの掃除
-  cleanupChangelog(localDb, retentionDays);
+  cleanupChangelog(localDb, retentionDays)
 
   // 6. onAfterSync コールバック
   if (config.onAfterSync) {
-    config.onAfterSync(localDb, result);
+    config.onAfterSync(localDb, result)
   }
 
-  return result;
+  return result
 }

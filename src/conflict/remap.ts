@@ -4,7 +4,7 @@
  * @module conflict/remap
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 import {
   areColumnsNullable,
   escapeIdentifier,
@@ -16,10 +16,10 @@ import {
   isSameIdentifier,
   readColumn,
   readForeignKeys,
-} from './schema';
-import { hasIdMerges, isFoldRecordStale, lookupIdMerge } from './ledger';
-import { isKnownDeleted, ResurrectionProbe } from './tombstone';
-import { TimestampColumnFor } from './timestamp';
+} from './schema'
+import { hasIdMerges, isFoldRecordStale, lookupIdMerge } from './ledger'
+import { isKnownDeleted, ResurrectionProbe } from './tombstone'
+import { TimestampColumnFor } from './timestamp'
 
 /**
  * {@link remapMergedForeignKeys} の結果。
@@ -30,9 +30,9 @@ export interface RemapOutcome {
    * 採るべき行（読み替え済み）。**読み替え先が消えていて採らないと決めた場合は null**
    * （{@link remapMergedForeignKeys} の「読み替え先が消えているとき」を参照）。
    */
-  record: Record<string, unknown> | null;
+  record: Record<string, unknown> | null
   /** 見送った・列をNULLにした、と利用者へ伝える文言（`SyncResult.warnings` へ出る） */
-  warnings: string[];
+  warnings: string[]
 }
 
 /**
@@ -49,9 +49,9 @@ export function isForeignKeyUnchecked(
   record: Record<string, unknown>
 ): boolean {
   return foreignKey.columns.some((column) => {
-    const value = record[column.childColumn];
-    return value === null || value === undefined;
-  });
+    const value = record[column.childColumn]
+    return value === null || value === undefined
+  })
 }
 
 /**
@@ -69,23 +69,20 @@ export function parentRowExists(
   foreignKey: ForeignKeyRef,
   record: Record<string, unknown>
 ): boolean {
-  if (!hasTable(db, foreignKey.parentTable)) return false;
+  if (!hasTable(db, foreignKey.parentTable)) return false
 
   const matchClause = foreignKey.columns
     .map((column) => `${escapeIdentifier(column.parentColumn)} = ?`)
-    .join(' AND ');
-  const values = foreignKey.columns.map(
-    (column) => record[column.childColumn]
-  );
+    .join(' AND ')
+  const values = foreignKey.columns.map((column) => record[column.childColumn])
   return (
     db
       .prepare(
         `SELECT 1 FROM ${escapeIdentifier(foreignKey.parentTable)} WHERE ${matchClause}`
       )
       .get(...values) !== undefined
-  );
+  )
 }
-
 
 /**
  * レコードの外部キーのうち、既に畳まれて消えた行を指しているものを、吸収先へ向け直す。
@@ -149,23 +146,23 @@ export function remapMergedForeignKeys(
 ): RemapOutcome {
   // 畳みが一度も起きていないDB（大多数）はここで打ち切る。
   // 外部キーの走査も、親の存在確認も、`_tombstone` 参照も一切増えない。
-  if (!hasIdMerges(db)) return { record, warnings: [] };
+  if (!hasIdMerges(db)) return { record, warnings: [] }
 
-  const warnings: string[] = [];
-  const recordId = String(readColumn(record, primaryKey));
-  let remapped: Record<string, unknown> | null = null;
+  const warnings: string[] = []
+  const recordId = String(readColumn(record, primaryKey))
+  let remapped: Record<string, unknown> | null = null
   // 「読み替え先が消えていた」外部キーの後始末。**全部の外部キーを見終えてから**行う。
   // 1つの表が `CASCADE` の親と `SET NULL` の親を両方持つとき、途中で結論を出すと
   // 外部キーを見る順番（`PRAGMA foreign_key_list` の順）で結果が変わってしまう
   // （先に null にしてから採らないと決める、など）。採らないと決めた相手が1人でも
   // 居れば採らない、が順番によらない答え。
-  const dropReasons: string[] = [];
-  const nullOutColumns: string[] = [];
-  const setDefaultColumns: { column: string; value: unknown }[] = [];
-  const nullOutWarnings: string[] = [];
+  const dropReasons: string[] = []
+  const nullOutColumns: string[] = []
+  const setDefaultColumns: { column: string; value: unknown }[] = []
+  const nullOutWarnings: string[] = []
 
   for (const foreignKey of readForeignKeys(db, tableName, primaryKey)) {
-    let repointedTo: string | null = null;
+    let repointedTo: string | null = null
 
     for (const { childColumn, parentColumn } of foreignKey.columns) {
       // **列名の比較は大小を畳む。** `PRAGMA foreign_key_list` は `REFERENCES` 句に
@@ -174,12 +171,12 @@ export function remapMergedForeignKeys(
       // 指す子がそのまま入って外部キー違反になる（その相手ぶんの取り込みが巻き戻る）。
       // 暗黙の `REFERENCES users` は `readForeignKeys` が主キー名で埋めるので無事だが、
       // 親の列を明示した宣言だけが落ちる、という見つけにくい形になる。
-      if (!isSameIdentifier(parentColumn, primaryKey)) continue;
-      const current = record[childColumn];
-      if (current === null || current === undefined) continue;
+      if (!isSameIdentifier(parentColumn, primaryKey)) continue
+      const current = record[childColumn]
+      if (current === null || current === undefined) continue
 
-      const merge = lookupIdMerge(db, foreignKey.parentTable, String(current));
-      if (merge === null || merge.winningId === String(current)) continue;
+      const merge = lookupIdMerge(db, foreignKey.parentTable, String(current))
+      if (merge === null || merge.winningId === String(current)) continue
       if (
         isFoldRecordStale(
           db,
@@ -193,34 +190,34 @@ export function remapMergedForeignKeys(
           timestampColumnFor?.(foreignKey.parentTable) ?? timestampColumn
         )
       ) {
-        continue;
+        continue
       }
 
-      remapped = remapped ?? { ...record };
-      remapped[childColumn] = merge.winningId;
-      repointedTo = merge.winningId;
+      remapped = remapped ?? { ...record }
+      remapped[childColumn] = merge.winningId
+      repointedTo = merge.winningId
     }
 
     // 読み替えていない参照は、今までどおり触らない
-    if (repointedTo === null || remapped === null) continue;
+    if (repointedTo === null || remapped === null) continue
     // 外部キーが効いていない接続では `ON DELETE` の動作も起きない。
     // 再現すべきものが無いのに子を捨てるのは、ただのデータ損失
-    if (!foreignKeysEnforced(db)) continue;
+    if (!foreignKeysEnforced(db)) continue
     // **子の列がどこか1列でも NULL なら、SQLite はその外部キーを検査しない**
     // （複合外部キーの NULL 規則。UNIQUE と同じ扱い）。検査されない＝親が居なくても
     // 何も起きないので、`ON DELETE` の動作も及ばない。ここを見落として全列を
     // `列 = ?` で引くと、`= NULL` が真にならないため「親が居ない」と判定され、
     // **SQLite ならそのまま通る行を捨てる**ことになる。
-    if (isForeignKeyUnchecked(foreignKey, remapped)) continue;
-    if (parentRowExists(db, foreignKey, remapped)) continue;
+    if (isForeignKeyUnchecked(foreignKey, remapped)) continue
+    if (parentRowExists(db, foreignKey, remapped)) continue
     if (
       !isKnownDeleted(db, foreignKey.parentTable, repointedTo, isResurrected)
     ) {
-      continue;
+      continue
     }
 
-    const gone = `parent ${foreignKey.parentTable}:${repointedTo} is gone`;
-    const childColumns = foreignKey.columns.map((column) => column.childColumn);
+    const gone = `parent ${foreignKey.parentTable}:${repointedTo} is gone`
+    const childColumns = foreignKey.columns.map((column) => column.childColumn)
 
     if (
       (foreignKey.onDelete === 'SET NULL' ||
@@ -232,55 +229,58 @@ export function remapMergedForeignKeys(
       // {@link includesPrimaryKeyColumn}）。書き換えず、採らずに知らせる。
       dropReasons.push(
         `Dropped ${tableName}:${recordId}: ${gone} and ON DELETE ${foreignKey.onDelete} cannot apply (${childColumns.join(', ')} is part of the primary key)`
-      );
-      continue;
+      )
+      continue
     }
 
     if (foreignKey.onDelete === 'SET NULL') {
       if (areColumnsNullable(db, tableName, childColumns)) {
         // SQLite は複合外部キーの**全列**を null にする。一部だけでは
         // 残った列が孤児を指し続ける
-        nullOutColumns.push(...childColumns);
+        nullOutColumns.push(...childColumns)
         nullOutWarnings.push(
           `Kept ${tableName}:${recordId} with ${childColumns.join(', ')} set to NULL: ${gone} (ON DELETE SET NULL)`
-        );
-        continue;
+        )
+        continue
       }
       dropReasons.push(
         `Dropped ${tableName}:${recordId}: ${gone} and ON DELETE SET NULL cannot apply (${childColumns.join(', ')} is NOT NULL)`
-      );
-      continue;
+      )
+      continue
     }
 
     if (foreignKey.onDelete === 'SET DEFAULT') {
       // SQLite は**その外部キーの全列**を宣言された既定値にする（複合でも全列。実測）。
       // 既定値の宣言が無い列は NULL になるので、その場合は `SET NULL` と同じ形になる。
-      const defaults = evaluateColumnDefaults(db, tableName, childColumns);
+      const defaults = evaluateColumnDefaults(db, tableName, childColumns)
       if (defaults === null) {
         dropReasons.push(
           `Dropped ${tableName}:${recordId}: ${gone} and ON DELETE SET DEFAULT cannot apply (default for ${childColumns.join(', ')} is not evaluable)`
-        );
-        continue;
+        )
+        continue
       }
 
       const nullColumns = childColumns.filter(
         (_, index) => defaults[index] === null
-      );
+      )
       // NULL を入れる列が NOT NULL なら、その既定値は入らない
-      if (nullColumns.length > 0 && !areColumnsNullable(db, tableName, nullColumns)) {
+      if (
+        nullColumns.length > 0 &&
+        !areColumnsNullable(db, tableName, nullColumns)
+      ) {
         dropReasons.push(
           `Dropped ${tableName}:${recordId}: ${gone} and ON DELETE SET DEFAULT cannot apply (${nullColumns.join(', ')} is NOT NULL without a default)`
-        );
-        continue;
+        )
+        continue
       }
 
       // 既定値の組がどこか1列でも NULL なら、その参照は検査されない
       // （SQLiteのUNIQUEと同じで、NULLを含む外部キーは満たされたものとして扱われる）。
       // 全列が非NULLのときだけ、その既定値の親が本当に居るかを見る。
-      const defaultRow = { ...remapped };
+      const defaultRow = { ...remapped }
       childColumns.forEach((childColumn, index) => {
-        defaultRow[childColumn] = defaults[index];
-      });
+        defaultRow[childColumn] = defaults[index]
+      })
       if (
         nullColumns.length === 0 &&
         !parentRowExists(db, foreignKey, defaultRow)
@@ -289,8 +289,8 @@ export function remapMergedForeignKeys(
         // 「その削除は起きなかった」を再現する術は無いので、採らずに知らせる
         dropReasons.push(
           `Dropped ${tableName}:${recordId}: ${gone} and ON DELETE SET DEFAULT cannot apply (default parent ${foreignKey.parentTable} row is missing)`
-        );
-        continue;
+        )
+        continue
       }
 
       setDefaultColumns.push(
@@ -298,34 +298,34 @@ export function remapMergedForeignKeys(
           column: childColumn,
           value: defaults[index],
         }))
-      );
+      )
       nullOutWarnings.push(
         `Kept ${tableName}:${recordId} with ${childColumns.join(', ')} set to its default: ${gone} (ON DELETE SET DEFAULT)`
-      );
-      continue;
+      )
+      continue
     }
 
     dropReasons.push(
       `Dropped ${tableName}:${recordId}: ${gone} (ON DELETE ${foreignKey.onDelete})`
-    );
+    )
   }
 
   // 1人でも「採らない」が居れば採らない。null にする話はもう関係が無いので載せない
   if (dropReasons.length > 0) {
-    warnings.push(...dropReasons);
-    return { record: null, warnings };
+    warnings.push(...dropReasons)
+    return { record: null, warnings }
   }
 
   if (
     remapped !== null &&
     (nullOutColumns.length > 0 || setDefaultColumns.length > 0)
   ) {
-    for (const childColumn of nullOutColumns) remapped[childColumn] = null;
-    for (const { column, value } of setDefaultColumns) remapped[column] = value;
-    warnings.push(...nullOutWarnings);
+    for (const childColumn of nullOutColumns) remapped[childColumn] = null
+    for (const { column, value } of setDefaultColumns) remapped[column] = value
+    warnings.push(...nullOutWarnings)
   }
 
-  if (remapped === null) return { record, warnings };
+  if (remapped === null) return { record, warnings }
 
   // **読み替えても、行の時刻には触らない。**
   //
@@ -338,6 +338,5 @@ export function remapMergedForeignKeys(
   // `docs/child-fold-not-revoked.md`）はあるが、**書かれたデータを消してまで
   // 解くものではない**。ライブラリはそれを解かず、代わりに {@link describeStalemate}
   // で**報告する**（消えた編集は取り戻せないが、食い違いは知らせれば人が直せる）。
-  return { record: remapped, warnings };
+  return { record: remapped, warnings }
 }
-

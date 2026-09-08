@@ -1,0 +1,7 @@
+dist
+docs/api
+coverage
+node_modules
+
+# 生成物は触らない（npm が書く形のまま置く）
+package-lock.json

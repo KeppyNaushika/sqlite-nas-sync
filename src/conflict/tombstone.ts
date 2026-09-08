@@ -9,10 +9,10 @@
  * @module conflict/tombstone
  * @internal
  */
-import Database from 'better-sqlite3';
-import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup';
-import { escapeIdentifier, hasTable } from './schema';
-import { isLaterTimestamp } from './timestamp';
+import Database from 'better-sqlite3'
+import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup'
+import { escapeIdentifier, hasTable } from './schema'
+import { isLaterTimestamp } from './timestamp'
 
 /**
  * `_tombstone` に載っているこの id の主張1件。
@@ -20,9 +20,9 @@ import { isLaterTimestamp } from './timestamp';
  */
 export interface TombstoneClaim {
   /** 消えたと主張している時刻 */
-  deletedAt: string;
+  deletedAt: string
   /** 畳み先。ただの削除なら null */
-  mergedInto: string | null;
+  mergedInto: string | null
 }
 
 /**
@@ -43,8 +43,8 @@ export function readTombstoneClaim(
   tableName: string,
   recordId: string
 ): TombstoneClaim | null {
-  if (!hasTable(db, '_tombstone')) return null;
-  ensureTombstoneMergedIntoColumn(db);
+  if (!hasTable(db, '_tombstone')) return null
+  ensureTombstoneMergedIntoColumn(db)
 
   // **1行を選ぶのではなく、合成する。**
   // 綴り違いの2行は「同じ id についての別々の主張の断片」であって、どちらか一方が
@@ -68,15 +68,15 @@ export function readTombstoneClaim(
            LIMIT 1) AS mergedInto`
     )
     .get(tableName, recordId, tableName, recordId) as {
-    deletedAt: string | null;
-    mergedInto: string | null;
-  };
-  if (row.deletedAt === null) return null;
+    deletedAt: string | null
+    mergedInto: string | null
+  }
+  if (row.deletedAt === null) return null
 
   return {
     deletedAt: String(row.deletedAt),
     mergedInto: row.mergedInto === null ? null : String(row.mergedInto),
-  };
+  }
 }
 
 /**
@@ -114,14 +114,14 @@ export function recordTombstoneMerge(
   winningId: string,
   foldedAt?: string
 ): void {
-  if (!hasTable(db, '_tombstone')) return;
-  ensureTombstoneMergedIntoColumn(db);
+  if (!hasTable(db, '_tombstone')) return
+  ensureTombstoneMergedIntoColumn(db)
 
   // 畳み先の鎖を作らない（`_id_merge` と同じ扱い）
   db.prepare(
     `UPDATE _tombstone SET mergedInto = ?
      WHERE tableName = ? COLLATE NOCASE AND mergedInto = ?`
-  ).run(winningId, tableName, losingId);
+  ).run(winningId, tableName, losingId)
 
   // **ここは比べない。置く。**
   //
@@ -134,24 +134,21 @@ export function recordTombstoneMerge(
   // 向こうの生きている行が子ごと消える）。
   //
   // 判断を1か所に集めたので、書き込みは1つの決定から素直に導かれる。
-  const explicitFoldedAt = foldedAt ? foldedAt : null;
+  const explicitFoldedAt = foldedAt ? foldedAt : null
   db.prepare(
     `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
      VALUES (?, ?, COALESCE(?, ${NOW_SQL}), ?)
      ON CONFLICT(tableName, recordId) DO UPDATE SET
        mergedInto = excluded.mergedInto,
        deletedAt = excluded.deletedAt`
-  ).run(tableName, losingId, explicitFoldedAt, winningId);
+  ).run(tableName, losingId, explicitFoldedAt, winningId)
 
   // 自分自身を指す畳み先は意味を持たない（畳む向きが反転したときに生まれる）
   db.prepare(
     `UPDATE _tombstone SET mergedInto = NULL
      WHERE tableName = ? COLLATE NOCASE AND recordId = mergedInto`
-  ).run(tableName);
+  ).run(tableName)
 }
-
-
-
 
 /**
  * 「その行は取り込み元に現存するか」を答える手続き。
@@ -168,8 +165,7 @@ export type ResurrectionProbe = (
   tableName: string,
   recordId: string,
   deletedAt: string
-) => boolean;
-
+) => boolean
 
 /**
  * その id が「消えた」と分かっているか（`_tombstone` に載っているか）。
@@ -185,19 +181,16 @@ export function isKnownDeleted(
   recordId: string,
   isResurrected: ResurrectionProbe | undefined
 ): boolean {
-  const tombstone = readTombstoneClaim(db, tableName, recordId);
-  if (tombstone === null) return false;
+  const tombstone = readTombstoneClaim(db, tableName, recordId)
+  if (tombstone === null) return false
 
   // **`_tombstone` は「いつか消された」の記録であって「今も消えている」ではない。**
   // 同じ取り込みの中で作り直された行が、この子より**後**に処理されることがあり、
   // そのとき tombstone だけを見て子を捨てると、親は蘇ったのに子だけ失われる（実測）。
   // 取り込み元にその行が現存するかを見て、作り直されたものは「消えていない」と扱う
   // （`applyTombstoneDelete` が tombstone を無視するのと同じ物差し）。
-  return !(
-    isResurrected?.(tableName, recordId, tombstone.deletedAt) ?? false
-  );
+  return !(isResurrected?.(tableName, recordId, tombstone.deletedAt) ?? false)
 }
-
 
 /**
  * ローカル `_tombstone` に、指定レコードの削除が `recordTimestamp` と同時刻以降で
@@ -215,9 +208,9 @@ export function isShadowedByTombstone(
   recordId: string,
   recordTimestamp: string
 ): boolean {
-  const ts = readTombstoneClaim(localDb, tableName, recordId);
-  if (ts === null) return false;
+  const ts = readTombstoneClaim(localDb, tableName, recordId)
+  if (ts === null) return false
 
   // record が削除より「厳密に新しい」場合のみ採用。さもなくば（同時刻含め）削除が勝つ。
-  return !isLaterTimestamp(localDb, recordTimestamp, ts.deletedAt);
+  return !isLaterTimestamp(localDb, recordTimestamp, ts.deletedAt)
 }

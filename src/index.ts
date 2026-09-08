@@ -35,7 +35,7 @@
  *
  * @packageDocumentation
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 import {
   SyncConfig,
   SyncInstance,
@@ -44,10 +44,10 @@ import {
   SyncEvent,
   SyncEventCallback,
   DEFAULTS,
-} from './types';
-import { discoverTables, validateDatabase } from './validator';
-import { setupChangelog, writeSchemaVersion, computeSchemaHash } from './setup';
-import { performSync } from './sync';
+} from './types'
+import { discoverTables, validateDatabase } from './validator'
+import { setupChangelog, writeSchemaVersion, computeSchemaHash } from './setup'
+import { performSync } from './sync'
 
 /**
  * 同期インスタンスを作成する。
@@ -74,11 +74,11 @@ import { performSync } from './sync';
  * ```
  */
 export function setupSync(config: SyncConfig): SyncInstance {
-  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey;
+  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
 
   // ローカルDB接続
-  const db = new Database(config.dbPath);
-  db.pragma('journal_mode = WAL');
+  const db = new Database(config.dbPath)
+  db.pragma('journal_mode = WAL')
 
   // 同期対象テーブルを自動検出
   const tables = discoverTables(db, {
@@ -86,15 +86,15 @@ export function setupSync(config: SyncConfig): SyncInstance {
     excludeTables: config.excludeTables,
     tableOptions: config.tableOptions,
     onWarning: config.onDiscoveryWarning,
-  });
+  })
 
   if (tables.length === 0) {
-    db.close();
+    db.close()
     throw new Error(
       `No sync tables discovered in ${config.dbPath}. ` +
         `Ensure tables exist with "${primaryKey}" and "updatedAt" columns ` +
         `(or pass tableOptions to use a different timestamp column).`
-    );
+    )
   }
 
   // 検出結果をログ出力（デバッグおよび「想定とのズレ」の早期発見用）
@@ -103,43 +103,46 @@ export function setupSync(config: SyncConfig): SyncInstance {
     `[sqlite-nas-sync] Auto-detected ${tables.length} sync table(s): ${tables
       .map((t) => t.name)
       .join(', ')}`
-  );
+  )
 
   // バリデーション（discoverTablesは存在チェック済みだが、PK型まではチェックしない）
-  const errors = validateDatabase(db, tables, primaryKey);
+  const errors = validateDatabase(db, tables, primaryKey)
   if (errors.length > 0) {
-    db.close();
+    db.close()
     throw new Error(
       `Validation failed:\n${errors.map((e) => `  ${e.table}: ${e.message}`).join('\n')}`
-    );
+    )
   }
 
   // _changelog / _sync_state / _sync_meta / トリガー 作成
-  setupChangelog(db, tables, primaryKey);
+  setupChangelog(db, tables, primaryKey)
 
   // schemaVersion: 明示指定がなければテーブルスキーマから自動生成
   const resolvedSchemaVersion =
-    config.schemaVersion ?? computeSchemaHash(db, tables);
-  writeSchemaVersion(db, resolvedSchemaVersion);
+    config.schemaVersion ?? computeSchemaHash(db, tables)
+  writeSchemaVersion(db, resolvedSchemaVersion)
 
   // configにresolved値を反映（performSyncで参照される）
-  const resolvedConfig: SyncConfig = { ...config, schemaVersion: resolvedSchemaVersion };
+  const resolvedConfig: SyncConfig = {
+    ...config,
+    schemaVersion: resolvedSchemaVersion,
+  }
 
   // 検出済みテーブル名のスナップショット
-  const syncedTableNames = tables.map((t) => t.name);
+  const syncedTableNames = tables.map((t) => t.name)
 
   // 内部状態
-  let intervalHandle: ReturnType<typeof setInterval> | null = null;
-  let isSyncing = false;
-  let lastSyncedAt: Date | null = null;
-  let lastResult: SyncResult | null = null;
-  const listeners = new Map<SyncEvent, SyncEventCallback[]>();
+  let intervalHandle: ReturnType<typeof setInterval> | null = null
+  let isSyncing = false
+  let lastSyncedAt: Date | null = null
+  let lastResult: SyncResult | null = null
+  const listeners = new Map<SyncEvent, SyncEventCallback[]>()
 
   function emit(event: SyncEvent, data?: unknown): void {
-    const cbs = listeners.get(event) ?? [];
+    const cbs = listeners.get(event) ?? []
     for (const cb of cbs) {
       try {
-        cb(data);
+        cb(data)
       } catch {
         // リスナーのエラーは飲み込む
       }
@@ -149,42 +152,42 @@ export function setupSync(config: SyncConfig): SyncInstance {
   const instance: SyncInstance = {
     async syncNow(): Promise<SyncResult> {
       if (isSyncing) {
-        throw new Error('Sync already in progress');
+        throw new Error('Sync already in progress')
       }
 
-      isSyncing = true;
-      emit('sync:start');
+      isSyncing = true
+      emit('sync:start')
 
       try {
-        const result = await performSync(db, resolvedConfig, tables);
-        lastResult = result;
-        lastSyncedAt = new Date();
-        emit('sync:complete', result);
-        return result;
+        const result = await performSync(db, resolvedConfig, tables)
+        lastResult = result
+        lastSyncedAt = new Date()
+        emit('sync:complete', result)
+        return result
       } catch (error) {
-        emit('sync:error', error);
-        throw error;
+        emit('sync:error', error)
+        throw error
       } finally {
-        isSyncing = false;
+        isSyncing = false
       }
     },
 
     start(): void {
-      if (intervalHandle) return;
-      const ms = resolvedConfig.intervalMs ?? DEFAULTS.intervalMs;
+      if (intervalHandle) return
+      const ms = resolvedConfig.intervalMs ?? DEFAULTS.intervalMs
       intervalHandle = setInterval(async () => {
         try {
-          await instance.syncNow();
+          await instance.syncNow()
         } catch {
           // エラーは sync:error イベントで通知済み
         }
-      }, ms);
+      }, ms)
     },
 
     stop(): void {
       if (intervalHandle) {
-        clearInterval(intervalHandle);
-        intervalHandle = null;
+        clearInterval(intervalHandle)
+        intervalHandle = null
       }
     },
 
@@ -194,30 +197,30 @@ export function setupSync(config: SyncConfig): SyncInstance {
         lastSyncedAt,
         lastResult,
         isRunning: intervalHandle !== null,
-      };
+      }
     },
 
     getSyncedTables(): string[] {
-      return [...syncedTableNames];
+      return [...syncedTableNames]
     },
 
     on(event: SyncEvent, callback: SyncEventCallback): void {
-      const existing = listeners.get(event) ?? [];
-      existing.push(callback);
-      listeners.set(event, existing);
+      const existing = listeners.get(event) ?? []
+      existing.push(callback)
+      listeners.set(event, existing)
     },
-  };
+  }
 
-  return instance;
+  return instance
 }
 
 // 公開API: テーブル自動検出
-export { discoverTables } from './validator';
+export { discoverTables } from './validator'
 
 // 公開API: レコードレベル競合解決
 // アプリ側が手動マージ（例: 同期無効化時のクライアントDB統合）を行う際に、
 // syncNowと同一のLWW競合解決（セカンダリUNIQUE違反の収束を含む）を再利用できる。
-export { applyInsert, applyUpdate, applyDelete } from './conflict';
+export { applyInsert, applyUpdate, applyDelete } from './conflict'
 
 // 公開API: 上の3つの引数・戻り値に現れる型
 export type {
@@ -225,7 +228,7 @@ export type {
   ApplyUpdateResult,
   ResurrectionProbe,
   TimestampColumnFor,
-} from './conflict';
+} from './conflict'
 
 // 公開型のre-export
 export type {
@@ -241,4 +244,4 @@ export type {
   SyncEvent,
   SyncEventCallback,
   ConflictInfo,
-} from './types';
+} from './types'

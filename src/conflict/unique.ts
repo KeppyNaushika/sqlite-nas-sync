@@ -4,28 +4,28 @@
  * @module conflict/unique
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 import {
   cachedBySchema,
   escapeIdentifier,
   foldIdentifier,
   readColumn,
-} from './schema';
-import { isPreferredOverRival } from './timestamp';
+} from './schema'
+import { isPreferredOverRival } from './timestamp'
 
 /** @internal SQLiteの `PRAGMA index_list` が返す行 */
 export interface IndexListRow {
-  seq: number;
-  name: string;
+  seq: number
+  name: string
   /** ユニーク索引なら 1 */
-  unique: number;
+  unique: number
   /**
    * 索引の出どころ。
    * `pk` = 主キー由来 / `u` = `UNIQUE` 宣言由来 / `c` = `CREATE UNIQUE INDEX` 由来。
    */
-  origin: string;
+  origin: string
   /** `WHERE` 付きの部分索引なら 1 */
-  partial: number;
+  partial: number
 }
 
 /**
@@ -35,16 +35,16 @@ export interface IndexListRow {
  * `name COLLATE NOCASE` で張られた索引を、列の既定照合順序で引くと相手を取り逃がす。
  */
 export interface IndexXInfoRow {
-  seqno: number;
+  seqno: number
   /** 列番号。式で張られた索引の列は -2、末尾に付く rowid は -1 */
-  cid: number;
+  cid: number
   /** 列名。式で張られた索引の列は null */
-  name: string | null;
-  desc: number;
+  name: string | null
+  desc: number
   /** その列の照合順序（`BINARY` / `NOCASE` / `RTRIM` / 利用者定義） */
-  coll: string;
+  coll: string
   /** 索引のキー列なら 1、参照用に付随しているだけなら 0 */
-  key: number;
+  key: number
 }
 
 /**
@@ -53,7 +53,7 @@ export interface IndexXInfoRow {
  */
 export interface UniqueKey {
   /** 列名と、その列を索引が使っている照合順序 */
-  columns: { name: string; collation: string }[];
+  columns: { name: string; collation: string }[]
 }
 
 /**
@@ -88,23 +88,23 @@ export function readSecondaryUniqueKeys(
   return cachedBySchema(db, `uniq:${foldIdentifier(tableName)}`, () => {
     const indexes = db
       .prepare(`PRAGMA index_list(${escapeIdentifier(tableName)})`)
-      .all() as IndexListRow[];
+      .all() as IndexListRow[]
 
-    const uniqueKeys: UniqueKey[] = [];
+    const uniqueKeys: UniqueKey[] = []
     for (const index of indexes) {
-      if (index.unique !== 1) continue;
-      if (index.origin === 'pk') continue;
-      if (index.partial !== 0) continue;
+      if (index.unique !== 1) continue
+      if (index.origin === 'pk') continue
+      if (index.partial !== 0) continue
 
       const indexColumns = (
         db
           .prepare(`PRAGMA index_xinfo(${escapeIdentifier(index.name)})`)
           .all() as IndexXInfoRow[]
-      ).filter((indexColumn) => indexColumn.key === 1);
+      ).filter((indexColumn) => indexColumn.key === 1)
 
       // 式で張られた索引は列の値から引けない
       if (indexColumns.some((indexColumn) => indexColumn.name === null)) {
-        continue;
+        continue
       }
 
       uniqueKeys.push({
@@ -112,10 +112,10 @@ export function readSecondaryUniqueKeys(
           name: String(indexColumn.name),
           collation: indexColumn.coll,
         })),
-      });
+      })
     }
-    return uniqueKeys;
-  });
+    return uniqueKeys
+  })
 }
 
 /**
@@ -127,7 +127,7 @@ export function readSecondaryUniqueKeys(
  * @internal
  */
 export function primaryKeyAsUniqueKey(primaryKey: string): UniqueKey {
-  return { columns: [{ name: primaryKey, collation: 'BINARY' }] };
+  return { columns: [{ name: primaryKey, collation: 'BINARY' }] }
 }
 
 /**
@@ -156,33 +156,33 @@ export function findUniqueRivals(
   selfId: unknown,
   uniqueKeys: UniqueKey[]
 ): Record<string, unknown>[] {
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedPk = escapeIdentifier(primaryKey);
-  const rivalsById = new Map<string, Record<string, unknown>>();
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedPk = escapeIdentifier(primaryKey)
+  const rivalsById = new Map<string, Record<string, unknown>>()
 
   for (const uniqueKey of uniqueKeys) {
-    const values = uniqueKey.columns.map((column) => record[column.name]);
-    if (values.some((value) => value === null || value === undefined)) continue;
+    const values = uniqueKey.columns.map((column) => record[column.name])
+    if (values.some((value) => value === null || value === undefined)) continue
 
     const matchClause = uniqueKey.columns
       .map(
         (column) =>
           `${escapeIdentifier(column.name)} = ? COLLATE ${escapeIdentifier(column.collation)}`
       )
-      .join(' AND ');
+      .join(' AND ')
 
     const rows = db
       .prepare(
         `SELECT * FROM ${escapedTable} WHERE ${matchClause} AND ${escapedPk} IS NOT ?`
       )
-      .all(...values, selfId) as Record<string, unknown>[];
+      .all(...values, selfId) as Record<string, unknown>[]
 
     for (const row of rows) {
-      rivalsById.set(String(readColumn(row, primaryKey)), row);
+      rivalsById.set(String(readColumn(row, primaryKey)), row)
     }
   }
 
-  return Array.from(rivalsById.values());
+  return Array.from(rivalsById.values())
 }
 
 /**
@@ -202,7 +202,7 @@ export function selectSurvivingRival(
     isPreferredOverRival(db, rivalRow, survivor, timestampColumn, primaryKey)
       ? rivalRow
       : survivor
-  );
+  )
 }
 
 /**
@@ -221,6 +221,5 @@ export function outranksAllRivals(
 ): boolean {
   return rivalRows.every((rivalRow) =>
     isPreferredOverRival(db, record, rivalRow, timestampColumn, primaryKey)
-  );
+  )
 }
-

@@ -5,16 +5,16 @@
  * `applyUpdate` / `applyDelete` は `conflict-update.test.ts`、
  * ユニークを索引から先に数える話と子の引き取りは `conflict-unique.test.ts` にある。
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
-import { applyInsert } from '../src/conflict';
-import { setupChangelog } from '../src/setup';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import Database from 'better-sqlite3'
+import { applyInsert } from '../src/conflict'
+import { setupChangelog } from '../src/setup'
 
-let db: Database.Database;
-const columns = ['id', 'name', 'email', 'updatedAt'];
+let db: Database.Database
+const columns = ['id', 'name', 'email', 'updatedAt']
 
 beforeEach(() => {
-  db = new Database(':memory:');
+  db = new Database(':memory:')
   db.exec(`
     CREATE TABLE users (
       id TEXT PRIMARY KEY,
@@ -22,97 +22,121 @@ beforeEach(() => {
       email TEXT NOT NULL UNIQUE,
       updatedAt TEXT NOT NULL
     )
-  `);
-});
+  `)
+})
 
 afterEach(() => {
-  db.close();
-});
+  db.close()
+})
 
 describe('applyInsert', () => {
   it('新規レコードを挿入する', () => {
-    const result = applyInsert(db, 'users', 'id', {
-      id: 'u1',
-      name: 'Alice',
-      email: 'alice@example.com',
-      updatedAt: '2024-01-01T00:00:00Z',
-    }, columns);
+    const result = applyInsert(
+      db,
+      'users',
+      'id',
+      {
+        id: 'u1',
+        name: 'Alice',
+        email: 'alice@example.com',
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
+      columns
+    )
 
-    expect(result.action).toBe('inserted');
-    expect(result.conflict).toBeUndefined();
+    expect(result.action).toBe('inserted')
+    expect(result.conflict).toBeUndefined()
 
-    const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
-    expect(row.name).toBe('Alice');
-  });
+    const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any
+    expect(row.name).toBe('Alice')
+  })
 
   it('PK重複時はUPSERTする（リモートが新しい場合）', () => {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z')
 
-    const result = applyInsert(db, 'users', 'id', {
-      id: 'u1',
-      name: 'Alice Updated',
-      email: 'alice.new@example.com',
-      updatedAt: '2024-06-01T00:00:00Z',
-    }, columns);
+    const result = applyInsert(
+      db,
+      'users',
+      'id',
+      {
+        id: 'u1',
+        name: 'Alice Updated',
+        email: 'alice.new@example.com',
+        updatedAt: '2024-06-01T00:00:00Z',
+      },
+      columns
+    )
 
-    expect(result.action).toBe('upserted');
-    expect(result.conflict?.resolution).toBe('remote_wins');
+    expect(result.action).toBe('upserted')
+    expect(result.conflict?.resolution).toBe('remote_wins')
 
-    const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
-    expect(row.name).toBe('Alice Updated');
-  });
+    const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any
+    expect(row.name).toBe('Alice Updated')
+  })
 
   it('セカンダリUNIQUE違反（別ID・同一ユニークキー）でリモートが新しい場合、ローカル行を置換する', () => {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z')
 
     // 異なるIDだが同じemail、リモートの方が新しい
-    const result = applyInsert(db, 'users', 'id', {
-      id: 'u2',
-      name: 'Alice Clone',
-      email: 'alice@example.com',
-      updatedAt: '2024-06-01T00:00:00Z',
-    }, columns);
+    const result = applyInsert(
+      db,
+      'users',
+      'id',
+      {
+        id: 'u2',
+        name: 'Alice Clone',
+        email: 'alice@example.com',
+        updatedAt: '2024-06-01T00:00:00Z',
+      },
+      columns
+    )
 
-    expect(result.action).toBe('upserted');
-    expect(result.conflict?.resolution).toBe('remote_wins');
+    expect(result.action).toBe('upserted')
+    expect(result.conflict?.resolution).toBe('remote_wins')
 
     // 敗者（u1）は削除され、勝者（u2）が存在する
-    const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1');
-    const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any;
-    expect(u1).toBeUndefined();
-    expect(u2.name).toBe('Alice Clone');
-  });
+    const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1')
+    const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2') as any
+    expect(u1).toBeUndefined()
+    expect(u2.name).toBe('Alice Clone')
+  })
 
   it('セカンダリUNIQUE違反でローカルが新しい場合、リモート行を採用しない', () => {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z')
 
-    const result = applyInsert(db, 'users', 'id', {
-      id: 'u2',
-      name: 'Alice Clone',
-      email: 'alice@example.com',
-      updatedAt: '2024-01-01T00:00:00Z',
-    }, columns);
+    const result = applyInsert(
+      db,
+      'users',
+      'id',
+      {
+        id: 'u2',
+        name: 'Alice Clone',
+        email: 'alice@example.com',
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
+      columns
+    )
 
     // 届いた行は書いていないので `skipped`（勝ったのはローカルの u1）
-    expect(result.action).toBe('skipped');
-    expect(result.conflict?.resolution).toBe('local_wins');
+    expect(result.action).toBe('skipped')
+    expect(result.conflict?.resolution).toBe('local_wins')
 
     // ローカル（u1）が保持され、リモート（u2）は挿入されない
-    const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any;
-    const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2');
-    expect(u1.name).toBe('Alice');
-    expect(u2).toBeUndefined();
-  });
-});
+    const u1 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u1') as any
+    const u2 = db.prepare(`SELECT * FROM users WHERE id = ?`).get('u2')
+    expect(u1.name).toBe('Alice')
+    expect(u2).toBeUndefined()
+  })
+})
 
 describe('applyInsert: 敗者行の子の引き取り', () => {
-  const orderColumns = ['id', 'userId', 'label', 'updatedAt'];
+  const orderColumns = ['id', 'userId', 'label', 'updatedAt']
 
   beforeEach(() => {
     db.exec(`
@@ -122,16 +146,16 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         label     TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
-    `);
-  });
+    `)
+  })
 
   it('トランザクションの外から呼んでも、敗者の子が勝者へ付け替えられる', () => {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z')
     db.prepare(
       `INSERT INTO orders (id, userId, label, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('o1', 'u1', '注文1', '2024-01-01T00:00:00Z');
+    ).run('o1', 'u1', '注文1', '2024-01-01T00:00:00Z')
 
     const result = applyInsert(
       db,
@@ -144,12 +168,14 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         updatedAt: '2024-06-01T00:00:00Z',
       },
       columns
-    );
+    )
 
-    expect(result.conflict?.resolution).toBe('remote_wins');
-    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
-    expect(order.userId).toBe('u2');
-  });
+    expect(result.conflict?.resolution).toBe('remote_wins')
+    const order = db
+      .prepare(`SELECT * FROM orders WHERE id = ?`)
+      .get('o1') as any
+    expect(order.userId).toBe('u2')
+  })
 
   it('親と主キーを共有する子（1:1）では、子のidが動いても孫が付いてくる', () => {
     db.exec(`
@@ -158,7 +184,7 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         bio       TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
-    `);
+    `)
     db.exec(`
       CREATE TABLE profile_notes (
         id        TEXT PRIMARY KEY,
@@ -166,17 +192,17 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         body      TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
-    `);
+    `)
 
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z')
     db.prepare(
       `INSERT INTO profiles (id, bio, updatedAt) VALUES (?, ?, ?)`
-    ).run('u1', '自己紹介', '2024-01-01T00:00:00Z');
+    ).run('u1', '自己紹介', '2024-01-01T00:00:00Z')
     db.prepare(
       `INSERT INTO profile_notes (id, profileId, body, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('n1', 'u1', 'メモ', '2024-01-01T00:00:00Z');
+    ).run('n1', 'u1', 'メモ', '2024-01-01T00:00:00Z')
 
     applyInsert(
       db,
@@ -189,19 +215,21 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         updatedAt: '2024-06-01T00:00:00Z',
       },
       columns
-    );
+    )
 
-    const profile = db.prepare(`SELECT * FROM profiles`).all() as any[];
-    expect(profile).toHaveLength(1);
-    expect(profile[0].id).toBe('u2');
-    const note = db.prepare(`SELECT * FROM profile_notes WHERE id = ?`).get('n1') as any;
-    expect(note.profileId).toBe('u2');
-  });
+    const profile = db.prepare(`SELECT * FROM profiles`).all() as any[]
+    expect(profile).toHaveLength(1)
+    expect(profile[0].id).toBe('u2')
+    const note = db
+      .prepare(`SELECT * FROM profile_notes WHERE id = ?`)
+      .get('n1') as any
+    expect(note.profileId).toBe('u2')
+  })
 
   it('ローカルが勝った場合、あとから届く敗者の子は勝者へ向け直して挿入される', () => {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z');
+    ).run('u1', 'Alice', 'alice@example.com', '2024-06-01T00:00:00Z')
 
     // リモートのu2は古いので採用されない（が、対応は記録される）
     applyInsert(
@@ -215,25 +243,32 @@ describe('applyInsert: 敗者行の子の引き取り', () => {
         updatedAt: '2024-01-01T00:00:00Z',
       },
       columns
-    );
+    )
 
     // 存在しないu2を指す子が遅れて届く
     const result = applyInsert(
       db,
       'orders',
       'id',
-      { id: 'o2', userId: 'u2', label: '注文2', updatedAt: '2024-01-01T00:00:00Z' },
+      {
+        id: 'o2',
+        userId: 'u2',
+        label: '注文2',
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
       orderColumns
-    );
+    )
 
-    expect(result.action).toBe('inserted');
-    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o2') as any;
-    expect(order.userId).toBe('u1');
-  });
-});
+    expect(result.action).toBe('inserted')
+    const order = db
+      .prepare(`SELECT * FROM orders WHERE id = ?`)
+      .get('o2') as any
+    expect(order.userId).toBe('u1')
+  })
+})
 
 describe('畳み先の記録', () => {
-  const orderColumns = ['id', 'userId', 'label', 'updatedAt'];
+  const orderColumns = ['id', 'userId', 'label', 'updatedAt']
 
   beforeEach(() => {
     db.exec(`
@@ -243,15 +278,15 @@ describe('畳み先の記録', () => {
         label     TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
-    `);
+    `)
     // _tombstone / _changelog / トリガーを実際の形で用意する
-    setupChangelog(db, [{ name: 'users' }, { name: 'orders' }], 'id');
-  });
+    setupChangelog(db, [{ name: 'users' }, { name: 'orders' }], 'id')
+  })
 
   function insertUser(id: string, updatedAt: string): void {
     db.prepare(
       `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-    ).run(id, id, 'alice@example.com', updatedAt);
+    ).run(id, id, 'alice@example.com', updatedAt)
   }
 
   function foldIn(id: string, updatedAt: string): void {
@@ -261,7 +296,7 @@ describe('畳み先の記録', () => {
       'id',
       { id, name: id, email: 'alice@example.com', updatedAt },
       columns
-    );
+    )
   }
 
   function idMerges(): string[] {
@@ -269,7 +304,7 @@ describe('畳み先の記録', () => {
       db
         .prepare(`SELECT losingId, winningId FROM _id_merge ORDER BY losingId`)
         .all() as { losingId: string; winningId: string }[]
-    ).map((merge) => `${merge.losingId}->${merge.winningId}`);
+    ).map((merge) => `${merge.losingId}->${merge.winningId}`)
   }
 
   function tombstoneMerges(): string[] {
@@ -279,55 +314,71 @@ describe('畳み先の記録', () => {
           `SELECT recordId, mergedInto FROM _tombstone ORDER BY recordId`
         )
         .all() as { recordId: string; mergedInto: string | null }[]
-    ).map((tombstone) => `${tombstone.recordId}->${tombstone.mergedInto ?? 'null'}`);
+    ).map(
+      (tombstone) => `${tombstone.recordId}->${tombstone.mergedInto ?? 'null'}`
+    )
   }
 
   it('畳み先が更に畳まれたら、記録は終端へ張り替えられる（鎖にしない）', () => {
-    insertUser('u-bbb', '2024-01-01T00:00:00Z');
-    foldIn('u-aaa', '2024-06-01T00:00:00Z'); // bbb → aaa
-    foldIn('u-ccc', '2024-12-01T00:00:00Z'); // aaa → ccc
+    insertUser('u-bbb', '2024-01-01T00:00:00Z')
+    foldIn('u-aaa', '2024-06-01T00:00:00Z') // bbb → aaa
+    foldIn('u-ccc', '2024-12-01T00:00:00Z') // aaa → ccc
 
     // u-bbb → u-aaa の鎖が残らず、どちらも終端の u-ccc を指す
-    expect(idMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc']);
-    expect(tombstoneMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc']);
+    expect(idMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc'])
+    expect(tombstoneMerges()).toEqual(['u-aaa->u-ccc', 'u-bbb->u-ccc'])
 
     // 最初の敗者を指す子も、1段で終端へ届く
     applyInsert(
       db,
       'orders',
       'id',
-      { id: 'o1', userId: 'u-bbb', label: '注文1', updatedAt: '2024-01-01T00:00:00Z' },
+      {
+        id: 'o1',
+        userId: 'u-bbb',
+        label: '注文1',
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
       orderColumns
-    );
-    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
-    expect(order.userId).toBe('u-ccc');
-  });
+    )
+    const order = db
+      .prepare(`SELECT * FROM orders WHERE id = ?`)
+      .get('o1') as any
+    expect(order.userId).toBe('u-ccc')
+  })
 
   it('畳む向きが反転しても、自分自身を指す記録が残らない', () => {
-    insertUser('u-aaa', '2024-06-01T00:00:00Z');
+    insertUser('u-aaa', '2024-06-01T00:00:00Z')
     // 古い u-bbb が届く → ローカルが勝ち、u-bbb → u-aaa を記録する
-    foldIn('u-bbb', '2024-01-01T00:00:00Z');
-    expect(idMerges()).toEqual(['u-bbb->u-aaa']);
+    foldIn('u-bbb', '2024-01-01T00:00:00Z')
+    expect(idMerges()).toEqual(['u-bbb->u-aaa'])
 
     // その後 u-bbb に、畳みより新しい更新が届く → 向きが反転して u-aaa が畳まれる
-    foldIn('u-bbb', '2099-01-01T00:00:00Z');
+    foldIn('u-bbb', '2099-01-01T00:00:00Z')
 
     expect(
       db.prepare(`SELECT id FROM users`).all() as { id: string }[]
-    ).toEqual([{ id: 'u-bbb' }]);
+    ).toEqual([{ id: 'u-bbb' }])
     // u-bbb->u-bbb のような自分自身を指す記録は残さない
-    expect(idMerges()).toEqual(['u-aaa->u-bbb']);
-    expect(tombstoneMerges()).toEqual(['u-aaa->u-bbb', 'u-bbb->null']);
+    expect(idMerges()).toEqual(['u-aaa->u-bbb'])
+    expect(tombstoneMerges()).toEqual(['u-aaa->u-bbb', 'u-bbb->null'])
 
     // 反転後の敗者を指す子も、生き残った側へ向く
     applyInsert(
       db,
       'orders',
       'id',
-      { id: 'o1', userId: 'u-aaa', label: '注文1', updatedAt: '2024-06-01T00:00:00Z' },
+      {
+        id: 'o1',
+        userId: 'u-aaa',
+        label: '注文1',
+        updatedAt: '2024-06-01T00:00:00Z',
+      },
       orderColumns
-    );
-    const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get('o1') as any;
-    expect(order.userId).toBe('u-bbb');
-  });
-});
+    )
+    const order = db
+      .prepare(`SELECT * FROM orders WHERE id = ?`)
+      .get('o1') as any
+    expect(order.userId).toBe('u-bbb')
+  })
+})

@@ -8,19 +8,19 @@
  * @module conflict/merged-delete
  * @internal
  */
-import Database from 'better-sqlite3';
-import { RecordFold } from '../types';
-import { escapeIdentifier, readColumn } from './schema';
+import Database from 'better-sqlite3'
+import { RecordFold } from '../types'
+import { escapeIdentifier, readColumn } from './schema'
 import {
   foldTimestampOf,
   isLaterTimestamp,
   TimestampColumnFor,
-} from './timestamp';
-import { hasIdMerges, recordMerge, resolveFoldChain } from './ledger';
-import { ResurrectionProbe } from './tombstone';
-import { remapMergedForeignKeys } from './remap';
-import { foldAndReplace, foldRowInto } from './fold';
-import { runDeferringForeignKeys } from './transaction';
+} from './timestamp'
+import { hasIdMerges, recordMerge, resolveFoldChain } from './ledger'
+import { ResurrectionProbe } from './tombstone'
+import { remapMergedForeignKeys } from './remap'
+import { foldAndReplace, foldRowInto } from './fold'
+import { runDeferringForeignKeys } from './transaction'
 
 /**
  * 「この行は消えたのではなく、あの行へ畳まれた」という削除をローカルへ適用する。
@@ -61,27 +61,27 @@ export function applyMergedDelete(
   isResurrected?: ResurrectionProbe,
   timestampColumnFor?: TimestampColumnFor
 ): { action: 'folded' | 'skipped'; folds: RecordFold[]; warnings: string[] } {
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedPk = escapeIdentifier(primaryKey);
-  const folds: RecordFold[] = [];
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedPk = escapeIdentifier(primaryKey)
+  const folds: RecordFold[] = []
 
   // 呼び出し元が読んだ勝者行は、この id のもの（鎖を辿る前の畳み先）
-  const requestedWinningId = winningId;
+  const requestedWinningId = winningId
 
   // 届いた畳み先が、こちらでは既に別の行へ畳まれていることがある
   // （`_tombstone.mergedInto` は同期で渡るので `A→C` と `C→B` の鎖がそのまま届く。実測）。
   // 中間の `C` は既に死んでいるため、そのまま使うと「畳み先が見つからない」と判断して
   // 敗者行を畳めない。終端まで辿ってから探す。
   if (hasIdMerges(localDb)) {
-    winningId = resolveFoldChain(localDb, tableName, winningId, losingId);
+    winningId = resolveFoldChain(localDb, tableName, winningId, losingId)
     if (losingId === winningId) {
-      return { action: 'skipped', folds, warnings: [] };
+      return { action: 'skipped', folds, warnings: [] }
     }
   }
 
   const losingRow = localDb
     .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-    .get(losingId) as Record<string, unknown> | undefined;
+    .get(losingId) as Record<string, unknown> | undefined
 
   // 敗者行がこの畳みより後に更新されていれば、畳みは既に古い判断である。
   // `_id_merge` にも書かない（行が生きているので、その子は今のままで正しい）。
@@ -94,14 +94,14 @@ export function applyMergedDelete(
       foldedAt
     )
   ) {
-    return { action: 'skipped', folds, warnings: [] };
+    return { action: 'skipped', folds, warnings: [] }
   }
 
   const localWinningRow = losingRow
     ? (localDb
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
         .get(winningId) as Record<string, unknown> | undefined)
-    : undefined;
+    : undefined
 
   // **渡された勝者行は、鎖を辿る前の畳み先のもの。** 終端が動いていたら、その行は
   // ここで入れてよい行ではない。入れると、**この端末が既に畳んで tombstone まで
@@ -137,7 +137,8 @@ export function applyMergedDelete(
   // ためだけに残してある（渡された行をそのまま入れると別の id が復活する）。
   const foldTargetMoved =
     winningId !== requestedWinningId ||
-    (winningRow !== undefined && String(readColumn(winningRow, primaryKey)) !== winningId);
+    (winningRow !== undefined &&
+      String(readColumn(winningRow, primaryKey)) !== winningId)
 
   if (losingRow && !localWinningRow && foldTargetMoved) {
     return {
@@ -148,7 +149,7 @@ export function applyMergedDelete(
           `the fold target has moved and its row is not here. ` +
           `${losingId} stays until ${winningId} arrives.`,
       ],
-    };
+    }
   }
 
   // **勝者行の読み替えは、帳簿へ書く前に済ませる。** 勝者行そのものが消えた親を
@@ -166,17 +167,17 @@ export function applyMergedDelete(
           isResurrected,
           timestampColumnFor
         )
-      : null;
+      : null
   if (remap && remap.record === null) {
-    return { action: 'skipped', folds, warnings: remap.warnings };
+    return { action: 'skipped', folds, warnings: remap.warnings }
   }
-  const remappedWinner = remap?.record ?? null;
+  const remappedWinner = remap?.record ?? null
 
   // 畳みを実行できるかに関わらず、敗者idの読み替えは先に覚える。
   // これが無いと、あとから届く敗者の子が存在しない親を指したままになる。
-  recordMerge(localDb, tableName, losingId, winningId, foldedAt);
+  recordMerge(localDb, tableName, losingId, winningId, foldedAt)
 
-  if (!losingRow) return { action: 'skipped', folds, warnings: [] };
+  if (!losingRow) return { action: 'skipped', folds, warnings: [] }
 
   if (localWinningRow) {
     runDeferringForeignKeys(localDb, () => {
@@ -195,9 +196,9 @@ export function applyMergedDelete(
         // まだ届いていない新しい版が捨てられる範囲が広がっていく。
         // 判断の時刻が分からないとき（公開APIを直接呼ぶ場合）だけ、勝ち残る行の版に落とす。
         foldedAt ?? foldTimestampOf(localWinningRow, timestampColumn)
-      );
-    });
-    return { action: 'folded', folds, warnings: [] };
+      )
+    })
+    return { action: 'folded', folds, warnings: [] }
   }
 
   if (winningRow && remap && remappedWinner) {
@@ -216,10 +217,10 @@ export function applyMergedDelete(
       // 適用しているのは**よそで下された1回の判断**。その時刻をそのまま刻む
       // （勝者行がその後に編集されていても、畳みが決まった時刻は動かない）。
       foldedAt
-    );
-    return { action: 'folded', folds, warnings: remap.warnings };
+    )
+    return { action: 'folded', folds, warnings: remap.warnings }
   }
 
   // 畳み先がどこにも無い → 敗者行はそのまま残す（消すと子が道連れになる）
-  return { action: 'skipped', folds, warnings: [] };
+  return { action: 'skipped', folds, warnings: [] }
 }

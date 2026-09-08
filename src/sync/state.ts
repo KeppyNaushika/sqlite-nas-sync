@@ -8,10 +8,10 @@
  * @module sync/state
  * @internal
  */
-import Database from 'better-sqlite3';
-import { ChangelogEntry, SyncResult } from '../types';
-import { foldIdentifier } from '../conflict/schema';
-import { NOW_SQL } from '../setup';
+import Database from 'better-sqlite3'
+import { ChangelogEntry, SyncResult } from '../types'
+import { foldIdentifier } from '../conflict/schema'
+import { NOW_SQL } from '../setup'
 
 /**
  * 同一レコード（tableName:recordId）の重複changelogエントリを、
@@ -23,15 +23,17 @@ import { NOW_SQL } from '../setup';
  *
  * @internal
  */
-export function deduplicateEntries(entries: ChangelogEntry[]): ChangelogEntry[] {
-  const map = new Map<string, ChangelogEntry>();
+export function deduplicateEntries(
+  entries: ChangelogEntry[]
+): ChangelogEntry[] {
+  const map = new Map<string, ChangelogEntry>()
   for (const entry of entries) {
     // 表名は大小を畳んで1件にまとめる（綴り違いで届いた同じ行を二度処理しない）。
     // id の方は**データ**なので畳まない
-    const key = `${foldIdentifier(entry.tableName)}:${entry.recordId}`;
-    map.set(key, entry);
+    const key = `${foldIdentifier(entry.tableName)}:${entry.recordId}`
+    map.set(key, entry)
   }
-  return Array.from(map.values());
+  return Array.from(map.values())
 }
 
 /**
@@ -47,10 +49,9 @@ export function getSyncState(
       `SELECT lastSeenId, lastSyncedAt FROM _sync_state WHERE remoteClientId = ?`
     )
     .get(remoteClientId) as
-    | { lastSeenId: number; lastSyncedAt: string | null }
-    | undefined;
+    { lastSeenId: number; lastSyncedAt: string | null } | undefined
 
-  return row ?? { lastSeenId: 0, lastSyncedAt: null };
+  return row ?? { lastSeenId: 0, lastSyncedAt: null }
 }
 
 /**
@@ -67,7 +68,7 @@ export function updateSyncState(
       `INSERT OR REPLACE INTO _sync_state (remoteClientId, lastSeenId, lastSyncedAt)
        VALUES (?, ?, ${NOW_SQL})`
     )
-    .run(remoteClientId, lastSeenId);
+    .run(remoteClientId, lastSeenId)
 }
 
 /**
@@ -78,14 +79,16 @@ export function updateSyncState(
  * @internal
  */
 export function updateHeartbeat(localDb: Database.Database): void {
-  const today = new Date().toISOString().slice(0, 10); // "2026-03-27"
-  const noon = `${today}T12:00:00Z`;
-  const HEARTBEAT_ID = '00000000-0000-0000-0000-000000000000';
+  const today = new Date().toISOString().slice(0, 10) // "2026-03-27"
+  const noon = `${today}T12:00:00Z`
+  const HEARTBEAT_ID = '00000000-0000-0000-0000-000000000000'
 
-  localDb.prepare(
-    `INSERT INTO _heartbeat (id, updatedAt) VALUES (?, ?)
+  localDb
+    .prepare(
+      `INSERT INTO _heartbeat (id, updatedAt) VALUES (?, ?)
      ON CONFLICT(id) DO UPDATE SET updatedAt = ? WHERE updatedAt < ?`
-  ).run(HEARTBEAT_ID, noon, noon, noon);
+    )
+    .run(HEARTBEAT_ID, noon, noon, noon)
 }
 
 /**
@@ -102,9 +105,9 @@ export function recordSkippedRemote(
   remoteVersion: string | null,
   localVersion: string
 ): void {
-  if (result.skippedRemotes.some((s) => s.clientId === clientId)) return;
-  result.skippedRemotes.push({ clientId, remoteVersion, localVersion });
+  if (result.skippedRemotes.some((s) => s.clientId === clientId)) return
+  result.skippedRemotes.push({ clientId, remoteVersion, localVersion })
   result.warnings.push(
     `Skipping client ${clientId}: schema version mismatch (local=${localVersion}, remote=${remoteVersion ?? 'unknown'})`
-  );
+  )
 }

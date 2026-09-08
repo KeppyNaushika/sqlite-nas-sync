@@ -3,8 +3,8 @@
  *
  * @module changelog
  */
-import Database from 'better-sqlite3';
-import { ChangelogEntry } from './types';
+import Database from 'better-sqlite3'
+import { ChangelogEntry } from './types'
 
 /**
  * 指定IDより後のchangelogエントリを取得する。
@@ -18,8 +18,10 @@ export function readChangelog(
   sinceId: number
 ): ChangelogEntry[] {
   return db
-    .prepare(`SELECT id, tableName, recordId, operation, changedAt FROM _changelog WHERE id > ? ORDER BY id`)
-    .all(sinceId) as ChangelogEntry[];
+    .prepare(
+      `SELECT id, tableName, recordId, operation, changedAt FROM _changelog WHERE id > ? ORDER BY id`
+    )
+    .all(sinceId) as ChangelogEntry[]
 }
 
 /**
@@ -31,10 +33,10 @@ export function readChangelog(
  * @returns 最大のchangelog ID。空の場合は `0`
  */
 export function getMaxChangelogId(db: Database.Database): number {
-  const row = db
-    .prepare(`SELECT MAX(id) as maxId FROM _changelog`)
-    .get() as { maxId: number | null };
-  return row.maxId ?? 0;
+  const row = db.prepare(`SELECT MAX(id) as maxId FROM _changelog`).get() as {
+    maxId: number | null
+  }
+  return row.maxId ?? 0
 }
 
 /**
@@ -58,19 +60,19 @@ export function hasChangelogGap(
   lastSeenId: number
 ): boolean {
   if (lastSeenId === 0) {
-    return false;
+    return false
   }
 
-  const row = db
-    .prepare(`SELECT MIN(id) as minId FROM _changelog`)
-    .get() as { minId: number | null };
+  const row = db.prepare(`SELECT MIN(id) as minId FROM _changelog`).get() as {
+    minId: number | null
+  }
 
   // _changelogが空の場合もギャップ（掃除で全エントリ削除済み）
   if (row.minId === null) {
-    return true;
+    return true
   }
 
-  return row.minId > lastSeenId;
+  return row.minId > lastSeenId
 }
 
 /**
@@ -95,6 +97,6 @@ export function cleanupChangelog(
       `DELETE FROM _changelog
         WHERE julianday(changedAt) < julianday('now', '-' || ? || ' days')`
     )
-    .run(retentionDays);
-  return result.changes;
+    .run(retentionDays)
+  return result.changes
 }

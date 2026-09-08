@@ -7,8 +7,8 @@
  * @module setup/tombstone
  * @internal
  */
-import Database from 'better-sqlite3';
-import { ColumnInfo, isSameIdentifier } from './sql';
+import Database from 'better-sqlite3'
+import { ColumnInfo, isSameIdentifier } from './sql'
 
 /**
  * `_tombstone` に `mergedInto` 列が無ければ追加する（冪等）。
@@ -24,13 +24,14 @@ export function ensureTombstoneMergedIntoColumn(db: Database.Database): void {
     .prepare(
       `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
     )
-    .get();
-  if (!exists) return;
+    .get()
+  if (!exists) return
 
   const columns = db
     .prepare(`PRAGMA table_info(_tombstone)`)
-    .all() as ColumnInfo[];
-  if (columns.some((column) => isSameIdentifier(column.name, 'mergedInto'))) return;
+    .all() as ColumnInfo[]
+  if (columns.some((column) => isSameIdentifier(column.name, 'mergedInto')))
+    return
 
-  db.exec(`ALTER TABLE _tombstone ADD COLUMN mergedInto TEXT`);
+  db.exec(`ALTER TABLE _tombstone ADD COLUMN mergedInto TEXT`)
 }

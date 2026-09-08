@@ -10,24 +10,24 @@
  * @module sync/sql
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 
 /**
  * SQL識別子をダブルクォートでエスケープする。
  * @internal
  */
 export function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+  return `"${identifier.replace(/"/g, '""')}"`
 }
 
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
 export interface ColumnInfo {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: unknown;
-  pk: number;
+  cid: number
+  name: string
+  type: string
+  notnull: number
+  dflt_value: unknown
+  pk: number
 }
 
 /**
@@ -40,6 +40,6 @@ export function getTableColumns(
 ): string[] {
   const columns = db
     .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-    .all() as ColumnInfo[];
-  return columns.map((c) => c.name);
+    .all() as ColumnInfo[]
+  return columns.map((c) => c.name)
 }

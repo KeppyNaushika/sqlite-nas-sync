@@ -8,21 +8,21 @@
  * @module setup/sql
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 
 // 識別子の比較は**1か所だけ**に置く。同じ規則の実装が2つあると、片方だけ直したときに
 // もう片方が古い意味のまま残る（この規則を1か所へ集めるための変更で、実装を2つに
 // 増やしてしまったことがある）。
-export { isSameIdentifier } from '../conflict/schema';
+export { isSameIdentifier } from '../conflict/schema'
 
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
 export interface ColumnInfo {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: unknown;
-  pk: number;
+  cid: number
+  name: string
+  type: string
+  notnull: number
+  dflt_value: unknown
+  pk: number
 }
 
 /**
@@ -42,7 +42,7 @@ export interface ColumnInfo {
  * `julianday()` で正規化しているので前後は正しく決まる。
  * @internal
  */
-export const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`;
+export const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
 
 /**
  * 秒精度の `datetime('now')` で作られた古いトリガを落とす（冪等）。
@@ -61,8 +61,8 @@ export function dropStaleTrigger(db: Database.Database, name: string): void {
       `SELECT name FROM sqlite_master
         WHERE type = 'trigger' AND name = ? AND sql LIKE '%datetime(''now'')%'`
     )
-    .get(name);
-  if (stale) db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`);
+    .get(name)
+  if (stale) db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`)
 }
 
 /**
@@ -70,5 +70,5 @@ export function dropStaleTrigger(db: Database.Database, name: string): void {
  * @internal
  */
 export function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+  return `"${identifier.replace(/"/g, '""')}"`
 }

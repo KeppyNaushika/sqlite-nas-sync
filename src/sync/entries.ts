@@ -8,17 +8,17 @@
  * @module sync/entries
  * @internal
  */
-import Database from 'better-sqlite3';
-import { ChangelogEntry, RecordFold, SyncResult, TableConfig } from '../types';
+import Database from 'better-sqlite3'
+import { ChangelogEntry, RecordFold, SyncResult, TableConfig } from '../types'
 import {
   applyInsert,
   applyMergedDelete,
   applyUpdate,
   isLaterTimestamp,
-} from '../conflict';
-import type { ResurrectionProbe, TimestampColumnFor } from '../conflict';
-import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup';
-import { escapeIdentifier, getTableColumns } from './sql';
+} from '../conflict'
+import type { ResurrectionProbe, TimestampColumnFor } from '../conflict'
+import { ensureTombstoneMergedIntoColumn, NOW_SQL } from '../setup'
+import { escapeIdentifier, getTableColumns } from './sql'
 import {
   getRemoteTombstone,
   makeTableConfigLookup,
@@ -26,7 +26,7 @@ import {
   makeTimestampColumnFor,
   readRemoteRecord,
   resolveFoldTarget,
-} from './remote';
+} from './remote'
 
 /**
  * 畳みの記録を同期結果へ写す。
@@ -38,8 +38,8 @@ import {
  */
 export function recordFolds(result: SyncResult, folds: RecordFold[]): void {
   for (const fold of folds) {
-    result.folds.push(fold);
-    if (fold.removedLocalRow) result.deleted++;
+    result.folds.push(fold)
+    if (fold.removedLocalRow) result.deleted++
   }
 }
 
@@ -79,7 +79,7 @@ export function applyTombstoneDelete(
     .prepare(
       `SELECT 1 FROM sqlite_master WHERE type='table' AND name='_tombstone'`
     )
-    .get();
+    .get()
   // **畳み先が分かっている削除は、`deletedAt` もここでは書かない。**
   //
   // 「この畳みの主張を受け入れるか」は `foldClaimWins` が2つの帳簿を見て一度だけ
@@ -107,17 +107,17 @@ export function applyTombstoneDelete(
       deletedAt,
       isResurrected,
       timestampColumnFor
-    );
-    recordFolds(result, folds);
-    result.warnings.push(...warnings);
-    return;
+    )
+    recordFolds(result, folds)
+    result.warnings.push(...warnings)
+    return
   }
 
   // ここから先は**畳み先の無い、ただの削除**。
   // 「この id は消えた」という事実は畳みの判断とは独立なので、新しいときだけ進める
   // （既存の畳み先には触らないので消えない）。
   if (hasTombstone) {
-    ensureTombstoneMergedIntoColumn(localDb);
+    ensureTombstoneMergedIntoColumn(localDb)
     localDb
       .prepare(
         `INSERT INTO _tombstone (tableName, recordId, deletedAt)
@@ -132,26 +132,26 @@ export function applyTombstoneDelete(
              ELSE _tombstone.deletedAt
            END`
       )
-      .run(tableName, recordId, deletedAt);
+      .run(tableName, recordId, deletedAt)
   }
 
-  const escapedTable = escapeIdentifier(tableName);
-  const escapedPk = escapeIdentifier(primaryKey);
-  const escapedTs = escapeIdentifier(timestampColumn);
+  const escapedTable = escapeIdentifier(tableName)
+  const escapedPk = escapeIdentifier(primaryKey)
+  const escapedTs = escapeIdentifier(timestampColumn)
 
   const localRecord = localDb
     .prepare(
       `SELECT ${escapedTs} AS ts FROM ${escapedTable} WHERE ${escapedPk} = ?`
     )
-    .get(recordId) as { ts: unknown } | undefined;
-  if (!localRecord) return;
+    .get(recordId) as { ts: unknown } | undefined
+  if (!localRecord) return
 
-  const localUpdatedAt = String(localRecord.ts ?? '');
+  const localUpdatedAt = String(localRecord.ts ?? '')
   if (isLaterTimestamp(localDb, deletedAt, localUpdatedAt)) {
     localDb
       .prepare(`DELETE FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-      .run(recordId);
-    result.deleted++;
+      .run(recordId)
+    result.deleted++
   }
 }
 
@@ -172,40 +172,48 @@ export function processChangelogEntries(
   result: SyncResult
 ): void {
   // テーブルごとのカラム情報をキャッシュ
-  const columnCache = new Map<string, string[]>();
+  const columnCache = new Map<string, string[]>()
   // テーブル名 → TableConfig のマップ
   // 表名は**相手の設定どおりの綴り**で届く。大小を畳んで引く
   // （{@link makeTableConfigLookup}）
-  const tableConfigFor = makeTableConfigLookup(configTables);
+  const tableConfigFor = makeTableConfigLookup(configTables)
   // 表をまたいで時刻列を引く手続きと、作り直し判定。**取り込み1回につき1つ**
   // （レコードごとに作り直すと、表ごとの `prepare` が毎回やり直しになる）
-  const timestampColumnFor = makeTimestampColumnFor(configTables);
+  const timestampColumnFor = makeTimestampColumnFor(configTables)
   const isResurrected = makeResurrectionProbe(
     remoteDb,
     primaryKey,
     timestampColumnFor
-  );
+  )
 
   for (const entry of entries) {
     // _heartbeat エントリは特別扱い: 直接適用
     if (entry.tableName === '_heartbeat') {
-      if (entry.operation === 'DELETE') continue;
-      const escapedPk = escapeIdentifier(primaryKey);
+      if (entry.operation === 'DELETE') continue
+      const escapedPk = escapeIdentifier(primaryKey)
       const remoteRecord = remoteDb
         .prepare(`SELECT * FROM _heartbeat WHERE id = ?`)
-        .get(entry.recordId) as Record<string, unknown> | undefined;
-      if (!remoteRecord) continue;
+        .get(entry.recordId) as Record<string, unknown> | undefined
+      if (!remoteRecord) continue
 
-      const columns = columnCache.get('_heartbeat') ?? getTableColumns(localDb, '_heartbeat');
-      columnCache.set('_heartbeat', columns);
+      const columns =
+        columnCache.get('_heartbeat') ?? getTableColumns(localDb, '_heartbeat')
+      columnCache.set('_heartbeat', columns)
 
-      applyUpdate(localDb, '_heartbeat', 'id', remoteRecord, columns, 'updatedAt');
-      continue;
+      applyUpdate(
+        localDb,
+        '_heartbeat',
+        'id',
+        remoteRecord,
+        columns,
+        'updatedAt'
+      )
+      continue
     }
 
     // config.tables に含まれないテーブルはスキップ
-    const tableConfig = tableConfigFor(entry.tableName);
-    if (!tableConfig) continue;
+    const tableConfig = tableConfigFor(entry.tableName)
+    if (!tableConfig) continue
 
     // **ここから先は、こちらの設定どおりの綴りだけを使う。**
     // `entry.tableName` は**相手の設定どおりの綴り**（相手のトリガが自分の設定を
@@ -213,14 +221,14 @@ export function processChangelogEntries(
     // `_id_merge` / `_tombstone` の重複行が増える（引く側の `COLLATE NOCASE` と
     // `ORDER BY` は、その後始末をしているにすぎない）。入口で自分の綴りへ揃えれば、
     // 重複はそもそも生まれない。
-    const table = tableConfig.name;
+    const table = tableConfig.name
 
-    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
+    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt'
 
-    let columns = columnCache.get(table);
+    let columns = columnCache.get(table)
     if (!columns) {
-      columns = getTableColumns(localDb, table);
-      columnCache.set(table, columns);
+      columns = getTableColumns(localDb, table)
+      columnCache.set(table, columns)
     }
 
     if (entry.operation === 'DELETE') {
@@ -231,17 +239,17 @@ export function processChangelogEntries(
         remoteDb,
         table,
         entry.recordId
-      );
+      )
       const mergedInto = resolveFoldTarget(
         entry.recordId,
         remoteTombstone?.mergedInto
-      );
+      )
 
       // deleteProtected は「利用者操作による削除を適用しない」ための設定。
       // 畳みはユニーク制約が強制する統合であって削除ではないので、その対象外とする。
       // 見送っても行は救えない — 勝者行が届いた時点で applyInsert が同じ畳みを行うだけで、
       // それまでのあいだ子が宙に浮き、両者が同じユニークキーを送り合い続ける。
-      if (tableConfig.deleteProtected && mergedInto === null) continue;
+      if (tableConfig.deleteProtected && mergedInto === null) continue
 
       applyTombstoneDelete(
         localDb,
@@ -256,16 +264,16 @@ export function processChangelogEntries(
         result,
         isResurrected,
         timestampColumnFor
-      );
+      )
     } else {
       // INSERT or UPDATE: リモートからレコード取得
-      const escapedTable = escapeIdentifier(table);
-      const escapedPk = escapeIdentifier(primaryKey);
+      const escapedTable = escapeIdentifier(table)
+      const escapedPk = escapeIdentifier(primaryKey)
       const remoteRecord = remoteDb
         .prepare(`SELECT * FROM ${escapedTable} WHERE ${escapedPk} = ?`)
-        .get(entry.recordId) as Record<string, unknown> | undefined;
+        .get(entry.recordId) as Record<string, unknown> | undefined
 
-      if (!remoteRecord) continue; // レコードがリモートに存在しない（後続のDELETEで消えた等）
+      if (!remoteRecord) continue // レコードがリモートに存在しない（後続のDELETEで消えた等）
 
       if (entry.operation === 'INSERT') {
         const { action, conflict, folds, warnings } = applyInsert(
@@ -277,19 +285,20 @@ export function processChangelogEntries(
           timestampColumn,
           isResurrected,
           timestampColumnFor
-        );
-        if (action === 'inserted') result.inserted++;
-        if (action === 'skipped') result.skipped++;
+        )
+        if (action === 'inserted') result.inserted++
+        if (action === 'skipped') result.skipped++
         // 畳みは「消えた行」でもある。届いた行を採用しなかった場合でも、同じPKの
         // ローカル行が畳まれて消えていることがある（UPDATE 側と同じ数え方）。
         // `upserted` 自体が畳みを伴うこともあるので、二重には数えない。
-        if (action === 'upserted' || folds.length > 0) result.conflictsResolved++;
-        recordFolds(result, folds);
-        result.warnings.push(...warnings);
+        if (action === 'upserted' || folds.length > 0)
+          result.conflictsResolved++
+        recordFolds(result, folds)
+        result.warnings.push(...warnings)
         if (conflict) {
           result.warnings.push(
             `Conflict on ${table}:${entry.recordId} resolved as ${conflict.resolution}`
-          );
+          )
         }
       } else {
         // UPDATE
@@ -302,19 +311,19 @@ export function processChangelogEntries(
           timestampColumn,
           isResurrected,
           timestampColumnFor
-        );
-        result.warnings.push(...warnings);
-        if (action === 'updated') result.updated++;
-        if (action === 'inserted') result.inserted++;
-        if (action === 'skipped') result.skipped++;
+        )
+        result.warnings.push(...warnings)
+        if (action === 'updated') result.updated++
+        if (action === 'inserted') result.inserted++
+        if (action === 'skipped') result.skipped++
         // 畳みは「消えた行」でもある。届いた更新を採用しなかった場合でも、
         // 更新対象の行が畳まれて消えていることがある（skipped だけでは実態に合わない）。
-        if (folds.length > 0) result.conflictsResolved++;
-        recordFolds(result, folds);
+        if (folds.length > 0) result.conflictsResolved++
+        recordFolds(result, folds)
         if (conflict) {
           result.warnings.push(
             `Conflict on ${table}:${entry.recordId} resolved as ${conflict.resolution}`
-          );
+          )
         }
       }
     }

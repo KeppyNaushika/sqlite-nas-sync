@@ -8,7 +8,7 @@
  * @module conflict/transaction
  * @internal
  */
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3'
 
 /**
  * 外部キーの検査をトランザクション終端まで遅らせて処理を実行する。
@@ -23,12 +23,12 @@ export function runDeferringForeignKeys<T>(
   apply: () => T
 ): T {
   const run = (): T => {
-    db.pragma('defer_foreign_keys = ON');
-    return apply();
-  };
+    db.pragma('defer_foreign_keys = ON')
+    return apply()
+  }
 
-  if (db.inTransaction) return run();
-  return db.transaction(run)();
+  if (db.inTransaction) return run()
+  return db.transaction(run)()
 }
 
 /**
@@ -43,8 +43,7 @@ export function runDeferringForeignKeys<T>(
  */
 export function runInSavepoint<T>(db: Database.Database, apply: () => T): T {
   return db.transaction((): T => {
-    db.pragma('defer_foreign_keys = ON');
-    return apply();
-  })();
+    db.pragma('defer_foreign_keys = ON')
+    return apply()
+  })()
 }
-

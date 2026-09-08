@@ -5,14 +5,14 @@
  * 同じスキーマを複数のテストファイルが使うので、**形はここ1か所で決める**
  * （各ファイルに写すと、片方だけ直したときに「同じはずのDB」が食い違う）。
  */
-import Database from 'better-sqlite3';
-import { setupChangelog } from '../../src/setup';
-import { applyInsert } from '../../src/conflict';
-import { TableConfig } from '../../src/types';
+import Database from 'better-sqlite3'
+import { setupChangelog } from '../../src/setup'
+import { applyInsert } from '../../src/conflict'
+import { TableConfig } from '../../src/types'
 
-export const PARENT_COLUMNS = ['id', 'tenantId', 'ukey', 'updatedAt'];
-export const KID_COLUMNS = ['id', 'parentId', 'updatedAt'];
-export const COMPOSITE_KID_COLUMNS = ['id', 'parentId', 'tenantId', 'updatedAt'];
+export const PARENT_COLUMNS = ['id', 'tenantId', 'ukey', 'updatedAt']
+export const KID_COLUMNS = ['id', 'parentId', 'updatedAt']
+export const COMPOSITE_KID_COLUMNS = ['id', 'parentId', 'tenantId', 'updatedAt']
 
 export const FK_TABLES: TableConfig[] = [
   { name: 'parents' },
@@ -30,12 +30,12 @@ export const FK_TABLES: TableConfig[] = [
   { name: 'kids_setdefault_expr_missing' },
   { name: 'detail_setnull' },
   { name: 'detail_setdefault' },
-];
+]
 
 export interface KidRow {
-  id: string;
-  parentId: string | null;
-  updatedAt: string;
+  id: string
+  parentId: string | null
+  updatedAt: string
 }
 
 /**
@@ -43,7 +43,7 @@ export interface KidRow {
  * 親は「別id・同一ユニークキー」で畳まれる形（`ukey`）を持つ。
  */
 export function createForeignKeyDb(): Database.Database {
-  const db = new Database(':memory:');
+  const db = new Database(':memory:')
   db.exec(`
     CREATE TABLE parents (
       id        TEXT PRIMARY KEY,
@@ -126,9 +126,9 @@ export function createForeignKeyDb(): Database.Database {
       updatedAt TEXT NOT NULL,
       FOREIGN KEY (parentId, tenantId) REFERENCES parents(id, tenantId) ON DELETE SET DEFAULT
     );
-  `);
-  setupChangelog(db, FK_TABLES, 'id');
-  return db;
+  `)
+  setupChangelog(db, FK_TABLES, 'id')
+  return db
 }
 
 /**
@@ -141,7 +141,7 @@ export function foldThenDeleteWinner(db: Database.Database): void {
   db.prepare(
     `INSERT INTO parents (id, tenantId, ukey, updatedAt)
      VALUES ('p-b', 'tenant-1', 'k1', '2026-02-01T00:00:00Z')`
-  ).run();
+  ).run()
 
   applyInsert(
     db,
@@ -154,13 +154,13 @@ export function foldThenDeleteWinner(db: Database.Database): void {
       updatedAt: '2026-01-01T00:00:00Z',
     },
     PARENT_COLUMNS
-  );
+  )
 
-  db.prepare(`DELETE FROM parents WHERE id = 'p-b'`).run();
+  db.prepare(`DELETE FROM parents WHERE id = 'p-b'`).run()
 }
 
 export function kidsOf(db: Database.Database, tableName: string): KidRow[] {
   return db
     .prepare(`SELECT id, parentId, updatedAt FROM ${tableName} ORDER BY id`)
-    .all() as KidRow[];
+    .all() as KidRow[]
 }
