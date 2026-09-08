@@ -11,7 +11,8 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { setupChangelog } from '../src/setup';
 import { applyInsert, applyUpdate } from '../src/conflict';
-import { TableConfig } from '../src/types';
+import { SyncResult, TableConfig } from '../src/types';
+import { processChangelogEntries } from '../src/sync/entries';
 
 const testDir = path.join(__dirname, 'test-data-conflict-reporting');
 
@@ -217,5 +218,72 @@ describe('膠着は「ローカルが勝った」ではない', () => {
       ['id', 'note', 'updatedAt']
     );
     expect(result.conflict?.resolution).toBe('local_wins');
+  });
+});
+
+describe('相手が違う綴りの表名で送ってきても、エントリを捨てない', () => {
+  it('設定が `users`、届くエントリが `Users` でも取り込む', () => {
+    db = createDb('table-name-case-dispatch');
+    db.exec(`
+      CREATE TABLE users (
+        id        TEXT PRIMARY KEY,
+        name      TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    setupChangelog(db, [{ name: 'users' }], 'id');
+
+    const remoteDb = new Database(':memory:');
+    remoteDb.exec(`
+      CREATE TABLE users (
+        id        TEXT PRIMARY KEY,
+        name      TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+    remoteDb
+      .prepare(
+        `INSERT INTO users VALUES ('u1', 'Alice', '2026-01-01T00:00:00.000Z')`
+      )
+      .run();
+
+    const result: SyncResult = {
+      clientsSynced: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
+      skipped: 0,
+      conflictsResolved: 0,
+      folds: [],
+      warnings: [],
+      skippedRemotes: [],
+      hadChangelogGap: false,
+    };
+
+    // 相手のトリガは**相手の設定どおりの綴り**を埋め込む。素の Map で引くと
+    // 全エントリが素通りし、しかもカーソルは進むので二度と提供されない
+    processChangelogEntries(
+      db,
+      remoteDb,
+      [
+        {
+          id: 1,
+          tableName: 'Users',
+          recordId: 'u1',
+          operation: 'INSERT',
+          changedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      'id',
+      [{ name: 'users' }],
+      result
+    );
+    remoteDb.close();
+
+    expect(result.inserted).toBe(1);
+    const row = db.prepare(`SELECT name FROM users WHERE id = 'u1'`).get() as
+      | { name: string }
+      | undefined;
+    expect(row?.name).toBe('Alice');
   });
 });

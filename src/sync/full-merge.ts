@@ -14,6 +14,7 @@ import { applyUpdate } from '../conflict';
 import { escapeIdentifier, getTableColumns } from './sql';
 import {
   hasMergedIntoColumn,
+  makeTableConfigLookup,
   makeResurrectionProbe,
   makeTimestampColumnFor,
   resolveFoldTarget,
@@ -104,10 +105,8 @@ export function applyTombstones(
     .get();
   if (!exists) return;
 
-  const tableConfigMap = new Map<string, TableConfig>();
-  for (const tc of tables) {
-    tableConfigMap.set(tc.name, tc);
-  }
+  // 取り込み元の `_tombstone` が名乗る表名も**相手の綴り**なので、大小を畳んで引く
+  const tableConfigFor = makeTableConfigLookup(tables);
   const timestampColumnFor = makeTimestampColumnFor(tables);
   const isResurrected = makeResurrectionProbe(
     remoteDb,
@@ -128,8 +127,12 @@ export function applyTombstones(
   const columnCache = new Map<string, string[]>();
 
   for (const ts of tombstones) {
-    const tableConfig = tableConfigMap.get(ts.tableName);
+    const tableConfig = tableConfigFor(ts.tableName);
     if (!tableConfig) continue;
+
+    // 相手の綴りではなく、こちらの設定の綴りで扱う（`entries.ts` と同じ理由 ——
+    // 帳簿の重複行をそもそも作らない）
+    const table = tableConfig.name;
 
     // 畳みは deleteProtected でも適用する（processChangelogEntries と同じ理由）
     const mergedInto = resolveFoldTarget(ts.recordId, ts.mergedInto);
@@ -137,7 +140,7 @@ export function applyTombstones(
 
     // リモートにレコードが現存する場合は再作成されたものとみなし、tombstoneを無視する。
     // （削除後に同一ソースで再INSERTされたケース。削除時刻との大小に依らず存続させる）
-    const escapedTable = escapeIdentifier(ts.tableName);
+    const escapedTable = escapeIdentifier(table);
     const escapedPk = escapeIdentifier(primaryKey);
     const remoteRecord = remoteDb
       .prepare(`SELECT ${escapedPk} FROM ${escapedTable} WHERE ${escapedPk} = ?`)
@@ -146,17 +149,17 @@ export function applyTombstones(
 
     const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt';
 
-    let columns = columnCache.get(ts.tableName);
+    let columns = columnCache.get(table);
     if (!columns) {
-      columns = getTableColumns(localDb, ts.tableName);
-      columnCache.set(ts.tableName, columns);
+      columns = getTableColumns(localDb, table);
+      columnCache.set(table, columns);
     }
 
     // フォーマット差(ISO-T vs スペース形式)を吸収したLWWで削除を適用する。
     applyTombstoneDelete(
       localDb,
       remoteDb,
-      ts.tableName,
+      table,
       primaryKey,
       timestampColumn,
       columns,

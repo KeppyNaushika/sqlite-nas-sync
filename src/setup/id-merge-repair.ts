@@ -13,6 +13,7 @@
  */
 import Database from 'better-sqlite3';
 import { isLaterTimestamp } from '../conflict/timestamp';
+import { foldIdentifier } from '../conflict/schema';
 import { escapeIdentifier } from './sql';
 
 /**
@@ -123,7 +124,7 @@ function collapseIdMergeChainsOnce(
     // 表名の大小だけが違う2件は**同じ1件として扱われる**（下の UPDATE / DELETE も
     // 両方に当たる）。索引の側だけ後勝ちにすると、辿る鎖と書き換える対象がずれるので、
     // 他と同じ「新しい主張が勝つ」で1つに決める（同時刻なら先に読んだ方を残す）。
-    const key = row.tableName.toLowerCase();
+    const key = foldIdentifier(row.tableName);
     const records = byTable.get(key) ?? new Map();
     const existing = records.get(row.losingId);
     // 時刻は**字面で比べない**。ここが掃除する相手は旧版が書いた記録で、
@@ -212,7 +213,7 @@ function collapseIdMergeChainsOnce(
   };
 
   for (const row of rows) {
-    const records = byTable.get(row.tableName.toLowerCase());
+    const records = byTable.get(foldIdentifier(row.tableName));
     if (!records) continue;
 
     // 終端まで辿る。通った記録を控えておき、出発点へ戻ったら循環と分かる

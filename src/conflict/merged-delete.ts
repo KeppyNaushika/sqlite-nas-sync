@@ -10,7 +10,7 @@
  */
 import Database from 'better-sqlite3';
 import { RecordFold } from '../types';
-import { escapeIdentifier } from './schema';
+import { escapeIdentifier, readColumn } from './schema';
 import {
   foldTimestampOf,
   isLaterTimestamp,
@@ -90,7 +90,7 @@ export function applyMergedDelete(
     foldedAt &&
     isLaterTimestamp(
       localDb,
-      String(losingRow[timestampColumn] ?? ''),
+      String(readColumn(losingRow, timestampColumn) ?? ''),
       foldedAt
     )
   ) {
@@ -137,7 +137,7 @@ export function applyMergedDelete(
   // ためだけに残してある（渡された行をそのまま入れると別の id が復活する）。
   const foldTargetMoved =
     winningId !== requestedWinningId ||
-    (winningRow !== undefined && String(winningRow[primaryKey]) !== winningId);
+    (winningRow !== undefined && String(readColumn(winningRow, primaryKey)) !== winningId);
 
   if (losingRow && !localWinningRow && foldTargetMoved) {
     return {

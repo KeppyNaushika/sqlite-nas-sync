@@ -8,7 +8,7 @@
  * @internal
  */
 import Database from 'better-sqlite3';
-import { getTableColumns } from './schema';
+import { getTableColumns, isSameIdentifier, readColumn } from './schema';
 
 /**
  * 2つのタイムスタンプを「時刻」として比較する。
@@ -87,10 +87,14 @@ export function resolveTimestampColumn(
   tableName: string,
   preferred: string
 ): string | null {
+  // 列名の比較は大小を畳む。`columns` は `PRAGMA` 由来、`preferred` は設定由来で、
+  // 綴りが揃うとは限らない。**見つからないと黙って現在時刻へ落ちる**種類の判断が
+  // この先にぶら下がっているので、字面で取り逃がしてはいけない。
+  // 返すのは**表が実際に名乗っている綴り**（SQLへ埋めるのはこちら）。
   const columns = getTableColumns(db, tableName);
-  if (columns.includes(preferred)) return preferred;
-  if (columns.includes('updatedAt')) return 'updatedAt';
-  return null;
+  const match = (name: string): string | undefined =>
+    columns.find((column) => isSameIdentifier(column, name));
+  return match(preferred) ?? match('updatedAt') ?? null;
 }
 
 
@@ -108,7 +112,7 @@ export function foldTimestampOf(
   timestampColumn: string | null
 ): string | undefined {
   if (!timestampColumn) return undefined;
-  const value = row[timestampColumn];
+  const value = readColumn(row, timestampColumn);
   if (value === null || value === undefined) return undefined;
   const text = String(value);
   return text === '' ? undefined : text;
@@ -136,12 +140,12 @@ export function isPreferredOverRival(
   primaryKey: string
 ): boolean {
   if (timestampColumn) {
-    const rowTimestamp = String(row[timestampColumn] ?? '');
-    const rivalTimestamp = String(rival[timestampColumn] ?? '');
+    const rowTimestamp = String(readColumn(row, timestampColumn) ?? '');
+    const rivalTimestamp = String(readColumn(rival, timestampColumn) ?? '');
     if (rowTimestamp !== rivalTimestamp) {
       return isLaterTimestamp(db, rowTimestamp, rivalTimestamp);
     }
   }
-  return String(row[primaryKey]) < String(rival[primaryKey]);
+  return String(readColumn(row, primaryKey)) < String(readColumn(rival, primaryKey));
 }
 
