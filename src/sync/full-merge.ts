@@ -9,6 +9,7 @@
  * @internal
  */
 import Database from 'better-sqlite3'
+import { normalizeRetentionDays } from '../changelog'
 import { SyncResult, TableConfig } from '../types'
 import { applyUpdate } from '../conflict'
 import { escapeIdentifier, getTableColumns } from './sql'
@@ -181,6 +182,24 @@ export function applyTombstones(
  * トリガーは呼び出し元で無効化済みであること。
  * ローカルのchangelogに直接INSERTする（トリガー経由ではない）。
  *
+ * **`changedAt` は相手が書いたまま写す。取り込み時刻へ書き換えてはいけない。**
+ * idは自分の `_changelog` で新しく採番される（AUTOINCREMENT）ので、
+ * ここを通ったエントリは**id順と時刻順がねじれる**。それでも時刻を触らない理由:
+ *
+ * 1. **`changedAt` は削除時刻の代わりに読まれている。** `sync/entries.ts` の
+ *    DELETE 経路は `remoteTombstone?.deletedAt ?? entry.changedAt` として、
+ *    tombstone が無い削除の時刻をここから得る。取り込み時刻へ書き換えると
+ *    **半年前の DELETE が今日の削除として振る舞い**、より新しい更新を持つ端末の
+ *    生きた行を消す。
+ * 2. **中継ごとに時刻が現在へ寄る。** A→B→C と渡るたびに新しくなるので、
+ *    同じ変更の履歴が際限なく複製され、どれも「今の削除」として振る舞う。
+ *
+ * 取り込みそのものをやめる案も採れない。この関数は「A が居なくなっても B 経由で
+ * C へ A の変更点が届く」という**中継そのもの**である。
+ *
+ * ねじれが changelog の穴に化けないようにするのは掃除側の仕事で、
+ * {@link cleanupChangelog} が接頭辞しか刈らないことで受け持っている。
+ *
  * @internal
  */
 export function mergeChangelog(
@@ -197,7 +216,7 @@ export function mergeChangelog(
        WHERE julianday(changedAt) >= julianday('now', '-' || ? || ' days')
        ORDER BY id`
     )
-    .all(retentionDays) as {
+    .all(normalizeRetentionDays(retentionDays)) as {
     tableName: string
     recordId: string
     operation: string

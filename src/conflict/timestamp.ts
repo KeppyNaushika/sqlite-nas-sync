@@ -31,11 +31,34 @@ export function isLaterTimestamp(
   a: string,
   b: string
 ): boolean {
+  const order = compareTimestamps(db, a, b)
+  // 解析できないときだけ字面へ落とす（少なくとも順序が定まる）
+  return order === null ? a > b : order > 0
+}
+
+/**
+ * 2つのタイムスタンプを時刻として比べ、**比べられたかどうかも返す**。
+ *
+ * `julianday()` で正規化して数値比較する。片方でも解析できなければ `null` ——
+ * つまり「時刻としては比べられない」。{@link isLaterTimestamp} /
+ * {@link isSameTimestamp} は `null` のとき字面へ落ちるが、**字面の順序に意味が
+ * 無い場面**（例: `deduplicateEntries` は時刻で決まらないぶんを id で決めたい）では、
+ * 落ちる前に自分で決めたい。その判断を呼び出し元へ渡すためにこれを分けてある。
+ *
+ * @returns `a` が後なら正、`b` が後なら負、同時刻なら 0、比べられなければ `null`
+ * @internal
+ */
+export function compareTimestamps(
+  db: Database.Database,
+  a: string,
+  b: string
+): number | null {
   const row = db
     .prepare(`SELECT julianday(?) AS ja, julianday(?) AS jb`)
     .get(a, b) as { ja: number | null; jb: number | null }
-  if (row.ja != null && row.jb != null) return row.ja > row.jb
-  return a > b
+  if (row.ja == null || row.jb == null) return null
+  if (row.ja === row.jb) return 0
+  return row.ja > row.jb ? 1 : -1
 }
 
 /**
@@ -55,11 +78,8 @@ export function isSameTimestamp(
   b: string
 ): boolean {
   if (a === b) return true
-  const row = db
-    .prepare(`SELECT julianday(?) AS ja, julianday(?) AS jb`)
-    .get(a, b) as { ja: number | null; jb: number | null }
-  if (row.ja != null && row.jb != null) return row.ja === row.jb
-  return false
+  // 解析できないものは「同時刻」と答えない（字面が違えば別の時刻として扱う）
+  return compareTimestamps(db, a, b) === 0
 }
 
 /**
@@ -139,7 +159,12 @@ export function isPreferredOverRival(
   if (timestampColumn) {
     const rowTimestamp = String(readColumn(row, timestampColumn) ?? '')
     const rivalTimestamp = String(readColumn(rival, timestampColumn) ?? '')
-    if (rowTimestamp !== rivalTimestamp) {
+    // 同着かどうかは**時刻として**見る。字面で `!==` と見ると、同じ瞬間でも書式が違う
+    // （ISO-T と旧版のスペース形式）だけで「差がある」と判断し、下の主キーによる
+    // 同着決着へ降りてこない。そのとき `isLaterTimestamp` は両向きとも false を返すので、
+    // **2端末が互いに相手を勝たせ**、どちらも自分の行を残したまま収束しなくなる
+    // （この関数は端末ごとに row と rival が入れ替わって呼ばれる）。
+    if (!isSameTimestamp(db, rowTimestamp, rivalTimestamp)) {
       return isLaterTimestamp(db, rowTimestamp, rivalTimestamp)
     }
   }
