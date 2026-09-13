@@ -456,10 +456,13 @@ describe('規則5: 読み替え先が消えているときは onDelete に従う
       staleSource
     )
 
-    // 判定の材料として、こちらの `_tombstone` の削除時刻が渡ること
-    expect(seen).toHaveLength(1)
-    expect(seen[0].recordId).toBe('p-b')
-    expect(seen[0].deletedAt).not.toBe('')
+    // 判定の材料として、こちらの `_tombstone` の削除時刻が渡ること。
+    // （読み替えの前にも「畳まれた親 p-a が取り込み元で作り直されていないか」を
+    //   同じ手続きで訊く。ここで見たいのは**消えた親 p-b についての問い**なので、
+    //   回数ではなくその1件を取り出して確かめる）
+    const askedAboutTarget = seen.filter((ask) => ask.recordId === 'p-b')
+    expect(askedAboutTarget).toHaveLength(1)
+    expect(askedAboutTarget[0].deletedAt).not.toBe('')
 
     expect(result.action).toBe('skipped')
     expect(result.warnings).toEqual([

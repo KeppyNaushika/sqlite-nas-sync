@@ -24,7 +24,12 @@
  */
 import Database from 'better-sqlite3'
 import { DEFAULTS, SyncConfig, SyncResult, TableConfig } from './types'
-import { cleanupChangelog, hasChangelogGap } from './changelog'
+import {
+  cleanupChangelog,
+  describeChangelogPruneWall,
+  hasChangelogGap,
+  normalizeRetentionDays,
+} from './changelog'
 import {
   copyToNas,
   ensureDirectory,
@@ -34,6 +39,7 @@ import {
 import { readSchemaVersion, writeSchemaVersion } from './setup'
 import { getSyncState, updateHeartbeat } from './sync/state'
 import { pullFullMerge, pullNormal } from './sync/pull'
+import { dropLocalWritesLostToDeletion } from './sync/self-check'
 
 /**
  * 同期処理を実行する。
@@ -65,8 +71,12 @@ export async function performSync(
   tables: TableConfig[]
 ): Promise<SyncResult> {
   const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
-  const retentionDays =
+  // 保持期間はSQLの綴りへ埋め込まれるので、使えない値のまま先へ流さない
+  // （{@link normalizeRetentionDays}）。掃除とフルマージの両方が同じ値を見るよう、
+  // **ここで一度だけ**均す。
+  const configuredRetentionDays =
     config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays
+  const retentionDays = normalizeRetentionDays(configuredRetentionDays)
   const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled
 
   const result: SyncResult = {
@@ -82,10 +92,27 @@ export async function performSync(
     hadChangelogGap: false,
   }
 
+  // 直せない設定は黙って直さない。均した事実を持ち主へ返す
+  // （負値や NaN のままだと、掃除もフルマージも例外なしで止まる）。
+  if (retentionDays !== configuredRetentionDays) {
+    result.warnings.push(
+      `changelogRetentionDays: ${String(configuredRetentionDays)} is not a usable ` +
+        `number of days, falling back to ${retentionDays}.`
+    )
+  }
+
   // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
   if (config.schemaVersion) {
     writeSchemaVersion(localDb, config.schemaVersion)
   }
+
+  // 0.5. 自分が書いた行にも同じ LWW を当てる。
+  //
+  // 取り込み経路は「削除より古い挿入・更新は採らない」を守るが、**アプリが
+  // ローカルへ直接書いた行はその検査を通らない**。既にある削除より古い時刻で
+  // 書かれた行は、受け取る側が規則どおり採らないので、**書いた端末だけが持ち続けて
+  // 永久に食い違う**（警告も例外も出ない）。押し出す前に閉じておく。
+  dropLocalWritesLostToDeletion(localDb, tables, primaryKey, result)
 
   // 1. NASディレクトリを確保し、リモートクライアントを列挙
   ensureDirectory(config.nasPath)
@@ -155,6 +182,16 @@ export async function performSync(
 
   // 5. 古い_changelogエントリの掃除
   cleanupChangelog(localDb, retentionDays)
+
+  // 掃除は接頭辞しか刈らないので、時刻として読めない `changedAt` は壁になり、
+  // そこから先は保持期間を過ぎても残る。**その行を消して解決したことにはしない**
+  // （消せばそれは changelog の穴で、穴の向こうの変更は届かなくなる）。
+  // 残したまま持ち主へ知らせる ——「掃除しているのに changelog が縮まない」を
+  // 黙って放置すると、いつか保持期間の意味が失われる。
+  const pruneWall = describeChangelogPruneWall(localDb, retentionDays)
+  if (pruneWall) {
+    result.warnings.push(pruneWall)
+  }
 
   // 6. onAfterSync コールバック
   if (config.onAfterSync) {

@@ -39,6 +39,119 @@ export function ensureIdMergeTable(db: Database.Database): void {
 }
 
 /**
+ * 届いた畳みの主張と**向きが逆**の主張が、この端末に既に記録されているとき、その中身。
+ * @internal
+ */
+export interface OpposingFoldClaim {
+  /** その主張が生かすと言っている id（＝逆向きの主張の生存者） */
+  survivingId: string
+  /** その主張が名乗っている時刻 */
+  mergedAt: string
+}
+
+/**
+ * 届いた主張 `L→W` と**向きが食い違う**主張が、この端末に記録されていないか。
+ *
+ * 帳簿は敗者idで引くので、逆向きの主張は**そのままでは見えない**。`L→W` が届いたとき、
+ * 手元に `W→L` が載っていても、引くのは `L` の記録だけなので「記録が無い＝素通り」に
+ * なる。実測では、A/B が `g2→g1`（同時刻を主キーの辞書順で決着）、C が `g1→g2`
+ * （C は A の**古い** g1 しか見ていないので g1 が負けたと判断）を刻み、**時刻が同じで
+ * 向きが逆の2つの主張**が生まれた。互いに相手の主張を素通りさせるので、生き残る id が
+ * 毎周入れ替わって永久に振動する（警告も例外も出ない）。
+ *
+ * 見つけ方は**`W` の側から鎖をたどる**こと。「`W` は負けた」という記録が、たどって
+ * `L` に行き着くなら、それはこの主張と逆向きの主張である。`W` の記録が `L` 以外の
+ * 終端へ行くだけなら、それは逆向きではなく**鎖**（`A→C` と `C→B`）であって、
+ * {@link recordMerge} が終端へ張り替えて扱うぶんなので、ここで断ってはいけない。
+ *
+ * 名乗る時刻は**2つの帳簿のうち強い方**（新しい方）。`_tombstone` 側は畳み先を
+ * 名乗っているものだけ見る —— 畳み先の無い削除は「`W` があの行へ負けた」という主張では
+ * なく、ただ「消えた」という別の事実なので、混ぜると無関係な削除時刻で向きの勝敗が
+ * 決まってしまう。
+ *
+ * 記録に循環があっても既訪問idで打ち切る（{@link resolveFoldChain} と同じ作り）。
+ * @internal
+ */
+export function readOpposingFoldClaim(
+  db: Database.Database,
+  tableName: string,
+  losingId: string,
+  winningId: string
+): OpposingFoldClaim | null {
+  // 帳簿がまだ無いDB（畳みが一度も起きていない・公開APIを直接呼ぶ場合）では、
+  // 逆向きの主張もありえない。`lookupIdMerge` は表の有無を見ないので、ここで打ち切る
+  // （見ないまま引くと「そんな表は無い」で例外になり、その相手ぶんの取り込みが
+  // 丸ごと巻き戻る）。
+  if (!hasTable(db, '_id_merge')) return null
+
+  // 「W は負けた」という記録が無いなら、向きの食い違いはそもそも無い
+  const claimAboutWinner = lookupIdMerge(db, tableName, winningId)
+  if (claimAboutWinner === null) return null
+
+  const seen = new Set<string>([winningId])
+  let terminal = claimAboutWinner.winningId
+  while (terminal !== losingId) {
+    if (seen.has(terminal)) return null
+    seen.add(terminal)
+    const next = lookupIdMerge(db, tableName, terminal)
+    // 終端が L 以外なら、これは逆向きの主張ではなく鎖である
+    if (next === null) return null
+    terminal = next.winningId
+  }
+
+  // 2つの帳簿は同じ1つの事実を持っているはずだが、片方だけに新しい主張が載っている
+  // 状態はありうる（理由は {@link foldClaimWins}）。強い方を名乗らせる。
+  const tombstone = readTombstoneClaim(db, tableName, winningId)
+  const mergedAt =
+    tombstone !== null &&
+    tombstone.mergedInto !== null &&
+    isLaterTimestamp(db, tombstone.deletedAt, claimAboutWinner.mergedAt)
+      ? tombstone.deletedAt
+      : claimAboutWinner.mergedAt
+
+  return { survivingId: losingId, mergedAt }
+}
+
+/**
+ * 届いた畳みの主張 `L→W` が、**逆向きの主張に負けているか**。
+ *
+ * 負けている＝この主張は行にも帳簿にも適用しない。判断はどの端末でも同じ答えに
+ * なる形でなければならないので、次の2段で決める:
+ *
+ * 1. **時刻が新しい主張が勝つ**（このライブラリの他のあらゆる判断と同じ）
+ * 2. **時刻が同じなら、行の勝敗と同じ物差し** —— 生き残る id が主キーの辞書順で
+ *    小さい方の主張を採る（{@link isPreferredOverRival} の同着決着と同じ）
+ *
+ * 2. がこの形でなければならないのは、**両端末が同じ2つの id を見て同じ答えに達する
+ * 必要がある**からである。「届いた方を採る」「手元を守る」のような、端末ごとに違う
+ * 向きへ倒れる決め方にすると、互いに相手の主張を受け入れ続けて生き残る id が毎周
+ * 入れ替わる（`__tests__/fold-claim-direction.test.ts` の3端末がその形）。
+ *
+ * **敗者行の時刻で畳みを無効にする形にはしない。** 同時刻の畳みまで無効にすると、
+ * 2端末の普通の同着（同じ時刻の別idが同じユニークキーを持つ形）でも畳みが消える ——
+ * `mergedAt` は勝者行の時刻なので、同着では敗者行の時刻と必ず一致するからである
+ * （{@link isFoldRecordStale} が「厳密に新しい」を要求しているのはそのため）。
+ * 決着させるのは**主張どうし**であって、主張と行ではない。
+ * @internal
+ */
+export function isFoldClaimOutranked(
+  db: Database.Database,
+  tableName: string,
+  losingId: string,
+  winningId: string,
+  foldedAt: string
+): boolean {
+  const opposing = readOpposingFoldClaim(db, tableName, losingId, winningId)
+  if (opposing === null) return false
+
+  if (isLaterTimestamp(db, foldedAt, opposing.mergedAt)) return false
+  if (isLaterTimestamp(db, opposing.mergedAt, foldedAt)) return true
+
+  // 同時刻。生き残る id が小さい方の主張を採る（全端末で同じ答えになる）
+  return opposing.survivingId < winningId
+}
+
+/**
  * この畳みの主張を、既にある記録の上へ置いてよいか。**判断はここ1か所だけで下す。**
  *
  * `_id_merge`（ローカル索引）と `_tombstone`（他端末へ渡る主張）は、同じ1つの事実を
@@ -61,6 +174,8 @@ export function ensureIdMergeTable(db: Database.Database): void {
  *   畳みの時刻は必ず負ける
  * - `foldedAt` が無い（本物の削除・公開APIの直接呼び出し）— 主張の時刻は「今」なので
  *   必ず最新
+ * - **向きが逆の主張に負けている**なら断る（{@link isFoldClaimOutranked}）。
+ *   帳簿を敗者idで引くだけでは、逆向きの主張は見えない
  * - それ以外 — **どちらかの帳簿に既にある主張が厳密に新しい**なら断る。
  *   同時刻なら新しい主張が勝つ
  * @internal
@@ -69,11 +184,19 @@ function foldClaimWins(
   db: Database.Database,
   tableName: string,
   losingId: string,
+  winningId: string,
   foldedAt: string | undefined,
   replacesOwnDeletion: boolean
 ): boolean {
   if (replacesOwnDeletion) return true
   if (foldedAt === undefined) return true
+
+  // **向きの食い違いは、敗者idで引く比較では見つからない。** 手元に `W→L` が載って
+  // いても、引くのは `L` の記録だけなので素通りする（実測では、それで生き残る id が
+  // 永久に振動した）。向きの決着は {@link isFoldClaimOutranked} に任せる。
+  if (isFoldClaimOutranked(db, tableName, losingId, winningId, foldedAt)) {
+    return false
+  }
 
   // 2つの帳簿のうち**強い方**（新しい方）と比べる。片方しか見ないと、そちらに
   // 記録が無いだけで通ってしまい、もう片方が断って食い違う
@@ -113,7 +236,16 @@ export function recordMerge(
 
   // **古い主張は、どちらの帳簿にも書かない。** `_tombstone` 側だけが断ると、2つの
   // 帳簿が別々の勝者を名乗ることになる（理由は {@link foldClaimWins}）。
-  if (!foldClaimWins(db, tableName, losingId, foldedAt, replacesOwnDeletion)) {
+  if (
+    !foldClaimWins(
+      db,
+      tableName,
+      losingId,
+      winningId,
+      foldedAt,
+      replacesOwnDeletion
+    )
+  ) {
     return
   }
 

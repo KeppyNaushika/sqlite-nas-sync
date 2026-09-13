@@ -9,7 +9,11 @@
  */
 import Database from 'better-sqlite3'
 import { SyncConfig, SyncResult, TableConfig } from '../types'
-import { getMaxChangelogId, readChangelog } from '../changelog'
+import {
+  getMaxChangelogId,
+  readChangelog,
+  readChangelogPrunedThroughId,
+} from '../changelog'
 import { openRemoteDbViaLocalCopy } from '../nas'
 import { readSchemaVersion } from '../setup'
 import {
@@ -76,7 +80,7 @@ export function pullNormal(
       }
 
       // エントリの重複排除
-      const deduplicated = deduplicateEntries(entries)
+      const deduplicated = deduplicateEntries(remoteDb, entries, primaryKey)
       const maxId = entries[entries.length - 1].id
 
       // 適用と lastSeenId 更新を 1 つのトランザクションで原子的に。
@@ -179,7 +183,17 @@ export function pullFullMerge(
           performFullMergeData(localDb, remoteDb, tables, primaryKey, result)
           applyTombstones(localDb, remoteDb, tables, primaryKey, result)
           mergeChangelog(localDb, remoteDb, retentionDays)
-          const maxId = getMaxChangelogId(remoteDb)
+          // カーソルは「相手の changelog で見終えた位置」。**掃除済みの位置も
+          // 含めて**進めること。相手が changelog を全部掃除していると
+          // `MAX(id) = 0 < prunedThroughId` になり、フルマージを済ませたのに
+          // `hasChangelogGap` の規則1が真のままになる ——
+          // **毎回フルマージを繰り返す**（全件突き合わせなので重い）。
+          // フルマージは相手の全レコードを見ているので、消えたエントリの位置まで
+          // 「見終えた」と言ってよい。
+          const maxId = Math.max(
+            getMaxChangelogId(remoteDb),
+            readChangelogPrunedThroughId(remoteDb)
+          )
           updateSyncState(localDb, remote.clientId, maxId)
         })
         transaction()

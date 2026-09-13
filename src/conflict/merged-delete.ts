@@ -16,7 +16,12 @@ import {
   isLaterTimestamp,
   TimestampColumnFor,
 } from './timestamp'
-import { hasIdMerges, recordMerge, resolveFoldChain } from './ledger'
+import {
+  hasIdMerges,
+  isFoldClaimOutranked,
+  recordMerge,
+  resolveFoldChain,
+} from './ledger'
 import { ResurrectionProbe } from './tombstone'
 import { remapMergedForeignKeys } from './remap'
 import { foldAndReplace, foldRowInto } from './fold'
@@ -76,6 +81,31 @@ export function applyMergedDelete(
     winningId = resolveFoldChain(localDb, tableName, winningId, losingId)
     if (losingId === winningId) {
       return { action: 'skipped', folds, warnings: [] }
+    }
+  }
+
+  // **向きが逆で、しかもこちらの主張の方が強い畳みは、行にも帳簿にも適用しない。**
+  //
+  // `recordMerge` は帳簿への書き込みを断るが、この関数はそのあとも進んで**行を畳んで
+  // しまう**（帳簿の判断と行の適用が別経路になっている）。断られた向きで行だけ畳むと、
+  // 帳簿は `W→L` を名乗ったまま実体は `L` が消えて `W` が生きる、という食い違いに
+  // なり、しかもこちらの主張は相手へ渡り続けるので毎周入れ替わる。
+  // 行の適用も同じ判断の下に置く。
+  if (
+    foldedAt !== undefined &&
+    isFoldClaimOutranked(localDb, tableName, losingId, winningId, foldedAt)
+  ) {
+    return {
+      action: 'skipped',
+      folds,
+      warnings: describeContestedFoldDirection(
+        localDb,
+        tableName,
+        escapedTable,
+        escapedPk,
+        losingId,
+        winningId
+      ),
     }
   }
 
@@ -223,4 +253,65 @@ export function applyMergedDelete(
 
   // 畳み先がどこにも無い → 敗者行はそのまま残す（消すと子が道連れになる）
   return { action: 'skipped', folds, warnings: [] }
+}
+
+/**
+ * 「畳む向きが端末どうしで食い違っている」ことを、利用者へ見える形にする。
+ *
+ * 向きの食い違い自体は決着する —— {@link isFoldClaimOutranked} が時刻と、同時刻なら
+ * 生き残る id の辞書順で決め、その答えは全端末で同じである。**決着したあとに
+ * 追いつけるかは別の話**で、負けた向きを刻んでしまった端末は、その id の墓標を
+ * 自分では取り消せない。
+ *
+ * 取り消せないのは、墓標を消すと**その id の古い DELETE エントリが現在時刻を削除時刻
+ * として名乗り、他端末の生きた行を消す**からである（`sync/self-check.ts` の
+ * `dropLocalWriteToFold` に同じ理由が書いてある）。かわりに時刻を過去へ倒すのも、
+ * 「いつ消えたか」という他端末へ渡る事実を偽ることになる。
+ *
+ * 結果として、こちらが勝ち残らせた行を、負けた向きを刻んだ端末が**受け取れない**まま
+ * 残ることがある。実測（3端末・`accounts`）: `a1`（00:01）と `a2`（00:02）が同じ
+ * `username` を持ち、A/C は「新しい方が勝つ」で `a1→a2` を畳んだ。そのあと `a1` が
+ * 00:02 へ更新されて**同着**になり、B は同着の決着（辞書順）で逆向きの `a2→a1` を
+ * 畳んだ。B の向きが正しい（`a1` が生き残る）のだが、A/C は `a1` の墓標を
+ * 取り消せないので `a1` を受け取れず、**B だけが `a1` を持つ**まま止まった。
+ *
+ * どちらの答えに寄せても、片方の端末で書かれたものが消える:
+ *
+ * - `a1` を生かす ← A/C は墓標を取り消さなければならない（上の理由で危険）
+ * - 一群ごと消す ← 利用者が消したのは `a2` だけで、`a1` は誰も消していない
+ *
+ * 「利用者が `a2` を消したとき、それはこの記録を消したのか、それとも死んだ id を
+ * 消したのか」——**同じ公開事実から両方に読める**ので、ライブラリには決められない
+ * （`sync/entries.ts` の `resolveMovedId` に、同じ形で答えが逆になる実測がある）。
+ * 解けないものは解かずに報告する、というこのライブラリの決め事に従う。
+ *
+ * 収束する向きの食い違い（{@link isFoldClaimOutranked} で決着して、負けた側が
+ * まだ何も刻んでいない形）でもこの文言は出る。**出ないよりはよい** ——
+ * 収束しない形だけを外から見分ける術が無く、黙って食い違うのが最悪だからである。
+ *
+ * @returns 手元にその行が在れば1件の文言。無ければ空（名乗るものが無い）
+ * @internal
+ */
+function describeContestedFoldDirection(
+  localDb: Database.Database,
+  tableName: string,
+  escapedTable: string,
+  escapedPk: string,
+  losingId: string,
+  winningId: string
+): string[] {
+  // 報告するのは**こちらが生かしている行**についてだけ。行が手元に無いなら、
+  // 食い違っているかどうかもここからは分からない
+  const here = localDb
+    .prepare(`SELECT 1 FROM ${escapedTable} WHERE ${escapedPk} = ?`)
+    .get(losingId)
+  if (here === undefined) return []
+
+  return [
+    `Stalemate on ${tableName}:${losingId}: another client merged ` +
+      `${losingId} into ${winningId} while this client merged ${winningId} into ` +
+      `${losingId}, and the tie goes to ${losingId}. A client that already recorded ` +
+      `the other direction cannot take ${losingId} back, so that client may keep ` +
+      `differing. Edit or delete the row on one side to break the tie.`,
+  ]
 }
