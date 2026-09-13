@@ -55,6 +55,30 @@ export function isForeignKeyUnchecked(
 }
 
 /**
+ * その外部キーが指している親の id（親の主キーを指す1列ぶん）。
+ *
+ * 見るのは**親の主キーを指している列**だけ。`_tombstone` は主キーで引く記録なので、
+ * 親の主キー以外を指す参照について「消えた」とは答えられない
+ * （読み替えの側も同じ理由で主キーを指す列だけを見ている）。
+ *
+ * @returns 指している id。指していない・NULL・主キーを指す列が無いなら null
+ * @internal
+ */
+export function parentIdReferencedBy(
+  foreignKey: ForeignKeyRef,
+  record: Record<string, unknown>,
+  primaryKey: string
+): string | null {
+  for (const { childColumn, parentColumn } of foreignKey.columns) {
+    if (!isSameIdentifier(parentColumn, primaryKey)) continue
+    const value = record[childColumn]
+    if (value === null || value === undefined) continue
+    return String(value)
+  }
+  return null
+}
+
+/**
  * その外部キーが指している親の行が、ローカルに在るか。
  *
  * 複合外部キーは**全列そろって**1行を指すので、全列で引く。
@@ -144,9 +168,19 @@ export function remapMergedForeignKeys(
   isResurrected?: ResurrectionProbe,
   timestampColumnFor?: TimestampColumnFor
 ): RemapOutcome {
-  // 畳みが一度も起きていないDB（大多数）はここで打ち切る。
-  // 外部キーの走査も、親の存在確認も、`_tombstone` 参照も一切増えない。
-  if (!hasIdMerges(db)) return { record, warnings: [] }
+  // 外部キーを1本も持たない表（大多数）はここで打ち切る。
+  // 親の存在確認も `_tombstone` 参照も一切増えない。
+  const foreignKeys = readForeignKeys(db, tableName, primaryKey)
+  if (foreignKeys.length === 0) return { record, warnings: [] }
+
+  // 読み替え（畳み先への付け替え）は、畳みが一度も起きていないDBでは要らない。
+  // **ただし「親が消えている」後始末はそれとは別に要る。** 畳みが絡まない普通の削除でも、
+  // 消えた親を指す子は届く（片方が親を消すのと入れ違いに、もう片方がその親へ子を足す）。
+  // そのとき親は tombstone に負けて入らないのに子だけ素通しで入ると、
+  // **COMMIT 時に外部キー違反でその相手ぶんの取り込みが丸ごと巻き戻る**。
+  // 作り直された親が tombstone より古い形では毎回同じ違反を繰り返し、
+  // その相手からの同期が**恒久的に止まる**（実測: 4周目以降ずっと巻き戻り続けた）。
+  const anyMerges = hasIdMerges(db)
 
   const warnings: string[] = []
   const recordId = String(readColumn(record, primaryKey))
@@ -161,10 +195,12 @@ export function remapMergedForeignKeys(
   const setDefaultColumns: { column: string; value: unknown }[] = []
   const nullOutWarnings: string[] = []
 
-  for (const foreignKey of readForeignKeys(db, tableName, primaryKey)) {
+  for (const foreignKey of foreignKeys) {
     let repointedTo: string | null = null
 
-    for (const { childColumn, parentColumn } of foreignKey.columns) {
+    for (const { childColumn, parentColumn } of anyMerges
+      ? foreignKey.columns
+      : []) {
       // **列名の比較は大小を畳む。** `PRAGMA foreign_key_list` は `REFERENCES` 句に
       // 書かれたとおりの綴りを返すので、`REFERENCES users(ID)` と設定の `id` は
       // 字面では一致しない。素の比較にすると読み替えが**一度も走らず**、畳まれた親を
@@ -192,14 +228,34 @@ export function remapMergedForeignKeys(
       ) {
         continue
       }
+      // **記録がまだ有効かは、取り込み元も見る。** 上の {@link isFoldRecordStale} が
+      // 比べるのは**ローカルの**敗者行だが、畳まれた id が**取り込み元で作り直されて
+      // いる**ことがある（畳みより新しい版で作り直せば、受け取る側は
+      // {@link isShadowedByTombstone} を通るのでその行を採る）。その親はこの取り込みで
+      // 届くのだから、子を畳み先へ向けてはいけない。
+      //
+      // 実測（3端末・親と主キーを共有する子）: 畳まれた `tags:g3` が新しい版で
+      // 作り直されたのに、同じ取り込みで届いた `tag_profiles:g3` だけが `g1` へ
+      // 読み替えられ（`g1` の行を上書きし）、**作り直した端末にだけ `g3` の子が残った**。
+      // ローカルにはまだ敗者行が無いので、ローカルだけを見る物差しでは気づけない。
+      if (
+        isResurrected?.(foreignKey.parentTable, String(current), merge.mergedAt)
+      ) {
+        continue
+      }
 
       remapped = remapped ?? { ...record }
       remapped[childColumn] = merge.winningId
       repointedTo = merge.winningId
     }
 
-    // 読み替えていない参照は、今までどおり触らない
-    if (repointedTo === null || remapped === null) continue
+    // 見るのは「この外部キーが今どの親を指しているか」。読み替えたならその先、
+    // 読み替えていないなら書かれているとおりの値。**読み替えの有無で分けてはいけない** ——
+    // 分けると、畳みが絡まない普通の削除で消えた親を指す子が素通りする（上記）。
+    const subject = remapped ?? record
+    const pointsTo =
+      repointedTo ?? parentIdReferencedBy(foreignKey, subject, primaryKey)
+    if (pointsTo === null) continue
     // 外部キーが効いていない接続では `ON DELETE` の動作も起きない。
     // 再現すべきものが無いのに子を捨てるのは、ただのデータ損失
     if (!foreignKeysEnforced(db)) continue
@@ -208,15 +264,16 @@ export function remapMergedForeignKeys(
     // 何も起きないので、`ON DELETE` の動作も及ばない。ここを見落として全列を
     // `列 = ?` で引くと、`= NULL` が真にならないため「親が居ない」と判定され、
     // **SQLite ならそのまま通る行を捨てる**ことになる。
-    if (isForeignKeyUnchecked(foreignKey, remapped)) continue
-    if (parentRowExists(db, foreignKey, remapped)) continue
-    if (
-      !isKnownDeleted(db, foreignKey.parentTable, repointedTo, isResurrected)
-    ) {
+    if (isForeignKeyUnchecked(foreignKey, subject)) continue
+    if (parentRowExists(db, foreignKey, subject)) continue
+    // **tombstone に載っていることが条件。** 「ローカルにまだ無い」だけで捨てると、
+    // 同じ取り込みであとから届く親を待てずに、順番が違うだけの子を殺す
+    // （{@link isKnownDeleted} のコメント）。作り直された親も「消えていない」側に入る。
+    if (!isKnownDeleted(db, foreignKey.parentTable, pointsTo, isResurrected)) {
       continue
     }
 
-    const gone = `parent ${foreignKey.parentTable}:${repointedTo} is gone`
+    const gone = `parent ${foreignKey.parentTable}:${pointsTo} is gone`
     const childColumns = foreignKey.columns.map((column) => column.childColumn)
 
     if (
@@ -316,10 +373,11 @@ export function remapMergedForeignKeys(
     return { record: null, warnings }
   }
 
-  if (
-    remapped !== null &&
-    (nullOutColumns.length > 0 || setDefaultColumns.length > 0)
-  ) {
+  // **読み替えが1つも無くても、null 化は起こりうる。** 畳みが絡まない
+  // 「親が消えた」後始末だけが走った場合で、`remapped` を作る条件に
+  // 読み替えの有無を混ぜると、外した参照が黙って捨てられる（行は元のまま入る）。
+  if (nullOutColumns.length > 0 || setDefaultColumns.length > 0) {
+    remapped = remapped ?? { ...record }
     for (const childColumn of nullOutColumns) remapped[childColumn] = null
     for (const { column, value } of setDefaultColumns) remapped[column] = value
     warnings.push(...nullOutWarnings)

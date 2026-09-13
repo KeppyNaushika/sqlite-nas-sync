@@ -1,7 +1,8 @@
 /**
  * changelog テーブル・トリガーのセットアップ機能を提供するモジュール。
  *
- * `_changelog` / `_sync_state` / `_tombstone` / `_id_merge` / `_heartbeat` の各テーブルと、
+ * `_changelog` / `_changelog_prune` / `_sync_state` / `_tombstone` / `_id_merge` /
+ * `_heartbeat` の各テーブルと、
  * 対象テーブルごとの INSERT / UPDATE / DELETE トリガーを**冪等に**作る。
  * 何度呼んでも同じ形になるので、アプリの起動ごとに通してよい。
  *
@@ -35,6 +36,7 @@ export {
  *
  * 以下を冪等に（`IF NOT EXISTS`で）作成する:
  * - `_changelog` テーブル: 全変更操作のログを記録
+ * - `_changelog_prune` テーブル: どのidまで掃除したかを記録（隙間検出に使う）
  * - `_sync_state` テーブル: リモートクライアントごとの同期進捗を管理
  * - 各テーブルに3つのトリガー（AFTER INSERT / UPDATE / DELETE）
  * - WALジャーナルモードの有効化
@@ -66,6 +68,28 @@ export function setupChangelog(
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_changelog_id ON _changelog(id)`)
+
+  // _changelog_prune テーブル（「どのidまで掃除したか」の記録）。
+  //
+  // `hasChangelogGap` は `MIN(id)` しか見ないので、**途中だけ**が欠けた隙間を
+  // 見抜けない。掃除した側が「実際に消したエントリの最大id」を書き残しておけば、
+  // 読む側は `prunedThroughId > lastSeenId` だけで「読む前に消えたものがある」と
+  // 判断できる。1行しか持たないので `onlyRow = 0` で席を固定する
+  // （行が増えると「どれが本当の位置か」が決まらなくなる）。
+  //
+  // 初期値は 0。ここを `MAX(id)` で初期化すると、**追いついている端末まで**
+  // 隙間ありと判定され、全員が一度フルマージに落ちる。
+  //
+  // `_` 始まりなので `discoverTables` の自動検出から外れ、同期対象にはならない。
+  // `computeSchemaHash` は設定に挙がった表だけを走査するので、この表を足しても
+  // スキーマの指紋は変わらない（変わると相手を全部見送ることになる）。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _changelog_prune (
+      onlyRow         INTEGER PRIMARY KEY CHECK (onlyRow = 0),
+      prunedThroughId INTEGER NOT NULL DEFAULT 0,
+      prunedAt        TEXT    NOT NULL DEFAULT (${NOW_SQL})
+    )
+  `)
 
   // _sync_state テーブル
   db.exec(`

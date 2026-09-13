@@ -204,10 +204,13 @@ describe('端末をまたいだ動き', () => {
     // 畳みを実際に適用した端末には、引き取り先の無い子は残らない
     expect(idsOf(dbB, `SELECT id FROM question_scores`)).toEqual([])
 
-    // **この形は全端末では揃わない。** 畳み先（es-b）が世界から消えているため、
-    // 敗者行 es-a を持っている端末はそれを消せず（消すと子が道連れになる）、
-    // es-a とその子を持ったまま残る。畳みの記録の時刻とは別の既知の食い違いで、
-    // 規則1〜5 では直らない（README「直っていないこと」）。ここでは固定しない。
+    // 畳み先（es-b）が世界から消えているので、**敗者行 es-a もその一群の死をもって
+    // 消える**（`readFoldTargetBurial`）。es-a を持っていた端末だけが持ち続ける形
+    // ——README「直っていないこと」に載っていた食い違い——はここで閉じている。
+    for (const db of [dbA, dbB, dbC]) {
+      expect(idsOf(db, `SELECT id FROM exam_students`)).toEqual([])
+      expect(idsOf(db, `SELECT id FROM question_scores`)).toEqual([])
+    }
 
     // C の取り込みが巻き戻っていないこと（巻き戻ると以後ずっと届かない）
     dbB
@@ -224,9 +227,19 @@ describe('端末をまたいだ動き', () => {
     dbC.close()
   })
 
-  it('同期経路でも、取り込み元に無い畳み先は「消えた」と判定される', async () => {
-    // `makeResurrectionProbe` が同期経路で実際に働くことを見る。畳みの記録を持つ端末へ
-    // 遅れて子が届き、畳み先は取り込み元にも無い —— このとき `ON DELETE` に従う。
+  it('畳み先が消されたと分かれば、敗者行を持っている端末もその行を消す', async () => {
+    // **以前はここで食い違ったままだった。** 畳み先（es-b）が世界から消えているので、
+    // 敗者行 es-a を持っている端末は「畳み先が見つからない」として es-a を残し、
+    // 畳んだ端末は es-a を消しており、**その行の存在そのものが揃わなかった**
+    // （しかも es-a は届く見込みの無い勝者を永久に待つ）。
+    //
+    // 畳み先が**ただ消された**と分かっている場合だけは、その一群ごと死んでいると
+    // 言えるので、敗者行も同じ死をもって消す（`readFoldTargetBurial`）。
+    // 判断は各端末が自分で導く —— 一群の死も畳みの主張もどちらも全端末へ渡るので、
+    // 同じ2つの事実から同じ答えに達する。
+    //
+    // 畳み先が**そもそもどこにも現れない**（削除の記録も無い）場合は今も残す。
+    // 消えたという証拠が無いところで消すと、順番が違うだけで届く勝者を待てない。
     const { db: dbA, dbPath: pathA } = createClientDb('client-a')
     dbA
       .prepare(
@@ -251,34 +264,33 @@ describe('端末をまたいだ動き', () => {
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
     dbB.prepare(`DELETE FROM exam_students WHERE id = 'es-b'`).run()
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
-    // A は畳み先を見つけられず、敗者行を持ったまま残る
-    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
 
-    // C はギャップ経路で全体を取り込み、畳みの記録を得る
+    // A は畳みの主張（es-a→es-b）と、畳み先の削除の両方を受け取る
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
+    expect(idsOf(dbA, `SELECT id FROM exam_students`)).toEqual([])
+
+    // C はギャップ経路で全体を取り込む。通ってくる道が違っても同じ答えになること
     dbA.exec(`DELETE FROM _changelog`)
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-    await performSync(dbC, makeConfig(pathC, 'client-c'), TABLES)
-    expect(
-      dbC.prepare(`SELECT losingId, winningId FROM _id_merge`).all()
-    ).toEqual([{ losingId: 'es-a', winningId: 'es-b' }])
+    const fullMerge = await performSync(
+      dbC,
+      makeConfig(pathC, 'client-c'),
+      TABLES
+    )
+    expect(fullMerge.hadChangelogGap).toBe(true)
+    expect(foreignKeyWarnings(fullMerge.warnings)).toEqual([])
+    expect(idsOf(dbC, `SELECT id FROM exam_students`)).toEqual([])
+    expect(idsOf(dbB, `SELECT id FROM exam_students`)).toEqual([])
 
-    // A が遅れて敗者行の子を作る。取り込み元 A にも畳み先 es-b は無い
+    // C の取り込みが巻き戻っていないこと（巻き戻ると以後ずっと届かない）
     dbA
       .prepare(
-        `INSERT INTO question_scores (id, examStudentId, regionId, score, updatedAt)
-       VALUES ('qs-late', 'es-a', 'region-1', '5', '2026-07-01T00:00:00Z')`
+        `INSERT INTO memos (id, body, updatedAt) VALUES ('memo-1', '後続', '2026-07-01T00:00:00Z')`
       )
       .run()
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-    const pull = await performSync(dbC, makeConfig(pathC, 'client-c'), TABLES)
-
-    expect(foreignKeyWarnings(pull.warnings)).toEqual([])
-    expect(
-      pull.warnings.filter((warning) => warning.startsWith('Dropped'))
-    ).toEqual([
-      'Dropped question_scores:qs-late: parent exam_students:es-b is gone (ON DELETE CASCADE)',
-    ])
-    expect(idsOf(dbC, `SELECT id FROM question_scores`)).toEqual([])
+    await performSync(dbC, makeConfig(pathC, 'client-c'), TABLES)
+    expect(idsOf(dbC, `SELECT id FROM memos`)).toEqual(['memo-1'])
 
     dbA.close()
     dbB.close()

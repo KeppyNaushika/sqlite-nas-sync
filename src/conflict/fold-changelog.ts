@@ -50,6 +50,64 @@ export function hasChangelogDelete(
 }
 
 /**
+ * `_changelog` に、そのレコードへの**書き込み**（INSERT / UPDATE）が載っているか。
+ *
+ * @param sinceId - 指定するとそのidより後のエントリだけを数える。「今起こした
+ *   書き込みでトリガーが記録したか」を見るときに使う。
+ * @internal
+ */
+export function hasChangelogWrite(
+  db: Database.Database,
+  tableName: string,
+  recordId: string,
+  sinceId: number = 0
+): boolean {
+  if (!hasTable(db, '_changelog')) return false
+  const row = db
+    .prepare(
+      `SELECT 1 FROM _changelog
+       WHERE tableName = ? COLLATE NOCASE AND recordId = ?
+         AND operation <> 'DELETE' AND id > ?`
+    )
+    .get(tableName, recordId, sinceId)
+  return row !== undefined
+}
+
+/**
+ * 畳みで**idが動いた先**の行の UPDATE を `_changelog` へ手で書く。
+ *
+ * 親と主キーを共有する1:1の子は、親が畳まれると**その子のidそのものが動く**。
+ * 動いた先の姿は「相手からもらった行」ではなく、**この端末でidが動いて生まれた姿**
+ * である。他端末はその id の行の中身をどこからも知れない —— 送り主から届くのは
+ * 「古いidは畳まれた」という削除だけで、中身は古いidの行と一緒に消えている。
+ *
+ * ふだんは UPDATEトリガがこの1行を記録する。フルマージ（changelogの隙間を検出した
+ * ときの経路）はトリガーを外して走るので記録が生まれず、**フルマージした端末にだけ
+ * その行が残る**（実測: `tag_profiles` が1台にだけ残り、増分同期の相手へは永久に
+ * 届かなかった。警告も出ない）。ここはその穴を塞ぐ。
+ *
+ * `changedAt` は「記録した今」にする（{@link writeFoldDeletion} と同じ理由 ——
+ * 畳みの時刻を入れると、それが保持期間より古いときに生まれた直後の掃除で消える）。
+ * 受け取る側のLWWが見るのは行の `updatedAt` なので、判断はぶれない。
+ *
+ * 操作は `UPDATE` と名乗る。受け取る側は行が無ければ挿入へ回す（{@link applyUpdate}）
+ * ので、`INSERT` と名乗り分ける必要は無い。
+ * @internal
+ */
+export function writeFoldMove(
+  db: Database.Database,
+  tableName: string,
+  recordId: string
+): void {
+  if (!hasTable(db, '_changelog')) return
+
+  db.prepare(
+    `INSERT INTO _changelog (tableName, recordId, operation, changedAt)
+     VALUES (?, ?, 'UPDATE', ${NOW_SQL})`
+  ).run(tableName, recordId)
+}
+
+/**
  * 畳んで消えたidのDELETEを `_changelog` へ手で書く。
  *
  * 畳みは**通常の差分経路にも乗せる**必要がある。フルマージ（changelogの隙間を検出した

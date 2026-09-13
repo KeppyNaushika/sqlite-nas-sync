@@ -35,8 +35,10 @@ import {
 import { recordFold, recordMerge } from './ledger'
 import {
   hasChangelogDelete,
+  hasChangelogWrite,
   maxChangelogId,
   writeFoldDeletion,
+  writeFoldMove,
 } from './fold-changelog'
 import {
   carryChildrenThroughDelete,
@@ -275,6 +277,17 @@ export function repointChild(
         )
       ) {
         writeFoldDeletion(db, foreignKey.childTable, previousId)
+      }
+
+      // **動いた先の行も差分経路へ載せる。** 上の UPDATE を記録するのはトリガーだが、
+      // フルマージはトリガーを外して走るので何も残らない。この行は相手からもらった
+      // ものではなく**この端末でidが動いて生まれた姿**で、他端末は送り主から
+      // 「古いidは畳まれた」という削除しか受け取らないため、載せないとその中身を
+      // どこからも知れない（{@link writeFoldMove} に実測を書いてある）。
+      if (
+        !hasChangelogWrite(db, foreignKey.childTable, nextId, changelogIdBefore)
+      ) {
+        writeFoldMove(db, foreignKey.childTable, nextId)
       }
     }
 
