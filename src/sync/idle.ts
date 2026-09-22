@@ -63,7 +63,7 @@ import { readClockLamport, readDeleteProtectedRaw } from '../rows/meta'
 export const FORCE_EVERY = 20
 
 /** 相手1人ぶんの「前に読んだときのこと」。 */
-export interface RemoteReadMemo {
+interface RemoteReadMemo {
   /** そのとき読んだファイルの印 */
   stamp: FileStamp
   /** 読み終えたあとの手元の `lastSeenId` */
@@ -141,7 +141,7 @@ export function createIdleMemory(enabled = true): IdleMemory {
  * `syncCount` は同期の**はじめ**に1つ進めるので、1回目（＝起動直後）は
  * 必ず `true` になる。
  */
-export function forcedRound(memory: IdleMemory): boolean {
+function forcedRound(memory: IdleMemory): boolean {
   return memory.syncCount % FORCE_EVERY === 1 || FORCE_EVERY <= 1
 }
 
@@ -253,7 +253,7 @@ export function forgetPushIfChanged(
 }
 
 /** {@link canSkipRemoteRead} が返す答え（落とす／読む理由つき）。 */
-export interface SkipDecision {
+interface SkipDecision {
   skip: boolean
   /** 読むことにした理由（`skip` が `true` のときは空） */
   reason?: string
@@ -292,7 +292,7 @@ export function canSkipRemoteRead(
 }
 
 /** {@link canSkipPush} に渡す、抑制を外す事情。 */
-export interface PushContext {
+interface PushContext {
   /** いまの手元の印 */
   fingerprint: string
   /** NAS 上に自分の写しがあるか */

@@ -19,13 +19,12 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../conflict/schema'
+import { escapeIdentifier, foldIdentifier } from './sql'
 import { parseCreateIndex } from '../rows/index-parse'
 import { assertDeterministicSql } from '../rows/sql-functions'
-import { escapeIdentifier } from './sql'
 
 /** 検査する表1つ分の指定。 */
-export interface RowsPreflightTable {
+interface RowsPreflightTable {
   name: string
   /**
    * 順序に使う時刻列。無い列を指しても、その表の時刻にまつわる検査を飛ばすだけ
@@ -35,7 +34,7 @@ export interface RowsPreflightTable {
 }
 
 /** {@link checkRowsPreconditions} の設定。 */
-export interface RowsPreflightOptions {
+interface RowsPreflightOptions {
   /**
    * 「大きく未来」と見なす幅（ミリ秒）。現在時刻からこれ以上先の値は警告になる
    * @defaultValue 366日
@@ -46,7 +45,7 @@ export interface RowsPreflightOptions {
 }
 
 /** {@link checkRowsPreconditions} の結果。例外にならなかった気がかりを載せる。 */
-export interface RowsPreflightResult {
+interface RowsPreflightResult {
   /** 利用者へ知らせる警告（空なら気がかり無し） */
   warnings: string[]
 }
@@ -78,14 +77,19 @@ export function checkRowsPreconditions(
 }
 
 /* ------------------------------------------------------------------ *
- * P1: 主キーが NULL を取らない
+ * P1: 主キーが TEXT で宣言され、NULL を取らない
  * ------------------------------------------------------------------ */
 
 /**
- * 主キーが NULL を取らないこと（設計書 §1.8 の P1）。
+ * 主キーが `TEXT` で宣言され、NULL を取らないこと（設計書 §1.8 の P1）。
  *
  * 素の `TEXT PRIMARY KEY` は **NULL を許す**（`WITHOUT ROWID` でも
  * `NOT NULL` 宣言でもない限り）。許したまま同期すると、版の鍵が定まらない。
+ *
+ * **`INTEGER PRIMARY KEY`（自動採番）は断る。** rowid そのものなので NULL には
+ * ならないが、別々の端末が**同じ値を別の行に**割り当てる。その2行は同期で1つの
+ * 行として扱われ、片方の中身が失われる。このライブラリは端末をまたいで一意な id
+ * （UUID / cuid）を前提にしている。
  */
 function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
   const info = db.pragma(`table_xinfo(${escapeIdentifier(table)})`) as {
@@ -112,18 +116,23 @@ function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
   }
   const sql = tableSql(db, table)
   const withoutRowid = /\)\s*WITHOUT\s+ROWID\s*;?\s*$/i.test(sql)
-  const integerPrimaryKey =
-    !withoutRowid &&
-    primaryKey.length === 1 &&
-    /^INTEGER$/i.test(primaryKey[0].type)
 
   for (const column of primaryKey) {
-    // `WITHOUT ROWID` の主キーは暗黙に NOT NULL。`INTEGER PRIMARY KEY` は
-    // rowid そのものなので NULL のまま格納されることが無い
-    if (withoutRowid || integerPrimaryKey || column.notnull === 1) continue
+    // 端末をまたいで一意な id（UUID / cuid）が前提。自動採番は同じ値が別の行に
+    // 割り当たるので、型の宣言の段階で断る
+    if (!/^TEXT$/i.test(column.type)) {
+      throw new Error(
+        `同期する表 ${table} の主キー ${column.name} が TEXT で宣言されていない` +
+          `（宣言: ${column.type || '無し'}、前提 P1）。` +
+          ` 端末をまたいで一意な id（UUID / cuid）を TEXT で持つこと` +
+          `（INTEGER PRIMARY KEY の自動採番は、別の端末が同じ値を別の行に割り当てる）`
+      )
+    }
+    // `WITHOUT ROWID` の主キーは暗黙に NOT NULL
+    if (withoutRowid || column.notnull === 1) continue
     throw new Error(
       `同期する表 ${table} の主キー ${column.name} が NULL を取れる（前提 P1）。` +
-        ` NOT NULL を宣言するか、INTEGER PRIMARY KEY か WITHOUT ROWID にすること`
+        ` NOT NULL を宣言するか、WITHOUT ROWID にすること`
     )
   }
 

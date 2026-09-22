@@ -29,8 +29,7 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../conflict/schema'
-import { NOW_SQL, escapeIdentifier } from '../setup/sql'
+import { NOW_SQL, escapeIdentifier, foldIdentifier } from '../setup/sql'
 import {
   RowsColumn,
   RowsTableSpec,
@@ -55,7 +54,7 @@ export interface RowsImportKey {
 }
 
 /** {@link importFromPeer} の設定。 */
-export interface RowsImportOptions {
+interface RowsImportOptions {
   /** 同期する表 */
   tables: (RowsTableSpec | string)[]
   /**
@@ -68,7 +67,7 @@ export interface RowsImportOptions {
 }
 
 /** `Max` が変わったキー1つ。 */
-export interface RowsImportChange {
+interface RowsImportChange {
   table: string
   key: string
   /** `_changelog` に載せた操作 */
@@ -76,7 +75,7 @@ export interface RowsImportChange {
 }
 
 /** {@link importFromPeer} の結果。 */
-export interface RowsImportResult {
+interface RowsImportResult {
   /** `skipped` なら相手を丸ごと見送った（`_sns_clock` にも触っていない） */
   status: 'imported' | 'skipped'
   /** 見送った理由 */

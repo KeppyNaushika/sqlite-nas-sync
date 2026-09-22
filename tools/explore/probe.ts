@@ -7,9 +7,8 @@
  *    相手のDBを開けなかった `Failed to open remote database` も同じ扱いにする。
  *    `performSync` が例外を投げた場合も違反。
  * 2. **収束すること** —— その状態から全端末を round-robin で同期し、状態が動かなく
- *    なったとき全端末の中身が一致すること。一致しない行は、その行のキーについて
- *    `Stalemate on <表>:<id>` が報告されていれば違反ではない（解けないものは解かずに
- *    報告する、が設計）。
+ *    なったとき全端末の中身が一致すること。一致しない行が1つでも残れば違反
+ *    （逃げ道は無い）。
  *
  * ## 「動かなくなった」の定義と上限
  *
@@ -18,10 +17,6 @@
  * 変わっていなければ不動点**、変わっていれば**振動**（違反）。上限
  * `maxProbeRounds × 端末数` 回の同期で不動点に届かなければ、それも違反として報告する
  * （changelog が同期のたびに伸び続ける形は、繰り返しに入らないのでここで捕まる）。
- *
- * 状態には「これまでに膠着として報告された行のキー」を含める（state.ts）。
- * 報告は差分同期で行が流れたときにしか出ないので、不動点では同じ警告が二度と出ない。
- * 探索の途中の同期で出た報告も数えないと、正しく報告済みの膠着を違反と誤認する。
  *
  * ## 開始端末
  *
@@ -50,7 +45,6 @@ import {
   normalizeOptionsFrom,
   readWorld,
   snapshotData,
-  stalemateKeys,
 } from './state'
 import { Library, World, applyTransition } from './world'
 
@@ -87,16 +81,11 @@ export type ViolationKind =
 
 /**
  * 検査の結果。`syncs` は開始状態から、結論が出るまでに回した同期の回数。
- * `view` は不動点での見え方（tools/explore/facts.ts の viewOf。膠着で端末ごとに違えば null）。
+ * `view` は不動点での見え方（tools/explore/history.ts の viewOf。端末ごとに違えば null）。
  */
 export type ProbeVerdict =
   | { ok: true; syncs: number; view: string | null }
   | { ok: false; kind: ViolationKind; syncs: number; summary: string }
-
-/** 状態の鍵に足す「膠着として報告された行」の集合の表現。 */
-export function reportedExtra(reported: Set<string>): string {
-  return JSON.stringify([...reported].sort())
-}
 
 /** 検査を回した記録（反例の書き下し用）。 */
 export type ProbeTrace = {
@@ -136,12 +125,11 @@ export class Prober {
     this.normalize = normalizeOptionsFrom(config)
   }
 
-  canonical(world: World, reported: Set<string>): CanonicalState {
+  canonical(world: World): CanonicalState {
     return canonicalize(
       readWorld(world, this.config),
       this.labeler,
       this.permutations,
-      reportedExtra(reported),
       this.normalize
     )
   }
@@ -172,7 +160,6 @@ export class Prober {
   async run(
     world: World,
     start: CanonicalState,
-    startReported: Set<string>,
     startClient: number,
     trace?: ProbeTrace
   ): Promise<ProbeVerdict> {
@@ -189,7 +176,6 @@ export class Prober {
     const chain: string[] = []
     const chainStates: string[] = []
     const position = new Map<string, number>()
-    const reported = new Set(startReported)
     let state = start
     let client = startClient
     let verdict: ProbeVerdict
@@ -211,10 +197,7 @@ export class Prober {
         const still = cycle.every((stateKey) => stateKey === state.key)
         if (still) {
           const differing = allDifferingKeys(world, this.config)
-          const silent = differing.keys.filter(
-            (rowKey) => !reported.has(rowKey)
-          )
-          if (silent.length === 0) {
+          if (differing.keys.length === 0) {
             const tables = TABLE_SETS[this.config.tableSet]
             verdict = {
               ok: true,
@@ -224,18 +207,16 @@ export class Prober {
               ),
             }
             if (trace)
-              trace.detail = `不動点での見え方: ${verdict.view ?? '（膠着で端末ごとに違う）'}`
+              trace.detail = `不動点での見え方: ${verdict.view ?? '（端末ごとに違う）'}`
           } else {
             verdict = {
               ok: false,
               kind: 'silent-divergence',
               syncs: 0,
-              summary: `往復しても一致せず、膠着としても報告されていない行: ${silent.join(', ')}`,
+              summary: `往復しても一致しない行: ${differing.keys.join(', ')}`,
             }
             if (trace) {
-              trace.detail =
-                `食い違っている行（updatedAt は julianday）:\n${differing.describe(silent)}\n` +
-                `膠着として報告済みの行: ${JSON.stringify([...reported].sort())}`
+              trace.detail = `食い違っている行（updatedAt は julianday）:\n${differing.describe(differing.keys)}`
             }
           }
         } else {
@@ -304,8 +285,7 @@ export class Prober {
         if (trace) trace.detail = verdict.summary
         break
       }
-      for (const rowKey of stalemateKeys(warnings)) reported.add(rowKey)
-      state = this.canonical(world, reported)
+      state = this.canonical(world)
       client = (client + 1) % n
     }
 

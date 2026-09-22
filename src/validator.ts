@@ -8,14 +8,14 @@
  */
 import Database from 'better-sqlite3'
 import { DiscoverOptions, TableConfig, TableOptions, DEFAULTS } from './types'
-import { foldIdentifier, isSameIdentifier } from './conflict/schema'
+import { foldIdentifier, isSameIdentifier } from './setup/sql'
 
 /**
  * バリデーションエラーの詳細。
  *
  * テーブルごとに発生したエラーを表す。
  */
-export interface ValidationError {
+interface ValidationError {
   /** エラーが発生したテーブル名 */
   table: string
   /** エラーの詳細メッセージ */

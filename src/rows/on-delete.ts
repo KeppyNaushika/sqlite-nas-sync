@@ -16,7 +16,7 @@
  */
 
 /** 親が置かれていないときに、子の外部キー列をどうするか。 */
-export type MissingParentAction =
+type MissingParentAction =
   /** その子は置かない行にする（`CASCADE` / `RESTRICT` / `NO ACTION`） */
   | 'drop'
   /** 外部キー列を NULL にする（NOT NULL を含むなら置かない行） */

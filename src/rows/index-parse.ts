@@ -32,7 +32,7 @@ import { escapeIdentifier } from '../setup/sql'
 import { assertDeterministicSql } from './sql-functions'
 
 /** 索引の項（列そのものか、式）。 */
-export interface IndexTerm {
+interface IndexTerm {
   /** 索引の項の SQL の字面（列なら `"name"`、式なら `lower("name")` など） */
   expression: string
   /** その項に効く照合順序（`PRAGMA index_xinfo` の `coll`。既定は `BINARY`） */
@@ -59,7 +59,7 @@ export interface UniqueIndexDefinition {
 }
 
 /** `CREATE INDEX` を読んだ結果（照合順序は `PRAGMA` 側で補う）。 */
-export interface ParsedCreateIndex {
+interface ParsedCreateIndex {
   name: string
   table: string
   unique: boolean

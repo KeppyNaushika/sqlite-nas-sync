@@ -324,7 +324,7 @@ export function ensureTombstoneVersionColumns(db: Database.Database): void {
  * 親和性が食い違うと `_sns_shown` から引いた文字列の id が整数の id と
  * 一致しなくなるからである。
  */
-export function createRowsTable(db: Database.Database, table: string): void {
+function createRowsTable(db: Database.Database, table: string): void {
   const columns = syncedColumns(db, table)
   const primaryKey = primaryKeyColumn(db, table)
   for (const column of columns) {
@@ -371,7 +371,7 @@ export function ensureClockRow(
 }
 
 /** `_sns_tick` にその表の行が無ければ作る（冪等）。tick には触らない。 */
-export function ensureTickRow(db: Database.Database, table: string): void {
+function ensureTickRow(db: Database.Database, table: string): void {
   db.prepare(
     `INSERT INTO _sns_tick (tableName, tick) VALUES (?, 0)
      ON CONFLICT (tableName) DO NOTHING`

@@ -27,10 +27,7 @@ import { RowsTableSpec } from './schema'
  * 引くのは `name = ? COLLATE NOCASE` —— **ここだけは綴り違いに備える**。
  * ここで畳むからこそ、以後の帳簿は字面で引ける。
  */
-export function canonicalTableName(
-  db: Database.Database,
-  table: string
-): string {
+function canonicalTableName(db: Database.Database, table: string): string {
   const row = db
     .prepare(
       `SELECT name FROM sqlite_master

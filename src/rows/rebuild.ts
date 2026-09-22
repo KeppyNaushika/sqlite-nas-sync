@@ -31,8 +31,7 @@
 import Database from 'better-sqlite3'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
-import { foldIdentifier } from '../conflict/schema'
-import { escapeIdentifier } from '../setup/sql'
+import { escapeIdentifier, foldIdentifier } from '../setup/sql'
 import { missingParentAction } from './on-delete'
 import {
   RebuildPlan,
@@ -49,10 +48,10 @@ import { canonicalTableSpecs } from './table-name'
 import { SqlValue, ValueOrdering } from './versions'
 
 /** 合流経路に落ちるまでの見送りの回数（設計書 §3.7.4 の k）。 */
-export const DEFAULT_MERGE_AFTER_SKIPS = 3
+const DEFAULT_MERGE_AFTER_SKIPS = 3
 
 /** 合流経路の `busy_timeout`（ミリ秒）。設計書の「数十 ms」。 */
-export const DEFAULT_MERGED_BUSY_TIMEOUT_MS = 50
+const DEFAULT_MERGED_BUSY_TIMEOUT_MS = 50
 
 /**
  * 検査と試験のための差し込み口（設計書 §8.2 の `REQUIRED_HOOKS`）。
@@ -96,7 +95,7 @@ export interface RowsRebuildState {
 }
 
 /** {@link rebuildOnce} の設定。 */
-export interface RowsRebuildOptions {
+interface RowsRebuildOptions {
   /** 同期する表 */
   tables: string[]
   /** 適用する表（省略すると `_sns_dirty` の表とその子孫） */
@@ -110,7 +109,7 @@ export interface RowsRebuildOptions {
 }
 
 /** {@link rebuildOnce} の結果。 */
-export interface RowsRebuildOutcome {
+interface RowsRebuildOutcome {
   /**
    * - `applied` 確定した
    * - `deferred` 見送った（`SQLITE_BUSY` か token の不一致）
@@ -136,7 +135,7 @@ export interface RowsRebuildOutcome {
 }
 
 /** アプリの表に当てた差の内訳。 */
-export interface RowsRebuildCounts {
+interface RowsRebuildCounts {
   /** 計画にあって、アプリの表に無かった行 */
   inserted: number
   /** 主キーは同じだが中身が違っていた行 */
@@ -191,22 +190,6 @@ export function rebuildOnce(
 }
 
 /**
- * すでに計算してある計画を適用する（ワーカーで計算したときの入口）。
- */
-export function applyRebuildPlan(
-  db: Database.Database,
-  plan: RebuildPlan,
-  options: RowsRebuildOptions
-): RowsRebuildOutcome {
-  const state = options.state ?? createRebuildState()
-  const tables = canonicalTables(db, options.tables)
-  if (db.inTransaction) {
-    return outcome(state, 'noop', 'normal', [], 'すでにトランザクションの中')
-  }
-  return applyRebuild(db, tables, options, state, 'normal', plan, null)
-}
-
-/**
  * もう1回だけ作り直して、いまのアプリの表との差の件数を返す（適用はしない）。
  *
  * `REQUIRED_HOOKS` の (4)。判定8（作り直しの冪等性）に使う。
@@ -240,7 +223,7 @@ export function rebuildDiffCount(
  * ------------------------------------------------------------------ */
 
 /** {@link computeRebuildPlanInWorker} の設定。 */
-export interface RebuildWorkerOptions {
+interface RebuildWorkerOptions {
   /** 読み取り専用で開く DB の位置（WAL が前提） */
   dbPath: string
   tables: string[]

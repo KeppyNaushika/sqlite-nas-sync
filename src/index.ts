@@ -112,13 +112,9 @@ export function setupSync(config: SyncConfig): SyncInstance {
     )
   }
 
-  // 検出結果をログ出力（デバッグおよび「想定とのズレ」の早期発見用）
-  // eslint-disable-next-line no-console
-  console.log(
-    `[sqlite-nas-sync] Auto-detected ${tables.length} sync table(s): ${tables
-      .map((t) => t.name)
-      .join(', ')}`
-  )
+  // 検出結果の通知（「想定とのズレ」の早期発見用）。**受け口が無ければ何も出さない。**
+  // ライブラリが利用者に断りなく標準出力へ書くと、利用側のログが表名で埋まる
+  config.onTablesDiscovered?.(tables.map((t) => t.name))
 
   // バリデーション（discoverTablesは存在チェック済みだが、PK型まではチェックしない）
   const errors = validateDatabase(db, tables, primaryKey)

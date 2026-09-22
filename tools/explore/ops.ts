@@ -559,7 +559,7 @@ export function enumerateOps(config: ExploreConfig): Op[] {
     })
   }
   if (tables.includes('users')) {
-    // users には UNIQUE が無い。名前の種類は --keys で振る（膠着＝同時刻で名前違い を作る）
+    // users には UNIQUE が無い。名前の種類は --keys で振る（同時刻で名前違い を作る）
     for (const i of ids) {
       for (const k of keys) {
         for (const at of ats) {

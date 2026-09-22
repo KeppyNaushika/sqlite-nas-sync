@@ -20,12 +20,10 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../conflict/schema'
-import { escapeIdentifier } from '../setup/sql'
+import { escapeIdentifier, foldIdentifier } from '../setup/sql'
 import { CandidateResult, RowsSchema, derive } from './derive'
 import { readDeleteProtectedTables } from './meta'
 import {
-  RowsColumn,
   VERSION_COLUMNS,
   primaryKeyColumn,
   rowsTableName,
@@ -39,7 +37,7 @@ import { RowVersion, SqlValue, ValueOrdering } from './versions'
  * 10進の文字列で持つのは、`BigInt` でも `Number` でも取り違えずに比べられる形が
  * 1つだけ欲しいからである。
  */
-export interface RebuildToken {
+interface RebuildToken {
   /** 表 → `_sns_tick.tick` */
   ticks: Record<string, string>
   /** `_sns_clock.importTick` */
@@ -58,21 +56,21 @@ export interface RebuildPlanTable {
 }
 
 /** 1:1 の表の「真の id ↔ 表示している id」（`_sns_shown`）。 */
-export interface RebuildPlanShown {
+interface RebuildPlanShown {
   table: string
   trueId: string
   shownId: string
 }
 
 /** 隠れた行と勝者（`_sns_hidden`）。 */
-export interface RebuildPlanHidden {
+interface RebuildPlanHidden {
   table: string
   trueId: string
   winnerId: string | null
 }
 
 /** 置かない行（`_sns_unplaceable`）。 */
-export interface RebuildPlanUnplaceable {
+interface RebuildPlanUnplaceable {
   table: string
   trueId: string
   reasonKind: string | null
@@ -417,7 +415,7 @@ export function dependencyOrder(
 }
 
 /** 外部キー1本（`PRAGMA foreign_key_list` の1組）。 */
-export interface ForeignKeyMeta {
+interface ForeignKeyMeta {
   id: number
   columns: string[]
   parentTable: string
@@ -520,6 +518,3 @@ function tableExists(db: Database.Database, name: string): boolean {
       .get(name) !== undefined
   )
 }
-
-/** `PRAGMA table_xinfo` の1列（再輸出せずに使うための別名）。 */
-export type RebuildColumn = RowsColumn

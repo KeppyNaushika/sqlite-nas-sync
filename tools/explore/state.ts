@@ -12,10 +12,14 @@
  * NASが古ければ、次の同期で相手に届くものが違う。
  *
  * - 同期対象の表の行（全列）を **rowid の順**で。`SELECT *` を `ORDER BY` なしで
- *   読む箇所（フルマージの全件走査）は rowid の順に行を処理するので、中身が同じでも
- *   並びが違えば畳みの順が変わりうる。主キー順に並べ直すと、その違いを潰してしまう
- * - `_tombstone`（全列、rowid 順。`applyTombstones` が rowid 順に走査する）
- * - `_id_merge`（全列、rowid 順）
+ *   読む箇所（`src/rows/rebuild-plan.ts` の `_sns_rows_<表>` の全件走査、
+ *   `src/rows/import.ts` の取り込み）は rowid の順に行を処理するので、中身が同じでも
+ *   並びが違えば処理の順が変わりうる。主キー順に並べ直すと、その違いを潰してしまう
+ * - `_tombstone`（全列、rowid 順。作り直しが `WHERE tableName = ?` で順序指定なしに読む）
+ * - `_sns_rows_<表>`（全列、rowid 順。案A の版の正）
+ * - `_sns_clock`・`_sns_shown`・`_sns_hidden`・`_sns_dirty`（全列、rowid 順）
+ * - `_id_merge`（全列、rowid 順）。旧方式の残りで、いまの `src/` が作ることはない
+ *   （`src/rows/migrate.ts` が移行のときに落とす）。移行前のDBを読んでも取りこぼさないため
  * - `_changelog`（id, tableName, recordId, operation, changedAt。id 順）
  * - `sqlite_sequence`（次に振られる changelog の id）
  * - `_changelog_prune.prunedThroughId`
@@ -24,18 +28,19 @@
  *   前任の途中成果はこれを外していた。外すと「見直し済みの位置だけが違う2状態」を
  *   同じと見て、見直しが走らない側の反例を見逃す）
  * - `_heartbeat`（在るかどうかで、次の同期が changelog を1件増やすかが決まる）
- * - スキーマ（`sqlite_master` の全 SQL の要約）。フルマージはトリガを外して付け直すので、
+ * - スキーマ（`sqlite_master` の全 SQL の要約）。作り直しはトリガを外して付け直すので、
  *   付け直し損ねた状態を同じと見ないため
  * - NAS ディレクトリにある、端末のコピー以外のファイル名（`.tmp` の残骸など）
  * - 時計 C（tools/explore/world.ts）。どの刻みと等しいか（等しくなければ「fresh」）だけ
- * - 呼び手が足す**これまでに膠着として報告された行のキーの集合**（収束の判定が
- *   「その行について `Stalemate on` の警告が出ていたか」を見るので、判定に効く）
  *
- * ## 案A（docs/rows-table-design.md）の表と、絶対値を持たない値
+ * 上のうち `_sns_*` と `_id_merge` は、DBに**在るときだけ**読む（方式の違うDBでも同じ検査器で
+ * 読めるように）。読み落とすと「それだけが違う2状態」を同じと見て反例を見逃すので、
+ * 表が増えたら必ずここに載せること。
  *
- * `_sns_rows_<表>`・`_sns_clock`・`_sns_shown`・`_sns_hidden`・`_sns_dirty` は、DBに**在るときだけ**
- * 読む（いまの `src/` には無い）。そのうち次の3つは、値のまま入れると状態が際限なく分かれるので
- * 畳む。畳み方と根拠は tools/explore/normalize.ts にある。
+ * ## 絶対値を持たない値
+ *
+ * 次の3つは、値のまま入れると状態が際限なく分かれるので畳む。畳み方と根拠は
+ * tools/explore/normalize.ts にある。
  *
  * - `_sync_meta.generation` —— 手元と NAS の写しの**新旧関係**だけ（同期のたびに増える絶対値は要らない）
  * - lamport（`_sns_clock.lamport`・`_sns_lamport`・墓標の `lamport`）—— 最大値からの隔たり。
@@ -572,7 +577,6 @@ export function serializeState(
   raw: RawWorld,
   labels: Map<string, string>,
   permutation: number[],
-  extra: string,
   options: NormalizeOptions
 ): string {
   const n = permutation.length
@@ -684,7 +688,6 @@ export function serializeState(
   lines.push(
     `nasExtras ${JSON.stringify(raw.nasExtras.map((file) => renameClientFile(file, permutation)))}`
   )
-  lines.push(`extra ${extra}`)
   return lines.join('\n')
 }
 
@@ -723,7 +726,6 @@ export function canonicalize(
   raw: RawWorld,
   labeler: TimeLabeler,
   permutations: number[][],
-  extra: string,
   options: NormalizeOptions
 ): CanonicalState {
   const labels = labeler.labels(collectTimes(raw))
@@ -731,9 +733,7 @@ export function canonicalize(
   let achieving: number[][] = []
   let frameKey = ''
   permutations.forEach((permutation, index) => {
-    const hash = hashString(
-      serializeState(raw, labels, permutation, extra, options)
-    )
+    const hash = hashString(serializeState(raw, labels, permutation, options))
     if (index === 0) frameKey = hash
     if (best === null || hash < best) {
       best = hash
@@ -749,12 +749,11 @@ export function canonicalize(
 export function dumpState(
   raw: RawWorld,
   labeler: TimeLabeler,
-  extra: string,
   options: NormalizeOptions
 ): string {
   const labels = labeler.labels(collectTimes(raw))
   const identity = raw.local.map((_, index) => index)
-  return serializeState(raw, labels, identity, extra, options)
+  return serializeState(raw, labels, identity, options)
 }
 
 type Row = Record<string, unknown>
@@ -824,14 +823,4 @@ export function allDifferingKeys(
         )
         .join('\n'),
   }
-}
-
-/** 警告から「膠着として報告された行のキー」（`表:id`）を拾う。 */
-export function stalemateKeys(warnings: string[]): string[] {
-  const keys: string[] = []
-  for (const warning of warnings) {
-    const match = /^Stalemate on ([^:\s]+):([^:\s]+):/.exec(warning)
-    if (match) keys.push(`${match[1]}:${match[2]}`)
-  }
-  return keys
 }
