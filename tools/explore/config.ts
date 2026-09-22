@@ -58,7 +58,7 @@ export type ExploreConfig = {
   ids: number
   /** セカンダリ UNIQUE キーの値の種類の数（`t1`, `t2`, …） */
   keys: number
-  /** 本文（`memo` / `body` / 利用者名）の種類の数。膠着（同時刻で中身違い）を作るのに使う */
+  /** 本文（`memo` / `body` / 利用者名）の種類の数。同時刻で中身違いの行を作るのに使う */
   payloads: number
   /** 行の時刻（基準時刻からのミリ秒）。基準は過去（{@link BASE_TIME}） */
   times: number[]

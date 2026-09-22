@@ -16,7 +16,7 @@ function open(statements: string[]): Database.Database {
   return db
 }
 
-describe('checkRowsPreconditions —— P1（主キーが NULL を取らない）', () => {
+describe('checkRowsPreconditions —— P1（主キーが TEXT で、NULL を取らない）', () => {
   it('素の TEXT PRIMARY KEY は NULL を許すので例外', () => {
     const db = open([`CREATE TABLE t (id TEXT PRIMARY KEY, updatedAt TEXT)`])
     try {
@@ -28,10 +28,9 @@ describe('checkRowsPreconditions —— P1（主キーが NULL を取らない�
     }
   })
 
-  it('NOT NULL・INTEGER PRIMARY KEY・WITHOUT ROWID はどれも通る', () => {
+  it('TEXT NOT NULL と TEXT の WITHOUT ROWID は通る', () => {
     for (const ddl of [
       `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, updatedAt TEXT)`,
-      `CREATE TABLE t (id INTEGER PRIMARY KEY, updatedAt TEXT)`,
       `CREATE TABLE t (id TEXT PRIMARY KEY, updatedAt TEXT) WITHOUT ROWID`,
     ]) {
       const db = open([ddl])
@@ -40,6 +39,32 @@ describe('checkRowsPreconditions —— P1（主キーが NULL を取らない�
       } finally {
         db.close()
       }
+    }
+  })
+
+  // 自動採番は NULL にこそならないが、別々の端末が**同じ値を別の行に**割り当てる。
+  // その2行は同期で1つの行として扱われ、片方の中身が失われるので、型の宣言で断る
+  it('INTEGER PRIMARY KEY（自動採番）は例外', () => {
+    const db = open([`CREATE TABLE t (id INTEGER PRIMARY KEY, updatedAt TEXT)`])
+    try {
+      expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
+        /主キー id が TEXT で宣言されていない/
+      )
+    } finally {
+      db.close()
+    }
+  })
+
+  it('TEXT 以外の宣言（BLOB など）も例外', () => {
+    const db = open([
+      `CREATE TABLE t (id BLOB PRIMARY KEY NOT NULL, updatedAt TEXT)`,
+    ])
+    try {
+      expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
+        /主キー id が TEXT で宣言されていない/
+      )
+    } finally {
+      db.close()
     }
   })
 

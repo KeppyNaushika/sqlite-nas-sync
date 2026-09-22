@@ -509,7 +509,7 @@ async function main(): Promise<number> {
         }
         continue
       }
-      // 膠着（null）は比べない
+      // 端末ごとに違って見え方が定まらない場合（null）は比べない
       if (info.view === null) continue
       const byStatus = statusIndex.get(pair.statusKey)
       const byOps = historyIndex.get(pair.historyKey)

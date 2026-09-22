@@ -1,7 +1,7 @@
 {
   "name": "sqlite-nas-sync",
-  "version": "0.19.0",
-  "description": "Sync SQLite databases across multiple clients via NAS with changelog-based conflict resolution",
+  "version": "0.20.0",
+  "description": "Sync SQLite databases across multiple clients via NAS by exchanging per-row versions and rebuilding the app tables from them",
   "type": "commonjs",
   "exports": {
     ".": {
@@ -34,7 +34,7 @@
     "database",
     "conflict-resolution",
     "multi-client",
-    "changelog"
+    "last-write-wins"
   ],
   "author": "KeppyNaushika",
   "license": "MIT",
@@ -46,6 +46,9 @@
     "url": "https://github.com/KeppyNaushika/sqlite-nas-sync/issues"
   },
   "homepage": "https://github.com/KeppyNaushika/sqlite-nas-sync#readme",
+  "dependencies": {
+    "@types/better-sqlite3": "^9.6.0"
+  },
   "peerDependencies": {
     "better-sqlite3": ">=11.0.0"
   },
@@ -56,7 +59,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.2.0",
     "eslint": "^10.10.0",
     "eslint-config-prettier": "^10.1.8",
@@ -71,7 +73,7 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
-    "docs/child-fold-not-revoked.md"
+    "docs/rows-table-design.md"
   ],
   "engines": {
     "node": ">=16.0.0"

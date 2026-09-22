@@ -33,7 +33,7 @@ import { missingParentAction } from './on-delete'
 import { RowVersion, SqlValue, ValueOrdering } from './versions'
 
 /** 同期する表1つ分のスキーマ。 */
-export interface RowsTable {
+interface RowsTable {
   name: string
   /** `CREATE TABLE` 文。そのまま一時 DB へ流す */
   ddl: string
@@ -79,7 +79,7 @@ export interface CandidateResult {
 }
 
 /** {@link derive} の結果。 */
-export interface DerivedRows {
+interface DerivedRows {
   /** 表 → 真の id の正規形 → 候補の結果 */
   candidates: Map<string, Map<string, CandidateResult>>
   /** 表 → 真の id の正規形 → `Res`（表示上の主キーの値の組。`⊥` は null。設計書 §1.6） */
@@ -91,7 +91,7 @@ export interface DerivedRows {
 }
 
 /** {@link derive} の差し込み口（設計書 §8.2 の「内部の差し込み口」）。公開 API ではない。 */
-export interface DeriveOptions {
+interface DeriveOptions {
   /**
    * 判定用の一時 DB を開いた直後に呼ばれる。
    *

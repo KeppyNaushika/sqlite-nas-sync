@@ -58,7 +58,7 @@ import { ISO_SHAPE_GLOBS } from './versions'
  * 字形の一覧（{@link ISO_SHAPE_GLOBS}）はそちらから借りている。片方だけ直すと、
  * トリガーが書いた順序と作り直しが読む順序が食い違う。
  */
-export function timeGroupSql(value: string): string {
+function timeGroupSql(value: string): string {
   const shape = ISO_SHAPE_GLOBS.map((glob) => `${value} GLOB '${glob}'`).join(
     ' OR '
   )
@@ -80,7 +80,7 @@ export function timeGroupSql(value: string): string {
  * **`COLLATE BINARY` を明示する。** 時刻列が `COLLATE NOCASE` で宣言されていると、
  * 素の比較では `'ABC'` と `'abc'` が同着になり、値が違うのに前後が付かない。
  */
-export function tsGreaterSql(a: string, b: string): string {
+function tsGreaterSql(a: string, b: string): string {
   const groupA = timeGroupSql(a)
   const groupB = timeGroupSql(b)
   return `(${groupA} > ${groupB} OR (${groupA} = ${groupB} AND (CASE
@@ -91,7 +91,7 @@ export function tsGreaterSql(a: string, b: string): string {
 }
 
 /** `a` と `b` が順序用の時刻として同着か（設計書 §1.2.3）。 */
-export function tsEqualSql(a: string, b: string): string {
+function tsEqualSql(a: string, b: string): string {
   const groupA = timeGroupSql(a)
   const groupB = timeGroupSql(b)
   return `(${groupA} = ${groupB} AND (CASE
@@ -102,7 +102,7 @@ export function tsEqualSql(a: string, b: string): string {
 }
 
 /** 版の3つ組（順序用の時刻・lamport・端末）。 */
-export interface VersionRefs {
+interface VersionRefs {
   ts: string
   lamport: string
   instance: string
@@ -619,10 +619,7 @@ export function rowsTriggerNames(table: string): string[] {
 }
 
 /** 1つの表に付く4本のトリガーの SQL（検査から中身を見るために公開している）。 */
-export function rowsTriggerSql(
-  db: Database.Database,
-  table: RowsTableSpec
-): string[] {
+function rowsTriggerSql(db: Database.Database, table: RowsTableSpec): string[] {
   const parts = readParts(db, table)
   return [
     insertTrigger(parts),

@@ -24,8 +24,7 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../conflict/schema'
-import { escapeIdentifier, NOW_SQL } from '../setup/sql'
+import { escapeIdentifier, foldIdentifier, NOW_SQL } from '../setup/sql'
 import { ROWS_FORMAT, readSnsFormat } from './import'
 import {
   SNS_META_KEYS,
@@ -48,7 +47,7 @@ import { canonicalTableSpecs } from './table-name'
 import { createRowsTriggers, dropRowsTriggers, maxTsSql } from './triggers'
 
 /** {@link migrateToRows} の設定。 */
-export interface RowsMigrationOptions {
+interface RowsMigrationOptions {
   /** 同期する表（綴りは入り口で `sqlite_master` へ畳む。§1.11・段階3 の申し送り） */
   tables: (RowsTableSpec | string)[]
   /**
@@ -64,7 +63,7 @@ export interface RowsMigrationOptions {
 }
 
 /** 1つの表について、移行が何をしたか。 */
-export interface RowsMigrationTableReport {
+interface RowsMigrationTableReport {
   /** 畳んだ綴りの表名 */
   table: string
   /** `_sns_rows_<t>` へ入れた行数 */
@@ -80,7 +79,7 @@ export interface RowsMigrationTableReport {
 }
 
 /** {@link migrateToRows} の結果。 */
-export interface RowsMigrationResult {
+interface RowsMigrationResult {
   /** `legacy` なら旧方式から移した。`refresh` なら既に案A だった（列の増減だけ見た） */
   from: 'legacy' | 'refresh'
   /** この移行で使った端末の id */

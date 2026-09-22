@@ -47,7 +47,7 @@ import { rowsTriggerNames } from './triggers'
  * ------------------------------------------------------------------ */
 
 /** 仕掛けの欠けの種類。 */
-export type RowsMachineryIssueKind =
+type RowsMachineryIssueKind =
   | 'missing-rows-table'
   | 'missing-trigger'
   | 'missing-clock-row'
@@ -56,7 +56,7 @@ export type RowsMachineryIssueKind =
   | 'rebuilding-leftover'
 
 /** 見つかった欠け1つ。 */
-export interface RowsMachineryIssue {
+interface RowsMachineryIssue {
   kind: RowsMachineryIssueKind
   /** その表（表に依らない欠けでは `undefined`） */
   table?: string
@@ -66,7 +66,7 @@ export interface RowsMachineryIssue {
 }
 
 /** {@link checkRowsMachinery} の結果。 */
-export interface RowsMachineryReport {
+interface RowsMachineryReport {
   issues: RowsMachineryIssue[]
   /** 何か足りない（`setupSync` で作り直すべき） */
   needsRepair: boolean
@@ -179,7 +179,7 @@ export function clearRebuildingFlag(db: Database.Database): boolean {
  * ------------------------------------------------------------------ */
 
 /** NAS 上の自分の写しの在りか。 */
-export interface RowsCopyLocation {
+interface RowsCopyLocation {
   /** NAS の共有ディレクトリ */
   nasPath: string
   /** 自分のクライアント id（写しは `client-<id>.sqlite`） */
@@ -189,17 +189,17 @@ export interface RowsCopyLocation {
 }
 
 /** 復元・巻き戻りの種類。 */
-export type RowsRestoreIssueKind =
+type RowsRestoreIssueKind =
   'lamport-behind-copy' | 'generation-behind-copy' | 'copy-unreadable'
 
 /** 見つかった巻き戻り1つ。 */
-export interface RowsRestoreIssue {
+interface RowsRestoreIssue {
   kind: RowsRestoreIssueKind
   message: string
 }
 
 /** {@link checkRestoreBeforeImport} の結果。 */
-export interface RowsRestoreReport {
+interface RowsRestoreReport {
   issues: RowsRestoreIssue[]
   /** 復元・巻き戻りと判断した（`lamport` か `generation` が写しより後ろ） */
   restored: boolean
@@ -293,7 +293,7 @@ export function checkRestoreBeforeImport(
 }
 
 /** {@link checkCopyOwnership} の結果。 */
-export interface RowsCopyOwnershipReport {
+interface RowsCopyOwnershipReport {
   /** 自分以外が同じファイル名へ書いている */
   taken: boolean
   /** 写しに載っていた `sns.instanceId`（読めなければ `null`） */

@@ -19,14 +19,14 @@ import { parentPort, workerData } from 'node:worker_threads'
 import { RebuildPlanOptions, computeRebuildPlan } from './rebuild-plan'
 
 /** 主スレッドから渡されるもの。 */
-export interface RebuildWorkerInput {
+interface RebuildWorkerInput {
   /** 読み取り専用で開く DB の位置（WAL が前提） */
   dbPath: string
   options: RebuildPlanOptions
 }
 
 /** 主スレッドへ返すもの。 */
-export type RebuildWorkerOutput =
+type RebuildWorkerOutput =
   { ok: true; plan: unknown } | { ok: false; message: string }
 
 void (function main(): void {

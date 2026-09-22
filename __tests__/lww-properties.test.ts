@@ -1,24 +1,27 @@
 /**
- * LWW（Last-Write-Wins）の物差しが満たすべき**性質**を、無作為な入力で確かめる。
+ * 時刻の物差し（{@link compareTimestamps}）が満たすべき**性質**を、
+ * 無作為な入力で確かめる。
  *
  * ここまでのテストは「見つかった不具合ごとに1本」という積み上げで書かれてきた。
- * それだと、まだ誰も踏んでいない入力の組み合わせ（同じ瞬間 × 違う書式 × 同着決着、
- * のような交点）が空白のまま残る。この形式なら、性質を1つ書けば入力の組み合わせは
+ * それだと、まだ誰も踏んでいない入力の組み合わせ（同じ瞬間 × 違う書式、のような
+ * 交点）が空白のまま残る。この形式なら、性質を1つ書けば入力の組み合わせは
  * fast-check が探す。
  *
  * ここで確かめる性質はどれも「2端末が同じ答えに達する」ための前提である。
- * - 三分律: 「新しい」「古い」「同時刻」のちょうど1つが成り立つ
- * - 反対称・全域: 2つの行のうち、勝つのはちょうど一方
- * - 推移性: 3つ以上の行が絡んでも順序が一貫する（勝者の選び方が畳み込む順に依らない）
+ * - 三分律: 「後」「前」「同時刻」のちょうど1つが成り立つ
+ * - 反対称: 引数を入れ替えると符号だけが反転する
+ * - 推移性: 3つ以上が絡んでも順序が一貫する
+ * - 書式に依らない: 同じ瞬間なら、どの書式で書かれていても同時刻と答える
+ *
+ * **行どうしの勝ち負け**（反対称・全域・同着の決着）の性質は、案A では
+ * `src/rows/versions.ts` の版の順序が持っている。そちらは
+ * `__tests__/rows-versions.test.ts` の「順序が全前順序であること」で
+ * 反射・完全性・推移・同着の推移まで確かめてある。
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import fc from 'fast-check'
 import Database from 'better-sqlite3'
-import {
-  isLaterTimestamp,
-  isSameTimestamp,
-  isPreferredOverRival,
-} from '../src/conflict/timestamp'
+import { compareTimestamps } from '../src/sync/timestamp'
 
 let db: Database.Database
 beforeAll(() => {
@@ -73,11 +76,11 @@ describe('時刻の比較（性質）', () => {
   it('三分律: 「aが後」「bが後」「同時刻」のちょうど1つが成り立つ', () => {
     fc.assert(
       fc.property(anyPairArb, ([a, b]) => {
-        const results = [
-          isLaterTimestamp(db, a, b),
-          isLaterTimestamp(db, b, a),
-          isSameTimestamp(db, a, b),
-        ]
+        // ここで渡すのはどれも `julianday()` が読める書式なので、
+        // 「比べられない」（null）は出てはいけない
+        const order = compareTimestamps(db, a, b)
+        expect(order).not.toBeNull()
+        const results = [order! > 0, order! < 0, order === 0]
         expect(results.filter(Boolean)).toHaveLength(1)
       }),
       { numRuns: 300 }
@@ -85,108 +88,55 @@ describe('時刻の比較（性質）', () => {
   })
 
   it('同じ瞬間なら、書式が違っても「同時刻」と答える', () => {
+    // 字面では揃わない（同日でも ' '(0x20) < 'T'(0x54)）。ここが字面比較へ
+    // 落ちると、同じ瞬間の2行に前後が付いて端末ごとに違う側が勝つ。
     fc.assert(
       fc.property(sameInstantPairArb, ([a, b]) => {
-        expect(isSameTimestamp(db, a, b)).toBe(true)
-        expect(isLaterTimestamp(db, a, b)).toBe(false)
-        expect(isLaterTimestamp(db, b, a)).toBe(false)
+        expect(compareTimestamps(db, a, b)).toBe(0)
       }),
       { numRuns: 300 }
     )
   })
 
-  it('同時刻の判定は対称', () => {
+  it('反対称: 入れ替えると符号だけが反転する', () => {
+    // この関数は**端末ごとに a と b が入れ替わって**呼ばれる。両向きとも同じ
+    // 符号を返すと、2端末が互いに相手を勝たせて収束しなくなる。
     fc.assert(
       fc.property(anyPairArb, ([a, b]) => {
-        expect(isSameTimestamp(db, a, b)).toBe(isSameTimestamp(db, b, a))
+        // 符号どうしを足して 0 を見る。`-0` と `+0` を区別する `toBe` に
+        // 同時刻（0）を渡すと、`-0 !== +0` で落ちてしまう
+        const forward = compareTimestamps(db, a, b)
+        const backward = compareTimestamps(db, b, a)
+        expect(forward).not.toBeNull()
+        expect(backward).not.toBeNull()
+        expect(Math.sign(forward!) + Math.sign(backward!)).toBe(0)
       }),
       { numRuns: 300 }
-    )
-  })
-})
-
-/** 行を1つ作る。 */
-function row(id: string, timestamp: string): Record<string, unknown> {
-  return { id, updatedAt: timestamp }
-}
-
-const idArb = fc.string({ minLength: 1, maxLength: 6 })
-
-describe('勝ち負けの決め方（性質）', () => {
-  it('反対称かつ全域: 別idの2行なら、勝つのはちょうど一方', () => {
-    // 差は 0 を厚めに引く。**同着こそが危ない**（時刻で決まらないぶんを端末ごとに
-    // 違う向きで決めると、互いに相手を勝たせて収束しなくなる）ので、無作為な2つの
-    // 瞬間に任せると滅多に踏まない交点を、意図して濃く踏ませる。
-    const deltaArb = fc.constantFrom(0, 0, 0, 1000, -1000, 86400000)
-    fc.assert(
-      fc.property(
-        idArb,
-        idArb,
-        instantArb,
-        styleArb,
-        deltaArb,
-        styleArb,
-        (idA, idB, msA, styleA, delta, styleB) => {
-          fc.pre(idA !== idB)
-          const a = row(idA, render(msA, styleA))
-          const b = row(idB, render(msA + delta, styleB))
-          const aWins = isPreferredOverRival(db, a, b, 'updatedAt', 'id')
-          const bWins = isPreferredOverRival(db, b, a, 'updatedAt', 'id')
-          // 端末ごとに row と rival が入れ替わって呼ばれる。ここが両方 false や
-          // 両方 true になると、2端末が別々の行を残して収束しない。
-          expect(aWins).not.toBe(bWins)
-        }
-      ),
-      { numRuns: 400 }
-    )
-  })
-
-  it('同じ瞬間を違う書式で書いても、勝つのは主キーの小さい方（端末に依らない）', () => {
-    fc.assert(
-      fc.property(
-        idArb,
-        idArb,
-        instantArb,
-        styleArb,
-        styleArb,
-        (idA, idB, ms, styleA, styleB) => {
-          fc.pre(idA !== idB)
-          const a = row(idA, render(ms, styleA))
-          const b = row(idB, render(ms, styleB))
-          expect(isPreferredOverRival(db, a, b, 'updatedAt', 'id')).toBe(
-            idA < idB
-          )
-        }
-      ),
-      { numRuns: 400 }
     )
   })
 
   it('推移性: a>b かつ b>c なら a>c', () => {
-    const rowArb = fc
-      .tuple(idArb, instantArb, styleArb)
-      .map(([id, ms, style]) => row(id, render(ms, style)))
+    const stampArb = fc
+      .tuple(instantArb, styleArb)
+      .map(([ms, style]) => render(ms, style))
     fc.assert(
-      fc.property(rowArb, rowArb, rowArb, (a, b, c) => {
-        fc.pre(a.id !== b.id && b.id !== c.id && a.id !== c.id)
-        const pref = (x: Record<string, unknown>, y: Record<string, unknown>) =>
-          isPreferredOverRival(db, x, y, 'updatedAt', 'id')
-        fc.pre(pref(a, b) && pref(b, c))
-        expect(pref(a, c)).toBe(true)
+      fc.property(stampArb, stampArb, stampArb, (a, b, c) => {
+        fc.pre(
+          compareTimestamps(db, a, b)! > 0 && compareTimestamps(db, b, c)! > 0
+        )
+        expect(compareTimestamps(db, a, c)).toBeGreaterThan(0)
       }),
       { numRuns: 400 }
     )
   })
 
-  it('時刻列が無いときは、主キーの辞書順だけで決まる', () => {
-    fc.assert(
-      fc.property(idArb, idArb, (idA, idB) => {
-        fc.pre(idA !== idB)
-        const a = row(idA, 'ignored')
-        const b = row(idB, 'ignored')
-        expect(isPreferredOverRival(db, a, b, null, 'id')).toBe(idA < idB)
-      }),
-      { numRuns: 200 }
-    )
+  it('時刻として読めない値は「比べられない」と答える（字面へ落ちない）', () => {
+    // 読めない値どうしの字面順には意味が無い。決着の付け方は場面ごとに違うので、
+    // ここで勝手に決めずに null を返し、呼び出し元（`deduplicateEntries` は
+    // `_changelog.id` で決める）へ渡すこと。
+    expect(
+      compareTimestamps(db, 'not-a-time', '2026-01-01T00:00:00.000Z')
+    ).toBe(null)
+    expect(compareTimestamps(db, 'zzz', 'aaa')).toBe(null)
   })
 })
