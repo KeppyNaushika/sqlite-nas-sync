@@ -3,7 +3,8 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import Database from 'better-sqlite3'
-import { setupChangelog, computeSchemaHash } from '../src/setup'
+import { computeSchemaHash } from '../src/setup'
+import { setupRowsDb } from './helpers/sync-fixtures'
 import {
   readChangelog,
   getMaxChangelogId,
@@ -25,7 +26,7 @@ describe('changelog', () => {
         updatedAt TEXT NOT NULL
       )
     `)
-    setupChangelog(db, [{ name: 'users' }], 'id')
+    setupRowsDb(db, [{ name: 'users' }])
   })
 
   afterEach(() => {
@@ -248,7 +249,7 @@ describe('changelog', () => {
       writable.exec(
         `CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, updatedAt TEXT NOT NULL)`
       )
-      setupChangelog(writable, [{ name: 'users' }], 'id')
+      setupRowsDb(writable, [{ name: 'users' }])
       writable
         .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
         .run('u1', 'Alice', '2024-01-01T00:00:00Z')
@@ -556,7 +557,7 @@ describe('changelog', () => {
       `)
       const before = computeSchemaHash(bare, [{ name: 'users' }])
 
-      setupChangelog(bare, [{ name: 'users' }], 'id')
+      setupRowsDb(bare, [{ name: 'users' }])
       expect(
         bare
           .prepare(
@@ -569,7 +570,7 @@ describe('changelog', () => {
       bare.close()
     })
 
-    it('`setupChangelog` は何度通しても同じ形になる（記録も消さない）', () => {
+    it('案A の取り付けは何度通しても同じ形になる（記録も消さない）', () => {
       db.prepare(
         `INSERT INTO _changelog (tableName, recordId, operation, changedAt) VALUES (?, ?, ?, ?)`
       ).run('users', 'old', 'INSERT', '2020-01-01T00:00:00.000Z')
@@ -577,7 +578,7 @@ describe('changelog', () => {
       expect(readChangelogPrunedThroughId(db)).toBe(1)
 
       // アプリの起動ごとに通る経路。ここで記録が消えると、開いた穴が見えなくなる
-      setupChangelog(db, [{ name: 'users' }], 'id')
+      setupRowsDb(db, [{ name: 'users' }])
       expect(readChangelogPrunedThroughId(db)).toBe(1)
     })
   })

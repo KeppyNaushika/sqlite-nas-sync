@@ -1,0 +1,625 @@
+/**
+ * 旧方式の DB から案A へ移す（`src/rows/migrate.ts`）。
+ * 設計書 `docs/rows-table-design.md` §3.9 と、§11 の段階4。
+ *
+ * ここで見るのは4つ:
+ *
+ * - **写し替えが正しいこと**（版の3列・アプリの表に居る id の墓標・`_changelog` を刈らない）
+ * - **列の増減に追従すること**（トリガーの作り直し・全行の書き直し・落とせない列）
+ * - **途中で落ちたら何も起きないこと**（1トランザクション）
+ * - **移行した2端末が食い違わないこと**（`_sns_ts` に時刻列の値を入れる効き目）
+ */
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
+import { setupLegacyChangelog } from './helpers/legacy-changelog'
+import { importFromPeer } from '../src/rows/import'
+import { SNS_META_KEYS, readSnsMeta } from '../src/rows/meta'
+import {
+  constantDefaultSql,
+  migrateToRows,
+  needsRowsMigration,
+} from '../src/rows/migrate'
+import { rowsTableName } from '../src/rows/schema'
+import { rowsTriggerNames } from '../src/rows/triggers'
+import { rebuildOnce } from '../src/rows/rebuild'
+
+const NOTES = `CREATE TABLE notes (
+  id        TEXT PRIMARY KEY NOT NULL,
+  title     TEXT NOT NULL,
+  body      TEXT,
+  updatedAt TEXT
+)`
+
+type Row = Record<string, unknown>
+
+let workDir: string
+const open: Database.Database[] = []
+
+beforeEach(() => {
+  workDir = mkdtempSync(join(tmpdir(), 'sns-migrate-'))
+})
+
+afterEach(() => {
+  for (const db of open.splice(0)) {
+    try {
+      db.close()
+    } catch {
+      /* 既に閉じている */
+    }
+  }
+  rmSync(workDir, { recursive: true, force: true })
+})
+
+/** 旧方式の DB を1つ作る（`_changelog` / `_tombstone` / `_id_merge` がある形）。 */
+function legacyDb(
+  statements: string[] = [NOTES],
+  tables: string[] = ['notes']
+): Database.Database {
+  const db = new Database(':memory:')
+  open.push(db)
+  db.pragma('foreign_keys = ON')
+  for (const statement of statements) db.exec(statement)
+  setupLegacyChangelog(
+    db,
+    tables.map((name) => ({ name })),
+    'id'
+  )
+  db.prepare(
+    `INSERT OR REPLACE INTO _sync_meta (key, value) VALUES ('schemaVersion', 'app1')`
+  ).run()
+  return db
+}
+
+function rowsOf(db: Database.Database, table: string): Row[] {
+  return db
+    .prepare(
+      `SELECT * FROM ${JSON.stringify(rowsTableName(table))} ORDER BY "id"`
+    )
+    .all() as Row[]
+}
+
+function tombstonesOf(db: Database.Database): Row[] {
+  return db
+    .prepare(`SELECT * FROM _tombstone ORDER BY tableName, recordId`)
+    .all() as Row[]
+}
+
+function triggerNamesOf(db: Database.Database): Set<string> {
+  return new Set(
+    (
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger'`)
+        .all() as { name: string }[]
+    ).map((row) => row.name)
+  )
+}
+
+/* ================================================================== *
+ * 旧方式から移す（§3.9 の1〜7）
+ * ================================================================== */
+
+describe('旧方式の DB を案A へ移す', () => {
+  it('アプリの表の中身が、時刻列の値を版として `_sns_rows_*` に入る', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n2', 'に', 'ほん', '2026-02-02')`
+    ).run()
+
+    expect(needsRowsMigration(db)).toBe(true)
+    const result = migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+
+    expect(result.from).toBe('legacy')
+    const rows = rowsOf(db, 'notes')
+    expect(rows.map((row) => row.id)).toEqual(['n1', 'n2'])
+    // §3.9 の C: `_sns_ts` は時刻列の値、lamport は 0、端末は自分
+    expect(rows[0]._sns_ts).toBe('2026-01-01')
+    expect(rows[1]._sns_ts).toBe('2026-02-02')
+    expect(rows.every((row) => row._sns_lamport === 0)).toBe(true)
+    expect(rows.every((row) => row._sns_instance === 'iid-a')).toBe(true)
+    expect(needsRowsMigration(db)).toBe(false)
+  })
+
+  it('時刻列が無い表では `_sns_ts` が NULL になる', () => {
+    const db = legacyDb(
+      [`CREATE TABLE plain (id TEXT PRIMARY KEY NOT NULL, v TEXT)`],
+      ['plain']
+    )
+    db.prepare(`INSERT INTO plain VALUES ('p1', 'あ')`).run()
+    migrateToRows(db, { tables: ['plain'], instanceId: 'iid-a' })
+    expect(rowsOf(db, 'plain')[0]._sns_ts).toBeNull()
+  })
+
+  it('`_tombstone` と `_changelog` を作り直し、版の3列を足す', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    db.prepare(`DELETE FROM notes WHERE id = 'n1'`).run()
+    const changelogBefore = (
+      db.prepare(`SELECT COUNT(*) AS n FROM _changelog`).get() as { n: number }
+    ).n
+    expect(changelogBefore).toBeGreaterThan(0)
+
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+
+    const tombstones = tombstonesOf(db)
+    expect(tombstones).toHaveLength(1)
+    // §3.9 の3: 残す墓標の `_sns_ts` は NULL（群0 ＝ 最小）
+    expect(tombstones[0]._sns_ts).toBeNull()
+    expect(tombstones[0]._sns_lamport).toBe(0)
+    expect(tombstones[0]._sns_instance).toBe('iid-a')
+    // 旧「畳み」の事実は捨てる
+    const columns = (
+      db.prepare(`PRAGMA table_info(_tombstone)`).all() as { name: string }[]
+    ).map((row) => row.name)
+    expect(columns).toEqual([
+      'tableName',
+      'recordId',
+      'deletedAt',
+      '_sns_ts',
+      '_sns_lamport',
+      '_sns_instance',
+    ])
+    expect(
+      db.prepare(`SELECT 1 FROM sqlite_master WHERE name = '_id_merge'`).get()
+    ).toBeUndefined()
+    // §3.9 の G: `_changelog` は刈らない（id もそのまま）
+    const after = db.prepare(`SELECT id FROM _changelog ORDER BY id`).all() as {
+      id: number
+    }[]
+    expect(after).toHaveLength(changelogBefore)
+    expect(after[0].id).toBe(1)
+  })
+
+  it('旧 `_tombstone` の畳みの列（mergedInto / revokedAt）は写さない', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto, revokedAt)
+       VALUES ('notes', 'lost', '2026-01-01', 'winner', NULL)`
+    ).run()
+    db.prepare(
+      `INSERT INTO _id_merge (tableName, losingId, winningId) VALUES ('notes', 'lost', 'winner')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    const kept = tombstonesOf(db)
+    expect(kept).toHaveLength(1)
+    expect(kept[0].recordId).toBe('lost')
+    expect(Object.keys(kept[0])).not.toContain('mergedInto')
+  })
+
+  it('アプリの表に同じ id がある墓標は消す（§3.9 の3）', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    // 表名の綴りをわざとずらし、正規化を通っていることも見る
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt)
+       VALUES ('NOTES', 'n1', '2025-12-31')`
+    ).run()
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt)
+       VALUES ('Notes', 'gone', '2025-12-31')`
+    ).run()
+
+    const result = migrateToRows(db, {
+      tables: ['notes'],
+      instanceId: 'iid-a',
+    })
+
+    const kept = tombstonesOf(db)
+    expect(kept.map((row) => row.recordId)).toEqual(['gone'])
+    // 綴りは畳んだものへ揃う
+    expect(kept[0].tableName).toBe('notes')
+    expect(result.tables[0].droppedTombstones).toBe(1)
+    // 残したままだと、版の鍵が完全一致して削除が勝ち、最初の作り直しで行が消える
+    const outcome = rebuildOnce(db, { tables: ['notes'] })
+    expect(outcome.status).toBe('applied')
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM notes`).get()).toEqual({
+      n: 1,
+    })
+  })
+
+  it('同期しない表の墓標はそのまま残す', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt)
+       VALUES ('other', 'x1', '2025-12-31')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    expect(tombstonesOf(db).map((row) => row.tableName)).toEqual(['other'])
+  })
+
+  it('旧トリガーを落とし、案A の4本を作り、補助の表と鍵を揃える', () => {
+    const db = legacyDb()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+
+    const triggers = triggerNamesOf(db)
+    for (const name of rowsTriggerNames('notes'))
+      expect(triggers.has(name)).toBe(true)
+    expect(triggers.has('_changelog_after_insert_notes')).toBe(false)
+    expect(triggers.has('_changelog_after_delete_notes')).toBe(false)
+
+    expect(db.prepare(`SELECT * FROM _sns_clock`).get()).toMatchObject({
+      onlyRow: 0,
+      lamport: 0,
+      instanceId: 'iid-a',
+      importTick: 0,
+    })
+    expect(
+      db.prepare(`SELECT tick FROM _sns_tick WHERE tableName = 'notes'`).get()
+    ).toEqual({ tick: 0 })
+    expect(db.prepare(`SELECT tableName FROM _sns_dirty`).all()).toEqual([
+      { tableName: 'notes' },
+    ])
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM _sync_state`).get()).toEqual({
+      n: 0,
+    })
+
+    // §3.1 の鍵の名前（H）
+    expect(readSnsMeta(db, SNS_META_KEYS.instanceId)).toBe('iid-a')
+    expect(readSnsMeta(db, SNS_META_KEYS.generation)).toBe('0')
+    expect(readSnsMeta(db, SNS_META_KEYS.lastInstance)).toBe('iid-a')
+    expect(readSnsMeta(db, SNS_META_KEYS.lastLamport)).toBe('0')
+    // §3.8 の形式の欄
+    expect(readSnsMeta(db, 'schemaVersion')).toBe('app1;sns-format=rows1')
+  })
+
+  it('`_sns_rebuilding` の残りは、知らせたうえでトリガーを作る前に消す（§3.10 の I）', () => {
+    const db = legacyDb()
+    db.exec(
+      `CREATE TABLE _sns_rebuilding (onlyRow INTEGER PRIMARY KEY CHECK (onlyRow = 0), startedAt TEXT)`
+    )
+    db.prepare(`INSERT INTO _sns_rebuilding VALUES (0, '2026-01-01')`).run()
+
+    const result = migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    expect(result.clearedRebuilding).toBe(true)
+    expect(result.warnings.join('\n')).toContain('_sns_rebuilding')
+    expect(
+      db.prepare(`SELECT COUNT(*) AS n FROM _sns_rebuilding`).get()
+    ).toEqual({ n: 0 })
+
+    // 旗が残っていたら、このあとの書き込みは1つも事実にならない
+    db.prepare(
+      `INSERT INTO notes VALUES ('n9', 'く', NULL, '2026-03-03')`
+    ).run()
+    expect(rowsOf(db, 'notes')).toHaveLength(1)
+  })
+
+  it('移行のあと、トリガー → 取り込み → 作り直しの経路が通る（段階2・3）', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+
+    // トリガー: アプリの書き込みが事実になる
+    db.prepare(
+      `UPDATE notes SET title = 'いち改', updatedAt = '2026-05-05' WHERE id = 'n1'`
+    ).run()
+    expect(rowsOf(db, 'notes')[0]).toMatchObject({
+      title: 'いち改',
+      _sns_ts: '2026-05-05',
+    })
+    expect(
+      (
+        db.prepare(`SELECT lamport FROM _sns_clock`).get() as {
+          lamport: number
+        }
+      ).lamport
+    ).toBeGreaterThan(0)
+
+    // 取り込み: 相手の強い版が入る
+    const peer = legacyDb()
+    peer
+      .prepare(`INSERT INTO notes VALUES ('n2', 'に', NULL, '2026-06-06')`)
+      .run()
+    migrateToRows(peer, { tables: ['notes'], instanceId: 'iid-b' })
+    const imported = importFromPeer(db, peer, { tables: ['notes'] })
+    expect(imported.status).toBe('imported')
+    expect(rowsOf(db, 'notes').map((row) => row.id)).toEqual(['n1', 'n2'])
+
+    // 作り直し: アプリの表が `_sns_rows_*` の姿に揃う
+    const outcome = rebuildOnce(db, { tables: ['notes'] })
+    expect(outcome.status).toBe('applied')
+    expect(db.prepare(`SELECT id FROM notes ORDER BY id`).all()).toEqual([
+      { id: 'n1' },
+      { id: 'n2' },
+    ])
+  })
+
+  it('2端末がそれぞれ移行したあと、新しい時刻の側が勝つ（§3.9 の C の効き目）', () => {
+    const a = legacyDb()
+    a.prepare(
+      `INSERT INTO notes VALUES ('n1', '古い', NULL, '2026-01-01')`
+    ).run()
+    migrateToRows(a, { tables: ['notes'], instanceId: 'iid-a' })
+
+    const b = legacyDb()
+    b.prepare(
+      `INSERT INTO notes VALUES ('n1', '新しい', NULL, '2026-09-09')`
+    ).run()
+    migrateToRows(b, { tables: ['notes'], instanceId: 'iid-b' })
+
+    // どちらの向きに取り込んでも、時刻の新しい側が勝つ（乱数で決まらない）
+    importFromPeer(a, b, { tables: ['notes'] })
+    importFromPeer(b, a, { tables: ['notes'] })
+    expect(rowsOf(a, 'notes')[0].title).toBe('新しい')
+    expect(rowsOf(b, 'notes')[0].title).toBe('新しい')
+    rebuildOnce(a, { tables: ['notes'] })
+    rebuildOnce(b, { tables: ['notes'] })
+    expect(a.prepare(`SELECT title FROM notes`).get()).toEqual({
+      title: '新しい',
+    })
+    expect(b.prepare(`SELECT title FROM notes`).get()).toEqual({
+      title: '新しい',
+    })
+  })
+})
+
+/* ================================================================== *
+ * 列の増減（§3.9 の D・E）
+ * ================================================================== */
+
+describe('列の増減へ追従する', () => {
+  /** 既に案A へ移した DB を1つ作る。 */
+  function migrated(instanceId = 'iid-a'): Database.Database {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', 'ほん', '2026-01-01')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId })
+    return db
+  }
+
+  it('列が増えたら、トリガーを作り直し、全行を新しい版で書き直す', () => {
+    const db = migrated()
+    const before = db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE name = '_sns_after_insert_notes'`
+      )
+      .get() as { sql: string }
+    db.exec(`ALTER TABLE notes ADD COLUMN tag TEXT`)
+    db.prepare(`UPDATE notes SET tag = 'あか'`).run()
+
+    const result = migrateToRows(db, {
+      tables: ['notes'],
+      instanceId: 'iid-a2',
+    })
+    expect(result.from).toBe('refresh')
+    expect(result.tables[0].addedColumns).toEqual(['tag'])
+    expect(result.tables[0].rewritten).toBe(true)
+
+    const rows = rowsOf(db, 'notes')
+    expect(rows[0].tag).toBe('あか')
+    // §3.9 の E: lamport は進み、端末は自分になる
+    expect(rows[0]._sns_lamport).toBeGreaterThan(0)
+    expect(rows[0]._sns_instance).toBe('iid-a2')
+    // §1.2.1 の3項の最大（時刻列の値がいちばん強い）
+    expect(rows[0]._sns_ts).toBe('2026-01-01')
+
+    const after = db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE name = '_sns_after_insert_notes'`
+      )
+      .get() as { sql: string }
+    expect(after.sql).not.toBe(before.sql)
+    expect(after.sql).toContain('"tag"')
+
+    // 作り直しても、アプリが書いた値が既定値へ戻らない
+    rebuildOnce(db, { tables: ['notes'] })
+    expect(db.prepare(`SELECT tag FROM notes`).get()).toEqual({ tag: 'あか' })
+  })
+
+  it('列が減ったら `_sns_rows_*` からも落とし、アプリの INSERT が通る', () => {
+    const db = migrated()
+    // アプリが表を組み直して列を落とす（`DROP COLUMN` はトリガーが `NEW.body` を
+    // 見ているあいだ通らないので、実際の移行はこの形になる）
+    db.exec(`CREATE TABLE notes_new (
+      id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, updatedAt TEXT)`)
+    db.exec(`INSERT INTO notes_new SELECT id, title, updatedAt FROM notes`)
+    db.exec(`DROP TABLE notes`)
+    db.exec(`ALTER TABLE notes_new RENAME TO notes`)
+
+    const result = migrateToRows(db, {
+      tables: ['notes'],
+      instanceId: 'iid-a2',
+    })
+    expect(result.tables[0].removedColumns).toEqual(['body'])
+    expect(result.tables[0].rewritten).toBe(true)
+    expect(Object.keys(rowsOf(db, 'notes')[0])).not.toContain('body')
+
+    // 落とさないと `has no column named body` で落ちる
+    db.prepare(
+      `INSERT INTO notes (id, title, updatedAt) VALUES ('n2', 'に', '2026-02-02')`
+    ).run()
+    expect(rowsOf(db, 'notes')).toHaveLength(2)
+  })
+
+  it('増えた列の既定値が定数なら、アプリの表に居ない行にもその定数を入れる', () => {
+    const db = migrated()
+    // アプリの表に居ない行（隠れた行・置かない行に相当）を1つ置く
+    db.prepare(
+      `INSERT INTO ${JSON.stringify(rowsTableName('notes'))}
+         ("id", "title", "body", "updatedAt", "_sns_ts", "_sns_lamport", "_sns_instance")
+       VALUES ('hidden', 'かくれ', NULL, '2026-01-01', '2026-01-01', 0, 'iid-a')`
+    ).run()
+    db.exec(`ALTER TABLE notes ADD COLUMN tag TEXT NOT NULL DEFAULT 'みどり'`)
+
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+    const rows = rowsOf(db, 'notes')
+    expect(rows.map((row) => row.tag)).toEqual(['みどり', 'みどり'])
+  })
+
+  it('増えた列が NOT NULL で既定値が定数でなく、埋め直せない行があれば例外', () => {
+    const db = migrated()
+    db.prepare(
+      `INSERT INTO ${JSON.stringify(rowsTableName('notes'))}
+         ("id", "title", "body", "updatedAt", "_sns_ts", "_sns_lamport", "_sns_instance")
+       VALUES ('hidden', 'かくれ', NULL, '2026-01-01', '2026-01-01', 0, 'iid-a')`
+    ).run()
+    // `ALTER TABLE ADD COLUMN` は定数でない既定値を受け取らないので、表を組み直す
+    db.exec(`
+      CREATE TABLE notes_new (
+        id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, body TEXT, updatedAt TEXT,
+        seen TEXT NOT NULL DEFAULT (datetime('now'))
+      )`)
+    db.exec(
+      `INSERT INTO notes_new (id, title, body, updatedAt) SELECT id, title, body, updatedAt FROM notes`
+    )
+    db.exec(`DROP TABLE notes`)
+    db.exec(`ALTER TABLE notes_new RENAME TO notes`)
+
+    expect(() =>
+      migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+    ).toThrow(/NOT NULL/)
+    // 1トランザクションなので、列は足されていない
+    expect(Object.keys(rowsOf(db, 'notes')[0])).not.toContain('seen')
+  })
+
+  it('埋め直せない行が無ければ、定数でない既定値でも警告だけで通す', () => {
+    const db = migrated()
+    db.exec(`
+      CREATE TABLE notes_new (
+        id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, body TEXT, updatedAt TEXT,
+        seen TEXT NOT NULL DEFAULT (datetime('now'))
+      )`)
+    db.exec(
+      `INSERT INTO notes_new (id, title, body, updatedAt) SELECT id, title, body, updatedAt FROM notes`
+    )
+    db.exec(`DROP TABLE notes`)
+    db.exec(`ALTER TABLE notes_new RENAME TO notes`)
+
+    const result = migrateToRows(db, {
+      tables: ['notes'],
+      instanceId: 'iid-a2',
+    })
+    expect(result.warnings.join('\n')).toContain('seen')
+    expect(rowsOf(db, 'notes')[0].seen).not.toBeNull()
+  })
+
+  it('主キーの列名が変わったら例外（`_sns_rows_*` の主キーは落とせない）', () => {
+    const db = migrated()
+    db.exec(`ALTER TABLE notes RENAME COLUMN id TO noteId`)
+    expect(() =>
+      migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+    ).toThrow(/主キーの列名/)
+  })
+
+  it('列が変わっていなければ書き直さない（版はそのまま）', () => {
+    const db = migrated()
+    const before = rowsOf(db, 'notes')[0]
+    const result = migrateToRows(db, {
+      tables: ['notes'],
+      instanceId: 'iid-a2',
+    })
+    expect(result.tables[0].rewritten).toBe(false)
+    expect(rowsOf(db, 'notes')[0]).toEqual(before)
+  })
+})
+
+/* ================================================================== *
+ * 途中で落ちたとき（§3.9 の1トランザクション）
+ * ================================================================== */
+
+describe('途中で落ちたとき', () => {
+  it('移行の途中で落ちたら、DB は旧方式のまま元へ戻る', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    db.prepare(`DELETE FROM notes WHERE id = 'n1'`).run()
+    const changelogBefore = db
+      .prepare(`SELECT * FROM _changelog ORDER BY id`)
+      .all()
+    const tombstoneBefore = db.prepare(`SELECT * FROM _tombstone`).all()
+
+    // 主キーの列名を変えて例外にする（移行の後半で落ちる形を作る）
+    expect(() =>
+      migrateToRows(db, { tables: ['notes', 'missing'], instanceId: 'iid-a' })
+    ).toThrow()
+
+    expect(needsRowsMigration(db)).toBe(true)
+    expect(db.prepare(`SELECT * FROM _changelog ORDER BY id`).all()).toEqual(
+      changelogBefore
+    )
+    expect(db.prepare(`SELECT * FROM _tombstone`).all()).toEqual(
+      tombstoneBefore
+    )
+    // 旧トリガーも `_id_merge` も残っている
+    expect(triggerNamesOf(db).has('_changelog_after_insert_notes')).toBe(true)
+    expect(
+      db.prepare(`SELECT 1 FROM sqlite_master WHERE name = '_id_merge'`).get()
+    ).toBeDefined()
+    expect(
+      db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE name = ?`)
+        .get(rowsTableName('notes'))
+    ).toBeUndefined()
+  })
+
+  it('COMMIT のあと・NAS への写しの前に落ちても、次の起動が正しく続ける', () => {
+    const file = join(workDir, 'local.sqlite')
+    const first = new Database(file)
+    open.push(first)
+    first.exec(NOTES)
+    setupLegacyChangelog(first, [{ name: 'notes' }], 'id')
+    first
+      .prepare(`INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`)
+      .run()
+    migrateToRows(first, { tables: ['notes'], instanceId: 'iid-a' })
+    const rowsAfterMigration = rowsOf(first, 'notes')
+    // ここで落ちた（写しは書いていない）
+    first.close()
+
+    const second = new Database(file)
+    open.push(second)
+    expect(needsRowsMigration(second)).toBe(false)
+    // 次の起動は `refresh` として通り、事実を作り直さない
+    const result = migrateToRows(second, {
+      tables: ['notes'],
+      instanceId: 'iid-a2',
+    })
+    expect(result.from).toBe('refresh')
+    expect(result.tables[0].rewritten).toBe(false)
+    expect(rowsOf(second, 'notes')).toEqual(rowsAfterMigration)
+    // `instanceId` だけは作り直す（§3.2）
+    expect(readSnsMeta(second, SNS_META_KEYS.instanceId)).toBe('iid-a2')
+    expect(db2Instance(second)).toBe('iid-a2')
+  })
+})
+
+function db2Instance(db: Database.Database): string {
+  return (
+    db.prepare(`SELECT instanceId FROM _sns_clock`).get() as {
+      instanceId: string
+    }
+  ).instanceId
+}
+
+/* ================================================================== *
+ * 既定値が定数か
+ * ================================================================== */
+
+describe('既定値が定数か', () => {
+  it('定数の字面だけを返す', () => {
+    expect(constantDefaultSql(`0`)).toBe('0')
+    expect(constantDefaultSql(`(0)`)).toBe('0')
+    expect(constantDefaultSql(`'あ'`)).toBe(`'あ'`)
+    expect(constantDefaultSql(`NULL`)).toBe('NULL')
+    expect(constantDefaultSql(`X'00ff'`)).toBe(`X'00ff'`)
+    expect(constantDefaultSql(`-1.5e3`)).toBe('-1.5e3')
+  })
+
+  it('評価のたびに変わるものは定数ではない', () => {
+    expect(constantDefaultSql(`CURRENT_TIMESTAMP`)).toBeNull()
+    expect(constantDefaultSql(`(datetime('now'))`)).toBeNull()
+    expect(constantDefaultSql(null)).toBeNull()
+  })
+})

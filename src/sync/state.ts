@@ -128,8 +128,8 @@ function makeRowPresenceProbe(
 /**
  * 2つのエントリのうち、`candidate` の方が後に起きたか。
  *
- * 時刻が同じ（または時刻として読めない）ときは、相手の現在の中身 → id の順で決める
- * （理由は {@link deduplicateEntries}）。
+ * まず**相手の現在の中身と話が合う方**を採り、それで決まらないときに時刻 → id で
+ * 決める（理由は {@link deduplicateEntries}）。
  * @internal
  */
 function happenedAfter(
@@ -138,17 +138,34 @@ function happenedAfter(
   candidate: ChangelogEntry,
   kept: ChangelogEntry
 ): boolean {
-  const order = compareTimestamps(db, candidate.changedAt, kept.changedAt)
-  if (order !== null && order !== 0) return order > 0
-
-  // 時刻で決まらない（同時刻・または時刻として読めない）。相手の現在の中身と
-  // 話が合う方を採る。**両方が合う／どちらも合わないときは決めない**（下の id へ）。
+  // **相手の現在の中身が、いちばん確かな手掛かりである。**
+  //
+  // 相手の `_changelog` は「相手が自分の行に行った操作の記録」ではない ——
+  // {@link mergeChangelog} がフルマージで**他人のエントリをそのまま写す**ので、
+  // 相手自身が採らなかった削除がそこに並ぶ。写されたエントリは相手の履歴では
+  // ないから、時刻（や id）の大小で「相手で最後に起きたこと」を決めてはいけない。
+  //
+  // 実測（3端末・性質テスト seed 941021465）: B が `tags:g3` を `g1` へ畳み、C は
+  // その畳みを「自分の g3 の方が新しい」と正しく見送った（C の g3 は生きている）。
+  // ところが C のフルマージが B の `DELETE tags:g3` を**自分の changelog へ写した**
+  // ため、A/B が C を読むと、時刻の新しいその DELETE が C 自身の g3 の書き込みを
+  // 覆い隠した。しかも C には墓標が無いので削除時刻は `entry.changedAt`（＝現在時刻）
+  // に落ち、A/B は **現在時刻の墓標**を立てて C の生きた g3 を永久に拒んだ
+  // （膠着としても報告されない）。
+  //
+  // 話の合わない方を落としても何も失わない ——行が無いのに INSERT/UPDATE を選んでも
+  // `processChangelogEntries` の `if (!remoteRecord) continue` で捨てられるだけで、
+  // 逆に行が在るのに DELETE を選ぶと、上記のとおり生きた行を殺す。
+  // **両方が合う／どちらも合わないときは決めない**（下の時刻 → id へ）。
   const present = hasRow(candidate.tableName, candidate.recordId)
   if (present !== null) {
     const candidateAgrees = (candidate.operation === 'DELETE') !== present
     const keptAgrees = (kept.operation === 'DELETE') !== present
     if (candidateAgrees !== keptAgrees) return candidateAgrees
   }
+
+  const order = compareTimestamps(db, candidate.changedAt, kept.changedAt)
+  if (order !== null && order !== 0) return order > 0
 
   // 最後の手掛かりは「そのDBが後から書いた方」。**字面の大小へ落としてはいけない**
   // —— 読めない値どうしの字面順には意味が無い。

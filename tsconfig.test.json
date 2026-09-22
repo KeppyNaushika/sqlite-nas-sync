@@ -12,5 +12,9 @@
     // vitest.config.mts の `globals: true` で生える describe/it/expect などを認識させる
     "types": ["vitest/globals", "node"]
   },
+  // 基底の `exclude` は `__tests__` を外しているので、ここで上書きする
+  // （`exclude` は `include` を後から絞るため、打ち消さないとテストが1件も
+  // 検査されない）
+  "exclude": ["node_modules", "dist"],
   "include": ["src/**/*", "__tests__/**/*", "vitest.config.mts"]
 }

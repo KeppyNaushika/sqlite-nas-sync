@@ -85,7 +85,7 @@ export function readChangelogPrunedThroughId(db: Database.Database): number {
       .get() as { prunedThroughId: number } | undefined
     return row?.prunedThroughId ?? 0
   } catch {
-    // 表が無い（相手が旧版 / setupChangelog を通していないDB）
+    // 表が無い（相手が旧版 / 案A の取り付けを通していないDB）
     return 0
   }
 }

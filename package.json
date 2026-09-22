@@ -22,6 +22,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test:watch": "vitest",
+    "explore": "tsc -p tools/tsconfig.json && node node_modules/.cache/explore/tools/explore-convergence.js",
     "docs": "typedoc",
     "docs:serve": "typedoc && npx serve docs/api -l 3333",
     "prepublishOnly": "npm run build"
