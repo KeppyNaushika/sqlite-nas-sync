@@ -11,10 +11,39 @@
  */
 import Database from 'better-sqlite3'
 
-// 識別子の比較は**1か所だけ**に置く。同じ規則の実装が2つあると、片方だけ直したときに
-// もう片方が古い意味のまま残る（この規則を1か所へ集めるための変更で、実装を2つに
-// 増やしてしまったことがある）。
-export { isSameIdentifier } from '../conflict/schema'
+/**
+ * SQLiteの識別子は大文字小文字を区別しないため、名前を畳んで比較する。
+ *
+ * `PRAGMA` は宣言どおりの綴りを返し、設定は利用者が書いた綴りを持つ。
+ * **字面で突き合わせると、綴りが違うだけで判断が丸ごと素通りする。**
+ *
+ * 畳むのは **ASCII の A–Z だけ**。SQLite の既定の照合順序（`BINARY` / `NOCASE`）が
+ * そうだからで、`toLowerCase()` を使うと全 Unicode を畳んでしまい、SQLite にとっては
+ * **別の識別子**である組（ケルビン記号 `K` U+212A と `k` など）を同じものと答える。
+ * ここでの答えは「SQLiteがこの2つを同じ列とみなすか」でなければならない。
+ *
+ * 識別子の比較は**1か所だけ**に置く。同じ規則の実装が2つあると、片方だけ直したときに
+ * もう片方が古い意味のまま残る（この規則を1か所へ集めるための変更で、実装を2つに
+ * 増やしてしまったことがある）。
+ * @internal
+ */
+export function isSameIdentifier(a: string, b: string): boolean {
+  return foldIdentifier(a) === foldIdentifier(b)
+}
+
+/**
+ * 識別子を、比較や**マップのキー**に使える形へ畳む。
+ *
+ * 畳む範囲は {@link isSameIdentifier} と同じ ASCII の A–Z だけ。
+ * キーの作り方と比較の仕方が食い違うと、「マップでは同じ、比較では別」という
+ * ねじれが生まれるので、**どちらもここを通す**。
+ * @internal
+ */
+export function foldIdentifier(value: string): string {
+  return value.replace(/[A-Z]/g, (char) =>
+    String.fromCharCode(char.charCodeAt(0) + 32)
+  )
+}
 
 /** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
 export interface ColumnInfo {

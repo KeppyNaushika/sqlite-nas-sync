@@ -10,10 +10,9 @@
  */
 import Database from 'better-sqlite3'
 import { ChangelogEntry, SyncResult } from '../types'
-import { foldIdentifier } from '../conflict/schema'
-import { compareTimestamps } from '../conflict/timestamp'
+import { escapeIdentifier, foldIdentifier } from '../setup/sql'
+import { compareTimestamps } from './timestamp'
 import { NOW_SQL } from '../setup'
-import { escapeIdentifier } from './sql'
 
 /**
  * 同一レコード（tableName:recordId）の重複changelogエントリを、
@@ -38,7 +37,7 @@ import { escapeIdentifier } from './sql'
  * （警告も出ない）。
  *
  * したがって時刻で比べる。書式が混在するので字面ではなく
- * {@link isLaterTimestamp} で（＝時刻として）比べる。
+ * {@link compareTimestamps} で（＝時刻として）比べる。
  *
  * **同時刻のときに id で決めるだけでは足りない。** `mergeChangelog` が写した
  * 相手のエントリは、元の `changedAt` のまま**自分の DELETE より大きい id**に並ぶ。

@@ -17,10 +17,10 @@
  * @internal
  */
 
-import { foldIdentifier } from '../conflict/schema'
+import { foldIdentifier } from '../setup/sql'
 
 /** 拾った関数呼び出し1つ。 */
-export interface FunctionCall {
+interface FunctionCall {
   /**
    * 関数の名前（引用符を外し、{@link foldIdentifier} で畳んだもの）。
    *
@@ -40,7 +40,7 @@ export interface FunctionCall {
  * 日付の関数はここに入れない。**引数に `'now'`・`'localtime'`・`'utc'` を
  * 含む使い方だけ**が決定的でないので、{@link TIME_FUNCTIONS} で別に見る。
  */
-export const NON_DETERMINISTIC_FUNCTIONS = new Set([
+const NON_DETERMINISTIC_FUNCTIONS = new Set([
   'random',
   'randomblob',
   'changes',
@@ -53,7 +53,7 @@ export const NON_DETERMINISTIC_FUNCTIONS = new Set([
 ])
 
 /** 引数しだいで決定的でなくなる、日付の関数。 */
-export const TIME_FUNCTIONS = new Set([
+const TIME_FUNCTIONS = new Set([
   'date',
   'time',
   'datetime',
@@ -163,7 +163,7 @@ function tokenize(sql: string): Token[] {
  * 落ちている）。`CHECK (…)` や `IN (…)` のような、名前に `(` が続くだけの形も
  * 拾ってしまうが、断る名前の一覧に入っていないので害は無い。
  */
-export function functionCalls(sql: string): FunctionCall[] {
+function functionCalls(sql: string): FunctionCall[] {
   const tokens = tokenize(sql)
   const calls: FunctionCall[] = []
   for (let at = 0; at < tokens.length; at += 1) {

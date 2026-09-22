@@ -53,6 +53,20 @@ const REMOVED_IN_STAGE6 =
   '案A で同じ形を踏むなら、版の比較（src/rows/versions.ts）か取り込み（src/rows/import.ts）に ' +
   '当たる壊し方を書き直すこと'
 
+/**
+ * `edits` はまだ当たるが、**壊しても症状が出ない**壊し方に添える文言。
+ *
+ * {@link REMOVED_IN_STAGE6} と分けてあるのは、「書き換える箇所が無い」と
+ * 「箇所はあるが意味が無い」では直し方が違うからである。前者は書き換え先を
+ * 探し直すことになるが、後者は `find` をそのまま使えるので、**症状が出る経路を
+ * 足せばそのまま駆動できる**。
+ */
+const UNOBSERVABLE_IN_STAGE6 =
+  '書き換える箇所は src/ にまだ在る（`find` は1か所に当たる）が、壊しても症状が出ない。' +
+  '症状が出る経路（_changelog のエントリで他端末の見え方が決まる形）が段階6 で消え、' +
+  '案A では取り込みの入口が版の Max だけになったため。駆動するなら、まず何が壊れるのかを' +
+  '書き直すこと'
+
 export const MUTANTS: Mutant[] = [
   {
     name: 'stalemate-by-literal',
@@ -127,9 +141,10 @@ export const MUTANTS: Mutant[] = [
       'isPreferredOverRival（src/conflict/timestamp.ts）の同着判定を、時刻としての比較' +
       '（isSameTimestamp）から字面の !== へ戻す。同じ瞬間・違う書式の2行は「差がある」と' +
       '判断されるのに isLaterTimestamp は両向きとも false を返すので、2端末が互いに相手を' +
-      '勝たせる。**現在の src/ では、畳む向きの食い違いを conflict/merged-delete.ts の決着が' +
-      '後から拾うので、端末2台・書式混在・深さ3まで（20,755状態）の範囲では表に出ない**（検査器で確認済み）。' +
-      '検査器の見逃しを確かめる用途には使えない。',
+      '勝たせる。当時の src/ でも、畳む向きの食い違いを conflict/merged-delete.ts の決着が' +
+      '後から拾うので、端末2台・書式混在・深さ3まで（20,755状態）の範囲では表に出なかった' +
+      '（検査器で確認済み）。**その後 isPreferredOverRival そのものが消えた**（案A の勝ち負けは' +
+      'src/rows/versions.ts の版の順序が決める）ので、`edits` の指す conflict/timestamp.ts は無い。',
     suggestedArgs: '--formats 0,1 --depth 3',
     edits: [
       {
@@ -158,7 +173,7 @@ export const MUTANTS: Mutant[] = [
   },
   {
     name: 'dedup-by-id',
-    pending: REMOVED_IN_STAGE6,
+    pending: UNOBSERVABLE_IN_STAGE6,
     description:
       'deduplicateEntries（src/sync/state.ts）が同じ行のエントリから「最後の id」を採る形へ' +
       '戻す。フルマージは相手のエントリを元の changedAt のまま新しい id で写すので、id 順と' +
@@ -218,7 +233,7 @@ export const MUTANTS: Mutant[] = [
       '**`--tables nocase_notes` で踏む**（時刻列を `COLLATE NOCASE` で宣言し、行の時刻を' +
       '大文字小文字だけ違う `TS-A` / `ts-a` にした表）。' +
       '**実測（2026-09-16）: 判定1（黙った食い違い）が深さ2 で捕まえる**（畳んで同着になった2つの版で、' +
-      '端末ごとに違う勝者が残り、膠着としても報告されない）。',
+      '端末ごとに違う勝者が残り、黙って食い違う）。',
     suggestedArgs:
       '--tables nocase_notes --ids 2 --keys 1 --depth 2 --oracle rows-d1',
     edits: [

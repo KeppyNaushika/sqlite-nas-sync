@@ -13,10 +13,10 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
-import { isLaterTimestamp } from '../src/conflict/timestamp'
+import { compareTimestamps } from '../src/sync/timestamp'
 import { setupRowsDb } from './helpers/sync-fixtures'
 
-describe('isLaterTimestamp: フォーマット差(ISO-T vs スペース)を吸収する', () => {
+describe('compareTimestamps: フォーマット差(ISO-T vs スペース)を吸収する', () => {
   let db: Database.Database
   beforeEach(() => {
     db = new Database(':memory:')
@@ -29,14 +29,14 @@ describe('isLaterTimestamp: フォーマット差(ISO-T vs スペース)を吸�
     // 文字列比較は壊れている（' ' < 'T' で削除が小さく見える）
     expect(deletedAt > updatedAt).toBe(false)
     // julianday正規化では正しく「削除が後」
-    expect(isLaterTimestamp(db, deletedAt, updatedAt)).toBe(true)
-    expect(isLaterTimestamp(db, updatedAt, deletedAt)).toBe(false)
+    expect(compareTimestamps(db, deletedAt, updatedAt)).toBe(1)
+    expect(compareTimestamps(db, updatedAt, deletedAt)).toBe(-1)
   })
 
   it('同時刻より前の削除は「新しくない」', () => {
     const updatedAt = '2026-05-13T23:17:35.111+00:00'
     const deletedAt = '2026-05-13 23:17:34'
-    expect(isLaterTimestamp(db, deletedAt, updatedAt)).toBe(false)
+    expect(compareTimestamps(db, deletedAt, updatedAt)).toBe(-1)
   })
 })
 

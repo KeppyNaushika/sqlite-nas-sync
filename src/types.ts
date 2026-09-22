@@ -204,6 +204,23 @@ export interface SyncConfig {
   onDiscoveryWarning?: (message: string) => void
 
   /**
+   * 同期する表を検出し終えたときに呼ばれる。
+   *
+   * 「同期するつもりの表が入っているか」「入れるつもりの無い表が混ざっていないか」を
+   * 起動時に確かめるための通知で、異常ではない。**指定しなければ何も出力されない。**
+   * ライブラリが利用者に断りなく標準出力へ書くことはない。
+   *
+   * @example
+   * ```typescript
+   * setupSync({
+   *   …,
+   *   onTablesDiscovered: (tables) => log.info(`同期する表: ${tables.join(', ')}`),
+   * })
+   * ```
+   */
+  onTablesDiscovered?: (tableNames: string[]) => void
+
+  /**
    * 変わっていないときの転送を落とすかどうか。
    *
    * `true`（既定）のとき、1回の同期で次を省く:
@@ -434,7 +451,7 @@ export interface SyncResult {
    */
   hadChangelogGap: boolean
   /**
-   * この回に実際に動かしたファイルの数と量（v0.20.1 で追加）。
+   * この回に実際に動かしたファイルの数と量（v0.20.0 で追加）。
    *
    * 無駄な転送の抑制が効いているかを測るために載せている。
    */
@@ -493,21 +510,6 @@ export interface ChangelogEntry {
   operation: 'INSERT' | 'UPDATE' | 'DELETE'
   /** 変更日時（ISO 8601形式、ミリ秒まで。`updatedAt` と同じ精度・書式で記録される） */
   changedAt: string
-}
-
-/**
- * `_sync_state` テーブルの1行を表す内部型。
- *
- * リモートクライアントごとにどこまでchangelogを処理したかを記録する。
- * @internal
- */
-export interface SyncStateEntry {
-  /** リモートクライアントの識別子 */
-  remoteClientId: string
-  /** 最後に処理したchangelog ID */
-  lastSeenId: number
-  /** 最後にsyncした日時 */
-  lastSyncedAt: string | null
 }
 
 /**

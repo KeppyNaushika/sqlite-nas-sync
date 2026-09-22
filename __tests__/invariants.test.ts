@@ -351,21 +351,20 @@ describe('規則: 時刻の比較は「時刻として」行う', () => {
     )
     expect(
       offenders.map((hit) => `${hit.where}: ${hit.line}`),
-      '`isSameTimestamp` / `isLaterTimestamp` を使うこと'
+      '`compareTimestamps` を使うこと'
     ).toEqual([])
   })
 
   it('`julianday` で正規化するのは1か所だけ', () => {
     // 正規化の仕方が2つあると、片方だけ直したときにもう片方が古い意味のまま残る。
-    // 時刻を数として比べたい箇所は `conflict/timestamp` の2つを通ること
-    // （`changelog.ts` の掃除は「行を選ぶSQL」で、値どうしの比較ではない）。
+    // 時刻を数として比べたい箇所は `sync/timestamp` の `compareTimestamps` を
+    // 通ること（`changelog.ts` の掃除は「行を選ぶSQL」で、値どうしの比較ではない）。
     const users = sourceFiles()
       .filter((file) => /julianday\s*\(\s*\?/.test(file.text))
       .map((file) => file.path)
-    expect(
-      users,
-      '時刻どうしの比較は `conflict/timestamp` に集めること'
-    ).toEqual([path.join('conflict', 'timestamp.ts')])
+    expect(users, '時刻どうしの比較は `sync/timestamp` に集めること').toEqual([
+      path.join('sync', 'timestamp.ts'),
+    ])
   })
 })
 

@@ -17,7 +17,7 @@
  *    同じ状態になる（対称性を外した鍵で比べる）
  * 3. **対称性**（端末2台のとき）—— 列 P と、P の端末を入れ替えた列 σ(P) を再生すると、
  *    σ(P) の状態は P の状態の鏡写しになり（端末を入れ替えて直列化すると一致する）、
- *    同期が出す「失敗」「膠着」の警告も鏡写しになる
+ *    同期が出す「失敗」の警告も鏡写しになる
  *
  * 列の選び方には擬似乱数を使うが、**種は固定**（毎回同じ列を調べる）。これは範囲を
  * 網羅する検査ではなく、削減手の前提が崩れていないかの抜き取り検査である。
@@ -36,7 +36,6 @@ import {
   normalizeOptionsFrom,
   readWorld,
   serializeState,
-  stalemateKeys,
 } from './state'
 import {
   Library,
@@ -90,8 +89,6 @@ export async function runSelfTest(
   const identity = Array.from({ length: config.clients }, (_, i) => i)
   const failures: string[] = []
 
-  const reportedOf = (warnings: string[][]): Set<string> =>
-    new Set(warnings.flatMap((list) => stalemateKeys(list)))
   const describe = (path_: Transition[]): string =>
     path_
       .map((t, i) => `    ${String(i + 1)}. ${describeTransition(t)}`)
@@ -99,7 +96,7 @@ export async function runSelfTest(
 
   /**
    * 列を再生し、`permutation` の並びで直列化した状態と、警告のうち判定に効くもの
-   * （失敗の有無・膠着の行）をまとめた署名を返す。
+   * （失敗の有無）をまとめた署名を返す。
    */
   const observe = async (
     path_: Transition[],
@@ -116,13 +113,11 @@ export async function runSelfTest(
         raw,
         labeler.labels(collectTimes(raw)),
         permutation,
-        JSON.stringify([...reportedOf(warnings)].sort()),
         normalizeOptionsFrom(config)
       )
-      const warningSignature = warnings.map((list) => [
-        failureWarning(list) !== null,
-        stalemateKeys(list).sort(),
-      ])
+      const warningSignature = warnings.map(
+        (list) => failureWarning(list) !== null
+      )
       return hashString(`${text}\n${JSON.stringify(warningSignature)}`)
     } finally {
       closeWorld(world)

@@ -18,7 +18,7 @@
  */
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../conflict/schema'
+import { foldIdentifier } from '../setup/sql'
 
 /** `_sync_meta` に置く案A の鍵（設計書 §3.1）。 */
 export const SNS_META_KEYS = {
@@ -30,7 +30,7 @@ export const SNS_META_KEYS = {
 } as const
 
 /** {@link SNS_META_KEYS} の値の型。 */
-export type SnsMetaKey = (typeof SNS_META_KEYS)[keyof typeof SNS_META_KEYS]
+type SnsMetaKey = (typeof SNS_META_KEYS)[keyof typeof SNS_META_KEYS]
 
 /**
  * 端末の id を1つ作る（設計書 §3.2）。
@@ -102,7 +102,7 @@ export function writeSnsMeta(
  * ------------------------------------------------------------------ */
 
 /** 名前と `deleteProtected` だけを見る、表の指定の最小形。 */
-export interface DeleteProtectedSpec {
+interface DeleteProtectedSpec {
   name: string
   deleteProtected?: boolean
 }

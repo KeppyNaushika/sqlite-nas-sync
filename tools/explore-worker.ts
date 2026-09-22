@@ -50,7 +50,7 @@ import {
   isAppWrite,
   isComparableHistory,
 } from './explore/history'
-import { CanonicalState, TimeLabeler, stalemateKeys } from './explore/state'
+import { CanonicalState, TimeLabeler } from './explore/state'
 import {
   Library,
   World,
@@ -76,7 +76,7 @@ type Context = {
   seen: Map<string, number[]>
   /** 検査を済ませた状態（親が見つけた分を含む） */
   checked: Set<string>
-  /** 状態の鍵 → 不動点での見え方（null は膠着）。違反のあった状態は載らない */
+  /** 状態の鍵 → 不動点での見え方（null は端末ごとに違って定まらない）。違反のあった状態は載らない */
   views: Map<string, ViewInfo>
   /** 見え方を突き合わせる参照実装（無ければ null） */
   oracle: Oracle | null
@@ -157,7 +157,7 @@ async function init(config: ExploreConfig, workDir: string): Promise<void> {
     stats: freshStats(),
   }
   const world = createWorld(dirs.template, dirs.work, config)
-  const root = prober.canonical(world, new Set())
+  const root = prober.canonical(world)
   closeWorld(world)
   // 根（何も書いていない空の世界）の見え方は空。事実の集合が空の列は、どう同期を挟んでもこれになるべき
   context.views.set(root.key, { kind: 'view', view: '[]' })
@@ -215,13 +215,12 @@ function chooseCanonical(
   return best
 }
 
-/** 列を空の世界から再生する。膠着として報告された行と、書き込みが作った事実も数え直す。 */
+/** 列を空の世界から再生する。書き込みが作った事実も数え直す。 */
 async function materialize(
   ctx: Context,
   path: number[]
-): Promise<{ world: World; reported: Set<string>; history: History }> {
+): Promise<{ world: World; history: History }> {
   const world = createWorld(ctx.dirs.template, ctx.dirs.work, ctx.config)
-  const reported = new Set<string>()
   const history = emptyHistory(ctx)
   for (const index of path) {
     const outcome = await applyTransition(
@@ -229,18 +228,16 @@ async function materialize(
       world,
       ctx.transitions[index]
     )
-    for (const key of stalemateKeys(outcome.warnings)) reported.add(key)
     recordIssued(history, ctx.transitions[index], outcome.status)
   }
-  return { world, reported, history }
+  return { world, history }
 }
 
 const KIND_LABEL: Record<Violation['kind'], string> = {
   exception: '例外（performSync が投げた）',
   'sync-failed':
     '取り込みの失敗（Sync failed / Full merge failed / Failed to open）',
-  'silent-divergence':
-    '黙った食い違い（収束せず、膠着としても報告されていない）',
+  'silent-divergence': '黙った食い違い（収束しても端末ごとに中身が違う）',
   oscillation: '振動（round-robin の同期が状態を行き来して止まらない）',
   'no-fixpoint': '上限まで同期しても状態が動き続けた',
   // **違反ではない**（設計書 §8.1 第11版）。件数と代表例として出す種類
@@ -288,7 +285,6 @@ async function writeReport(
   expected: { kind: Violation['kind']; summary: string }
 ): Promise<{ report: string; probeSyncs: number }> {
   const world = createWorld(ctx.dirs.template, ctx.dirs.work, ctx.config)
-  const reported = new Set<string>()
   const warningsByStep: string[][] = []
   let edgeFailure: string | null = null
   try {
@@ -300,7 +296,6 @@ async function writeReport(
           ctx.transitions[index]
         )
         warningsByStep.push(outcome.warnings)
-        for (const key of stalemateKeys(outcome.warnings)) reported.add(key)
         edgeFailure = failureWarning(outcome.warnings)
       } catch (error) {
         warningsByStep.push([`例外: ${String(error)}`])
@@ -332,15 +327,9 @@ async function writeReport(
         probeSyncs: 0,
       }
     }
-    const state = ctx.prober.canonical(world, reported)
+    const state = ctx.prober.canonical(world)
     const trace: ProbeTrace = { startClient: probeStart, steps: [], detail: '' }
-    const verdict = await ctx.prober.run(
-      world,
-      state,
-      reported,
-      probeStart,
-      trace
-    )
+    const verdict = await ctx.prober.run(world, state, probeStart, trace)
     const probeLines = trace.steps.map((step, index) => {
       const name = clientName(step.client)
       const line = `  ${String(path.length + index + 1)}. ${name}: await performSync(${name}.db, ${name}.config, TABLES)`
@@ -381,14 +370,13 @@ type StateCheck =
 /**
  * 状態を全ての開始端末から検査する。**世界を動かす**ので、呼んだあとは捨てること。
  *
- * 開始端末ごとに不動点での見え方も集め、膠着でない見え方どうしが違えば、それも違反として返す
- * （挟み方の検査が有効なとき）。膠着（null）は比べない。
+ * 開始端末ごとに不動点での見え方も集め、見え方どうしが違えば、それも違反として返す
+ * （挟み方の検査が有効なとき）。端末ごとに違って見え方が定まらない場合（null）は比べない。
  */
 async function checkState(
   ctx: Context,
   world: World,
-  state: CanonicalState,
-  reported: Set<string>
+  state: CanonicalState
 ): Promise<StateCheck> {
   const n = ctx.config.clients
   const limit = ctx.config.maxProbeRounds * n
@@ -434,12 +422,7 @@ async function checkState(
           closeWorld(current)
           current = restoreWorld(ctx.dirs.probeSnap, ctx.dirs.work, ctx.config)
         }
-        const verdict = await ctx.prober.run(
-          current,
-          state,
-          reported,
-          pending[i]
-        )
+        const verdict = await ctx.prober.run(current, state, pending[i])
         judge(verdict, pending[i])
         if (found !== null) break
       }
@@ -497,7 +480,6 @@ async function describeSchedules(
   for (let i = 0; i < runs.length; i += 1) {
     const { path, start } = runs[i]
     const world = createWorld(ctx.dirs.template, ctx.dirs.work, ctx.config)
-    const reported = new Set<string>()
     const history = emptyHistory(ctx)
     const warningsByStep: string[][] = []
     try {
@@ -508,12 +490,11 @@ async function describeSchedules(
           ctx.transitions[index]
         )
         warningsByStep.push(outcome.warnings)
-        for (const key of stalemateKeys(outcome.warnings)) reported.add(key)
         recordIssued(history, ctx.transitions[index], outcome.status)
       }
-      const state = ctx.prober.canonical(world, reported)
+      const state = ctx.prober.canonical(world)
       const trace: ProbeTrace = { startClient: start, steps: [], detail: '' }
-      const verdict = await ctx.prober.run(world, state, reported, start, trace)
+      const verdict = await ctx.prober.run(world, state, start, trace)
       sections.push(
         '',
         `── 実行${letters[i] ?? String(i + 1)}: 空の世界から、この順に ──`,
@@ -526,7 +507,7 @@ async function describeSchedules(
           (issued, client) =>
             `    ${clientName(client)}: ${issued.length === 0 ? '（なし）' : issued.map((entry) => `${JSON.stringify(entry.op)} → ${entry.status}`).join(' ; ')}`
         ),
-        `  落ち着いた先の見え方: ${verdict.ok ? (verdict.view ?? '（膠着で端末ごとに違う）') : `（違反: ${verdict.summary}）`}`
+        `  落ち着いた先の見え方: ${verdict.ok ? (verdict.view ?? '（端末ごとに違う）') : `（違反: ${verdict.summary}）`}`
       )
     } finally {
       closeWorld(world)
@@ -567,8 +548,8 @@ async function expand(work: ExpandUnit[]): Promise<void> {
   for (const { nodes, from, to } of work) {
     if (stopping) break
     const representative = nodes[0]
-    const { world, reported } = await materialize(ctx, representative.path)
-    const parentState = ctx.prober.canonical(world, reported)
+    const { world } = await materialize(ctx, representative.path)
+    const parentState = ctx.prober.canonical(world)
     if (parentState.frameKey !== representative.frameKey) {
       // 同じ列を再生したのに、見つけたときと違う状態になった。同期の中の刻みが
       // 同じミリ秒に収まったかどうかの揺れで起きうる（docs の「保証しないこと」）。
@@ -644,14 +625,12 @@ async function expand(work: ExpandUnit[]): Promise<void> {
           continue
         }
 
-        const childReported = new Set(reported)
-        for (const key of stalemateKeys(warnings)) childReported.add(key)
-        const state = ctx.prober.canonical(child, childReported)
+        const state = ctx.prober.canonical(child)
 
         // 子の状態の検査は、組の中で1回だけ（状態で決まる）
         if (!ctx.checked.has(state.key)) {
           ctx.checked.add(state.key)
-          const checked = await checkState(ctx, child, state, childReported)
+          const checked = await checkState(ctx, child, state)
           closed = true // checkState が閉じる
           if ('violation' in checked) {
             const found = checked.violation
