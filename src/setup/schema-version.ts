@@ -23,8 +23,13 @@ export function writeSchemaVersion(
   db: Database.Database,
   schemaVersion: string
 ): void {
+  // **同じ値なら書かない**（`WHERE`）。`INSERT OR REPLACE` は値が同じでも毎回1行
+  // 書き換えるので、同期のたびに「何かが変わった」ことになり、変わっていない回の
+  // 見分け（`sync/idle` の `PushMemo.changesAtCopy`）が効かなくなる
   db.prepare(
-    `INSERT OR REPLACE INTO _sync_meta (key, value) VALUES ('schemaVersion', ?)`
+    `INSERT INTO _sync_meta (key, value) VALUES ('schemaVersion', ?)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value
+        WHERE value <> excluded.value`
   ).run(schemaVersion)
 }
 

@@ -8,7 +8,9 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
-import { setupChangelog } from '../../src/setup'
+import { setupRowsLedgers } from '../../src/setup'
+import { migrateToRows } from '../../src/rows/migrate'
+import { newInstanceId, writeDeleteProtected } from '../../src/rows/meta'
 import { SyncConfig, TableConfig } from '../../src/types'
 
 export const TABLES: TableConfig[] = [
@@ -20,6 +22,35 @@ export const TABLES: TableConfig[] = [
   { name: 'tag_profiles' },
   { name: 'accounts' },
 ]
+
+/**
+ * 案A の仕掛けを、できたばかりの DB へ取り付ける（`setupSync` と同じ順序）。
+ *
+ * `setupSync` を通さずに `performSync` だけを呼ぶ試験のための足場である。
+ * これを通しておかないと、最初の `performSync` が「仕掛けが欠けている」を
+ * 見つけて移行を走らせ、その1回だけ余分な警告が乗る（設計書 §3.9）。
+ *
+ * - `migrateToRows` —— `_sns_rows_<表>`・`_sns_clock`・4本のトリガー・
+ *   `_tombstone` と `_changelog` を作る
+ * - `writeDeleteProtected` —— 作り直しの計算が読む鍵（§3.1）
+ * - `setupRowsLedgers` —— 表に触らない帳簿（`_sync_state` ほか）
+ */
+export function setupRowsDb(
+  db: Database.Database,
+  tables: readonly TableConfig[],
+  instanceId: string = newInstanceId()
+): void {
+  migrateToRows(db, {
+    tables: tables.map((t) => ({
+      name: t.name,
+      timestampColumn: t.timestampColumn,
+      deleteProtected: t.deleteProtected,
+    })),
+    instanceId,
+  })
+  writeDeleteProtected(db, tables)
+  setupRowsLedgers(db)
+}
 
 /**
  * 1つのテストファイル専用の作業ディレクトリと、その中で使う道具を作る。
@@ -115,7 +146,7 @@ export function createSyncFixture(name: string): {
         updatedAt TEXT NOT NULL
       )
     `)
-    setupChangelog(db, TABLES, 'id')
+    setupRowsDb(db, TABLES)
     return { db, dbPath }
   }
 

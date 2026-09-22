@@ -1,0 +1,26 @@
+{
+  // 検査器（tools/）の**実行用**の設定。
+  //
+  // tsx / ts-node は入っていないし、入れてもいけない（依存を増やさない約束）。
+  // Node 24 は `.ts` を読めるが、型を剥がすだけで `import` 文を `require` へ
+  // 直さないため、`"type": "commonjs"` のこのリポジトリでは src を読み込めない。
+  // vitest を器にする手もあるが、テストの枠（並行実行・作業ディレクトリ・時間切れ）に
+  // 検査器の寿命を合わせることになり、`__tests__/convergence-properties.test.ts` の
+  // 測定と作業ディレクトリを取り合う。そこで**既存の tsc で JS へ落として node で走らせる**。
+  //
+  // `src/**/*` も一緒にコンパイルする。検査器が既定で駆動するライブラリは、ここで
+  // 出力される `node_modules/.cache/explore/src/`（tools/explore/config.ts の libDir）。
+  // `npm run build` の `dist/` を使わないのは、`build` が `dist/` を消してから作り直すので、
+  // 同時に `dist/` を読んでいる別の作業を壊しうるから。
+  //
+  // 出力先は `node_modules/.cache/` の下。`.gitignore` を触らずに版管理から外せる場所が
+  // ここしか無い。
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "outDir": "../node_modules/.cache/explore",
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["../src/**/*", "./**/*"]
+}
