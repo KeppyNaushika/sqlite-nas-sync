@@ -221,86 +221,6 @@ describe('規則: 日数を SQL の綴りへ埋め込むなら、必ず均して
   })
 })
 
-describe('規則: 帳簿（`_id_merge` / `_tombstone`）を id で引くときは、綴り違いに備える', () => {
-  it('1件引きの文は、大小を畳んだうえで新しい方を採る', () => {
-    // 引くときは `COLLATE NOCASE` だが `PRIMARY KEY` は BINARY で照合されるので、
-    // `('Users','A')` と `('users','A')` は同居できる。走査順まかせにすると
-    // 古い記録を拾い、遅れて届いた子が死んだ id へ読み替えられる。
-    //
-    // **検査するのは「1件引きの文」だけ。** 意図的な全件スキャン（起動時の掃除や
-    // フルマージ）には `WHERE` が無く、この規則の対象ではない。ファイル単位で
-    // 判定すると、同じファイルに1件引きを足しただけで無関係な正しい文が落ちる。
-    const offenders: string[] = []
-    let checked = 0
-
-    for (const file of sourceFiles()) {
-      // バッククォートを跨がない範囲で1文ずつ切り出す
-      const statements = file.text.match(
-        /`[^`]*FROM (?:_id_merge|_tombstone)[^`]*`/g
-      )
-      for (const statement of statements ?? []) {
-        // 1件を引く文か（id で絞っているか）。全件スキャンは対象外
-        if (!/\b(recordId|losingId)\s*=\s*\?/.test(statement)) continue
-        // 存在確認（`SELECT 1`）は重複しても答えが変わらない
-        if (/SELECT\s+1\b/.test(statement)) continue
-        // 書き込み（DELETE / UPDATE）は「両方に当てる」のが正しいので対象外
-        if (/^`\s*(DELETE|UPDATE|INSERT)/.test(statement)) continue
-
-        checked++
-        if (!statement.includes('COLLATE NOCASE')) {
-          offenders.push(
-            `${file.path}: 表名は COLLATE NOCASE で引くこと\n${statement}`
-          )
-        }
-        if (!/ORDER BY|LIMIT 1/.test(statement)) {
-          offenders.push(
-            `${file.path}: 綴り違いの2行がありうるので、新しい方を採ること\n${statement}`
-          )
-        }
-      }
-    }
-
-    expect(offenders).toEqual([])
-    // 検査対象が0件になったら、この検査自体が壊れている（正規表現が当たっていない）
-    expect(
-      checked,
-      '1件引きの文が1つも見つからない＝この検査が空振りしている'
-    ).toBeGreaterThan(0)
-  })
-
-  it('`_tombstone.mergedInto` を書くのは、判断を通る経路だけ', () => {
-    // 「この主張を受け入れるか」は `foldClaimWins` が2つの帳簿を見て一度だけ決める。
-    // 別の場所で `mergedInto` を書くと、その判断を飛び越えて帳簿が食い違う。
-    // SQL の中の代入だけを見る（`const mergedInto = …` のような変数宣言は別物）
-    const writers = findLines(
-      (line) =>
-        /mergedInto\s*=[^=]/.test(line) &&
-        !/^\s*(const|let|var)\s/.test(line) &&
-        !/mergedInto\s*[:?]/.test(line)
-    ).map((hit) => hit.where.split(':')[0])
-
-    const allowed = new Set([
-      // 判断を通した書き込み（`recordMerge` → ここ）
-      path.join('conflict', 'tombstone.ts'),
-      // 起動時の帳簿の手当て（`_id_merge` と辻褄を合わせるための書き換え）
-      path.join('setup', 'id-merge-repair.ts'),
-    ])
-    const unexpected = [...new Set(writers)].filter(
-      (file) => !allowed.has(file)
-    )
-    expect(
-      unexpected,
-      '`_tombstone.mergedInto` を書くなら `foldClaimWins` を通すこと'
-    ).toEqual([])
-    // 書き込みが1つも見つからないなら、この検査は「許した2箇所」も含めて何も見て
-    // いない（正規表現が当たっていないか、列名が変わった）。規則4と同じ空振りである。
-    expect(
-      writers.length,
-      '`mergedInto` への書き込みが1つも見つからない＝この検査が空振りしている'
-    ).toBeGreaterThan(0)
-  })
-})
-
 describe('規則: 識別子（表名・列名）の比較は大小を畳む', () => {
   it('設定由来の名前と `PRAGMA` 由来の名前を、字面で突き合わせない', () => {
     // `PRAGMA` は宣言どおりの綴りを返し、設定は利用者が書いた綴りを持つ。
@@ -321,48 +241,6 @@ describe('規則: 識別子（表名・列名）の比較は大小を畳む', ()
       findLines((line) => /\bisSameIdentifier\s*\(/.test(line)).length,
       '`isSameIdentifier` の呼び出しが1つも無い＝この検査が空振りしている'
     ).toBeGreaterThan(0)
-  })
-})
-
-describe('規則: 表名をキーに設定を引くときは大小を畳む', () => {
-  it('`TableConfig` を素の Map で引かない', () => {
-    // `_changelog` / `_tombstone` のエントリが名乗る表名は**相手の設定どおりの綴り**。
-    // 素の `Map` で引くと全エントリが素通りし、しかもカーソルは進むので失われる。
-    //
-    // **変数名では検査しない。** 以前この検査は `tableConfigMap.get(` という
-    // 字面を探していたが、その呼び出しが消えたあとは0件に当たって**決して落ちなく
-    // なっていた**（別の変数名で同じ間違いを書けば素通りする）。「表名で
-    // `TableConfig` を引く索引を、`makeTableConfigLookup` 以外で作っていないか」を見る。
-    const index = /new Map<\s*string\s*,\s*TableConfig\s*>/
-    const offenders: string[] = []
-    let canonical = 0
-    for (const file of sourceFiles()) {
-      if (file.path === path.join('sync', 'remote.ts')) {
-        if (index.test(file.text)) canonical++ // 正本
-        continue
-      }
-      if (index.test(file.text)) {
-        offenders.push(`${file.path}: \`makeTableConfigLookup\` を使うこと`)
-      }
-    }
-    expect(offenders).toEqual([])
-    // この検査は「索引の作り方の字面」を1つだけ知っている。正本がその字面を
-    // 使わなくなったら（`Record<string, TableConfig>` へ変える、など）、
-    // **他所で同じ間違いを書いても当たらない**。正本に当たることを確かめておく。
-    expect(
-      canonical,
-      '正本が `new Map<string, TableConfig>` で索引を作っていない＝この検査が空振りしている'
-    ).toBe(1)
-  })
-
-  it('正本（`makeTableConfigLookup`）は畳んで引いている', () => {
-    // 上の検査は「他所で作っていないこと」しか見ない。正本が畳んでいなければ
-    // 規則そのものが成り立たないので、こちらも押さえる。
-    const remote = fs.readFileSync(path.join(SRC, 'sync', 'remote.ts'), 'utf8')
-    const body = remote.slice(
-      remote.indexOf('export function makeTableConfigLookup')
-    )
-    expect(body.slice(0, body.indexOf('\n}'))).toContain('foldIdentifier')
   })
 })
 
@@ -445,7 +323,7 @@ describe('規則: `_changelog` から行を消すなら、消した位置を必�
     // 「idは単調に増える」ことに乗っているので、再利用が起きた瞬間に
     // 両方が意味を失う ——「読んだ位置より小さいid」で新しい変更が現れ、
     // 差分経路がそれを永久に飛ばす。
-    const setup = fs.readFileSync(path.join(SRC, 'setup', 'index.ts'), 'utf8')
+    const setup = fs.readFileSync(path.join(SRC, 'rows', 'schema.ts'), 'utf8')
     const create = /CREATE TABLE IF NOT EXISTS _changelog\s*\(([^)]*)\)/.exec(
       setup
     )
@@ -492,97 +370,36 @@ describe('規則: 時刻の比較は「時刻として」行う', () => {
 })
 
 describe('規則: `ON DELETE` の意味を写し取る場所を増やさない', () => {
-  it('`ON DELETE` の綴りで分岐するのは、決まった2か所だけ', () => {
-    // 「親が消えたとき子をどうするか」は SQLite の規則（`CASCADE` / `SET NULL` /
-    // `SET DEFAULT` / `NO ACTION` / `RESTRICT`）を写し取る処理で、**写しが増えると
-    // 必ず片方だけ直る**。実際、畳みで読み替えた先が消えた場合（`conflict/remap.ts`）
-    // には規則が実装されていたのに、畳みが絡まない普通の削除で消えた親を指す子は
-    // 素通しで、**COMMIT 時の外部キー違反でその相手ぶんの取り込みが恒久的に
-    // 止まっていた**（同じ規則の別の抜け）。
+  it('`ON DELETE` の綴りを読むのは `rows/on-delete.ts` だけ', () => {
+    // 「親が置かれていないとき子をどうするか」は SQLite の規則（`CASCADE` /
+    // `SET NULL` / `SET DEFAULT` / `NO ACTION` / `RESTRICT`）を写し取る処理で、
+    // **写しが増えると必ず片方だけ直る**。旧経路では同じ規則が2か所にあり、
+    // 片方だけ実装されていたせいで、消えた親を指す子が素通りして
+    // **COMMIT 時の外部キー違反でその相手ぶんの取り込みが恒久的に止まっていた**。
     //
-    // 3か所目を足すなら、既存のどちらかへ寄せるか、共通の道具へ括り出すこと。
-    const branching = new Set(
-      findLines((line) =>
-        /(===|!==|case)\s*'(CASCADE|SET NULL|SET DEFAULT|NO ACTION|RESTRICT)'|'(CASCADE|SET NULL|SET DEFAULT|NO ACTION|RESTRICT)'\s*(===|!==)/.test(
-          line
-        )
-      ).map((hit) => hit.where.split(':')[0])
+    // 案A では `missingParentAction` の表引き1本に寄せてある。2か所目を足すなら、
+    // そこへ寄せるか、共通の道具へ括り出すこと。
+    const spelling = /'(CASCADE|SET NULL|SET DEFAULT|NO ACTION|RESTRICT)'/
+    const readers = new Set(
+      findLines((line) => spelling.test(line)).map(
+        (hit) => hit.where.split(':')[0]
+      )
     )
 
-    const allowed = new Set([
-      // 届いた行の外部キーの後始末（読み替えた先が消えた場合と、普通に消えた場合）
-      path.join('conflict', 'remap.ts'),
-      // 畳みで敗者行を消すときの、子の引き取り
-      path.join('conflict', 'child-carry.ts'),
-    ])
+    const canonical = path.join('rows', 'on-delete.ts')
     expect(
-      [...branching].filter((file) => !allowed.has(file)),
-      '`ON DELETE` の意味は `conflict/remap.ts` と `conflict/child-carry.ts` に集めること'
+      [...readers].filter((file) => file !== canonical),
+      '`ON DELETE` の意味は `rows/on-delete.ts` に集めること'
     ).toEqual([])
-    // 検査対象が0件になったら、この検査自体が壊れている
+    // 検査対象が0件になったら、この検査自体が壊れている（綴りが変わったか、消えた）
     expect(
-      branching.size,
-      '`ON DELETE` で分岐する箇所が1つも見つからない＝この検査が空振りしている'
-    ).toBeGreaterThan(0)
-  })
-
-  it('親が消えたことの判断は `isKnownDeleted` を通る', () => {
-    // 「ローカルに無い」と「消えたと分かっている」は違う。取り込みは外部キーの検査を
-    // トランザクション終端まで遅らせているので、**親がこのあと同じ取り込みで届く**のは
-    // 普通に起きる。証拠（tombstone）が無いのに子を捨てると、順番が違うだけの行を殺す。
-    // `_tombstone` を直に引いてこの判断を書くと、作り直された親を「消えている」と
-    // 誤って答える（`isKnownDeleted` は取り込み元を見て作り直しを除いている）。
-    const offenders = findLines(
-      (line) =>
-        /parentRowExists\s*\(/.test(line) && !/isKnownDeleted/.test(line)
-    ).filter((hit) => !hit.where.startsWith(path.join('conflict', 'remap.ts')))
-    expect(
-      offenders.map((hit) => `${hit.where}: ${hit.line}`),
-      '親の不在から子を捨てるなら `isKnownDeleted` を通すこと'
-    ).toEqual([])
+      readers.has(canonical),
+      '`ON DELETE` の綴りが正本にも見つからない＝この検査が空振りしている'
+    ).toBe(true)
   })
 })
 
 describe('規則: トリガーが働かない経路で行を変えたら、自分で `_changelog` に載せる', () => {
-  it('畳みで id が動いたら、消えた id と動いた先の id の**両方**を載せる', () => {
-    // 親と主キーを共有する1:1の子は、親が畳まれると**その子のidそのものが動く**。
-    // ふだんは UPDATEトリガが動いた先の1行を記録するが、**フルマージはトリガーを
-    // 外して走る**ので何も残らない。動いた先の行は「相手からもらった行」ではなく
-    // この端末でidが動いて生まれた姿なので、載せないと他端末はその中身を
-    // どこからも知れない（送り主から届くのは「古いidは畳まれた」という削除だけ）。
-    //
-    // 実測（3端末）: `tag_profiles` が、フルマージした端末にだけ残り、増分同期の
-    // 相手へは永久に届かなかった（警告も例外も出ない）。**片側だけを載せるのが
-    // 落とし穴**なので、両方そろっていることを数える。
-    const fold = withoutComments(
-      fs.readFileSync(path.join(SRC, 'conflict', 'fold.ts'), 'utf8')
-    )
-    const guard = fold.indexOf('previousId !== nextId')
-    expect(
-      guard,
-      '`conflict/fold.ts` に「idが動いた」の分岐が見つからない＝この検査が空振りしている'
-    ).toBeGreaterThan(-1)
-
-    // 分岐の本体（`{` から対応する `}` まで）を切り出す
-    const open = fold.indexOf('{', guard)
-    let index = open + 1
-    let depth = 1
-    for (; index < fold.length && depth > 0; index++) {
-      if (fold[index] === '{') depth++
-      else if (fold[index] === '}') depth--
-    }
-    const body = fold.slice(open, index)
-
-    expect(
-      body.includes('writeFoldDeletion('),
-      '動いた先が埋まった id の DELETE を `_changelog` へ載せること'
-    ).toBe(true)
-    expect(
-      body.includes('writeFoldMove('),
-      '動いた先の id の書き込みを `_changelog` へ載せること'
-    ).toBe(true)
-  })
-
   it('`_changelog` へ手で書く箇所は、数え上げてある', () => {
     // トリガー以外から `_changelog` へ書くのは、**トリガーが働かない経路の穴を
     // 塞ぐため**だけである。どれも「この端末でしか分からないことを差分経路へ載せる」
@@ -591,19 +408,16 @@ describe('規則: トリガーが働かない経路で行を変えたら、自�
     const handWritten = new Set<string>()
     for (const file of sourceFiles()) {
       const code = withoutComments(file.text)
-      if (!/INSERT INTO _changelog\b/.test(code)) continue
+      if (!/INSERT INTO "?_changelog"?\b/.test(code)) continue
       // トリガーの定義そのものは対象外（これが本来の書き手）
       if (/CREATE TRIGGER/.test(code)) continue
       handWritten.add(file.path)
     }
     expect([...handWritten].sort()).toEqual(
       [
-        // 畳みで消えた id / 動いた先の id（フルマージ中はトリガーが外れている）
-        path.join('conflict', 'fold-changelog.ts'),
-        // 相手のエントリの中継（A が居なくなっても B 経由で C へ届くように）
-        path.join('sync', 'full-merge.ts'),
-        // 「こちらの版が新しいので採らなかった」の名乗り直し
-        path.join('sync', 'entries.ts'),
+        // 取り込みで `Max` が変わったキーの通知（相手の版を書くのは
+        // トリガーの外なので、差分経路へは自分で載せる。§4.3）
+        path.join('rows', 'import.ts'),
       ].sort()
     )
   })

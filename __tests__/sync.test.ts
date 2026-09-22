@@ -203,9 +203,19 @@ describe('performSync', () => {
       result.warnings.some((w) => w.includes('schema version mismatch'))
     ).toBe(true)
 
-    // 構造化されたskippedRemotesにも記録される
+    // 構造化されたskippedRemotesにも記録される。
+    //
+    // **案A（段階5）で変わった点**: `_sync_meta.schemaVersion` は
+    // `<アプリの版>;sns-format=rows1` の形で持ち（設計書 §3.8）、相手を見送るかは
+    // **この文字列ぜんたいの一致**で決める（§4.2）。`skippedRemotes` に載るのも
+    // その形。期待するのは「`v1` と `v2` が食い違っている」ことなので、
+    // 形式の欄が付いただけで意味は変わらない。
     expect(result.skippedRemotes).toEqual([
-      { clientId: 'client-a', remoteVersion: 'v1', localVersion: 'v2' },
+      {
+        clientId: 'client-a',
+        remoteVersion: 'v1;sns-format=rows1',
+        localVersion: 'v2;sns-format=rows1',
+      },
     ])
 
     dbB.close()

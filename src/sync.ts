@@ -1,202 +1,43 @@
 /**
- * コア同期オーケストレーションを提供するモジュール。
+ * コア同期オーケストレーション。
  *
- * 1回の `performSync` はこう進む:
+ * **v0.20.0（案A）から、既定の経路は `sync/rows-sync` である。**
+ * 1回の `performSync` はこう進む（設計書 `docs/rows-table-design.md` §4.1）:
  *
- * 1. ローカルDBをNASへコピーする（相手はこのコピーを読む）
- * 2. NAS上の相手を1人ずつ開き、通常経路かフルマージかを選んで取り込む
- *    （`sync/pull`）
- * 3. `_heartbeat` を更新して「まだ生きている」と伝え、changelog を掃除する
+ * 1. 取り込みより前に、復元・巻き戻りと仕掛けの欠けを見る（§3.10）
+ * 2. NAS への写し（印 → `backup()` → 取り合いの確認）
+ * 3. 相手ごとに `_sns_rows_*` と `_tombstone` を突き合わせて取り込む（§4.3）
+ * 4. **別のトランザクション**でアプリの表を作り直す（§3.7）
+ * 5. heartbeat、`cleanupChangelog`、`onAfterSync`
  *
- * 実装は役割ごとに分かれている:
- *
- * | モジュール | 受け持ち |
- * | --- | --- |
- * | `sync/sql` | この層でだけ使う SQLite の小道具 |
- * | `sync/state` | `_sync_state` / `_heartbeat` の読み書き |
- * | `sync/remote` | 取り込み元のDBを読む（バージョン差を吸収する） |
- * | `sync/entries` | changelog エントリ1件ずつの適用 |
- * | `sync/full-merge` | 隙間があるときの全件突き合わせ |
- * | `sync/triggers` | フルマージ中のトリガー付け外し |
- * | `sync/pull` | 相手1人ぶんの取り込み（トランザクションの単位） |
+ * 旧経路（`sync/entries`・`sync/full-merge`・`sync/pull`・`conflict/*` の畳み）は
+ * **段階6 で消した**。
  *
  * @module sync
  */
 import Database from 'better-sqlite3'
-import { DEFAULTS, SyncConfig, SyncResult, TableConfig } from './types'
-import {
-  cleanupChangelog,
-  describeChangelogPruneWall,
-  hasChangelogGap,
-  normalizeRetentionDays,
-} from './changelog'
-import {
-  copyToNas,
-  ensureDirectory,
-  listRemoteClients,
-  openRemoteDbViaLocalCopy,
-} from './nas'
-import { readSchemaVersion, writeSchemaVersion } from './setup'
-import { getSyncState, updateHeartbeat } from './sync/state'
-import { pullFullMerge, pullNormal } from './sync/pull'
-import { dropLocalWritesLostToDeletion } from './sync/self-check'
+import { SyncConfig, SyncResult, TableConfig } from './types'
+import { RowsSyncRuntime, performRowsSync } from './sync/rows-sync'
+
+export type { RowsSyncRuntime } from './sync/rows-sync'
+export type { RowsRebuildHooks } from './rows/rebuild'
 
 /**
- * 同期処理を実行する。
- *
- * **通常フロー（ギャップなし）:**
- * 1. ローカルDBをNASにアトミックコピー
- * 2. 各リモートクライアントからchangelogベースでpull
- * 3. heartbeat更新
- *
- * **ギャップ検出時（pull-firstフロー）:**
- * 1. NASへのアップロードをスキップ（staleデータの拡散を防止）
- * 2. トリガー無効化 → 各リモートからフルマージ（データ + tombstone + changelog）→ トリガー有効化
- * 3. heartbeat更新（トリガーON → changelogに1件記録 → changelog延命）
- * 4. pull完了後にローカルDBをNASにアップロード（クリーンな状態）
+ * 同期処理を1回実行する（案A）。
  *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param config - 同期設定
- * @param tables - 同期対象テーブル設定の配列（{@link discoverTables} 等で解決済み）
+ * @param tables - 同期対象テーブル設定の配列
+ * @param runtime - `SyncInstance` が持ち回る記憶（作り直しの見送り回数など）。
+ *   省略すると毎回まっさらになる（見送りが続いても合流経路へ入れないので、
+ *   `setupSync` からは必ず渡す）
  * @returns 同期結果の統計情報
- * @throws NASへのコピーに失敗した場合
- *
- * @remarks
- * 個別のリモートクライアントの処理失敗は警告として記録され、
- * 他のクライアントの処理には影響しない。
  */
 export async function performSync(
   localDb: Database.Database,
   config: SyncConfig,
-  tables: TableConfig[]
+  tables: TableConfig[],
+  runtime?: RowsSyncRuntime
 ): Promise<SyncResult> {
-  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
-  // 保持期間はSQLの綴りへ埋め込まれるので、使えない値のまま先へ流さない
-  // （{@link normalizeRetentionDays}）。掃除とフルマージの両方が同じ値を見るよう、
-  // **ここで一度だけ**均す。
-  const configuredRetentionDays =
-    config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays
-  const retentionDays = normalizeRetentionDays(configuredRetentionDays)
-  const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled
-
-  const result: SyncResult = {
-    clientsSynced: 0,
-    inserted: 0,
-    updated: 0,
-    deleted: 0,
-    skipped: 0,
-    conflictsResolved: 0,
-    folds: [],
-    warnings: [],
-    skippedRemotes: [],
-    hadChangelogGap: false,
-  }
-
-  // 直せない設定は黙って直さない。均した事実を持ち主へ返す
-  // （負値や NaN のままだと、掃除もフルマージも例外なしで止まる）。
-  if (retentionDays !== configuredRetentionDays) {
-    result.warnings.push(
-      `changelogRetentionDays: ${String(configuredRetentionDays)} is not a usable ` +
-        `number of days, falling back to ${retentionDays}.`
-    )
-  }
-
-  // 0. schemaVersionが指定されている場合、ローカルDBに書き込む
-  if (config.schemaVersion) {
-    writeSchemaVersion(localDb, config.schemaVersion)
-  }
-
-  // 0.5. 自分が書いた行にも同じ LWW を当てる。
-  //
-  // 取り込み経路は「削除より古い挿入・更新は採らない」を守るが、**アプリが
-  // ローカルへ直接書いた行はその検査を通らない**。既にある削除より古い時刻で
-  // 書かれた行は、受け取る側が規則どおり採らないので、**書いた端末だけが持ち続けて
-  // 永久に食い違う**（警告も例外も出ない）。押し出す前に閉じておく。
-  dropLocalWritesLostToDeletion(localDb, tables, primaryKey, result)
-
-  // 1. NASディレクトリを確保し、リモートクライアントを列挙
-  ensureDirectory(config.nasPath)
-  const remoteClients = listRemoteClients(config.nasPath, config.clientId)
-
-  // 2. ギャップ事前チェック: いずれかのリモートにchangelogギャップがあるか確認
-  let hasAnyGap = false
-  for (const remote of remoteClients) {
-    let handle: ReturnType<typeof openRemoteDbViaLocalCopy> = null
-    try {
-      handle = openRemoteDbViaLocalCopy(remote.filePath)
-      if (!handle) continue
-      const remoteDb = handle.db
-
-      if (config.schemaVersion) {
-        const remoteVersion = readSchemaVersion(remoteDb)
-        if (remoteVersion !== config.schemaVersion) continue
-      }
-
-      const { lastSeenId } = getSyncState(localDb, remote.clientId)
-      if (hasChangelogGap(remoteDb, lastSeenId)) {
-        hasAnyGap = true
-        break
-      }
-    } finally {
-      if (handle) {
-        handle.cleanup()
-      }
-    }
-  }
-
-  if (hasAnyGap) {
-    // === Pull-first フルマージフロー ===
-    result.hadChangelogGap = true
-
-    // 3a. トリガーOFFでフルマージ（データ + tombstone + changelog）
-    pullFullMerge(
-      localDb,
-      remoteClients,
-      config,
-      tables,
-      primaryKey,
-      retentionDays,
-      result
-    )
-
-    // 3b. heartbeat更新（トリガーON状態 → changelogに1件 → changelog延命）
-    if (heartbeatEnabled) {
-      updateHeartbeat(localDb)
-    }
-
-    // 3c. クリーンな状態をNASにアップロード
-    await copyToNas(localDb, config.nasPath, config.clientId)
-  } else {
-    // === 通常フロー ===
-    // 4a. ローカルDBをNASにコピー（schemaVersion込み）
-    await copyToNas(localDb, config.nasPath, config.clientId)
-
-    // 4b. リモートから変更をpull
-    pullNormal(localDb, remoteClients, config, tables, primaryKey, result)
-
-    // 4c. heartbeat更新
-    if (heartbeatEnabled) {
-      updateHeartbeat(localDb)
-    }
-  }
-
-  // 5. 古い_changelogエントリの掃除
-  cleanupChangelog(localDb, retentionDays)
-
-  // 掃除は接頭辞しか刈らないので、時刻として読めない `changedAt` は壁になり、
-  // そこから先は保持期間を過ぎても残る。**その行を消して解決したことにはしない**
-  // （消せばそれは changelog の穴で、穴の向こうの変更は届かなくなる）。
-  // 残したまま持ち主へ知らせる ——「掃除しているのに changelog が縮まない」を
-  // 黙って放置すると、いつか保持期間の意味が失われる。
-  const pruneWall = describeChangelogPruneWall(localDb, retentionDays)
-  if (pruneWall) {
-    result.warnings.push(pruneWall)
-  }
-
-  // 6. onAfterSync コールバック
-  if (config.onAfterSync) {
-    config.onAfterSync(localDb, result)
-  }
-
-  return result
+  return performRowsSync(localDb, config, tables, runtime)
 }

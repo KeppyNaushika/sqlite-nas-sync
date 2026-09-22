@@ -17,7 +17,7 @@ describe('Integration Tests', () => {
     const db = new Database(dbPath)
     db.exec(`
       CREATE TABLE users (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
         email TEXT NOT NULL,
         updatedAt TEXT NOT NULL
@@ -25,7 +25,7 @@ describe('Integration Tests', () => {
     `)
     db.exec(`
       CREATE TABLE posts (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         title TEXT NOT NULL,
         body TEXT,
         userId TEXT NOT NULL,
@@ -469,7 +469,7 @@ describe('Integration Tests', () => {
       const db = new Database(dbPath)
       db.exec(`
         CREATE TABLE items (
-          id TEXT PRIMARY KEY,
+          id TEXT PRIMARY KEY NOT NULL,
           name TEXT NOT NULL,
           modifiedAt TEXT NOT NULL
         )
@@ -530,57 +530,6 @@ describe('Integration Tests', () => {
         .get('i1') as any
       dbBCheck.close()
       expect(itemB.name).toBe('New Item')
-    })
-  })
-
-  describe('deleteProtected', () => {
-    it('deleteProtected: true のテーブルではDELETEがスキップされる', async () => {
-      const pathA = createClientDb('client-a')
-      const pathB = createClientDb('client-b')
-
-      const configWithProtect = (
-        dbPath: string,
-        clientId: string
-      ): SyncConfig => ({
-        dbPath,
-        nasPath: nasDir,
-        clientId,
-        tableOptions: { users: { deleteProtected: true } },
-        primaryKey: 'id',
-        intervalMs: 100,
-        changelogRetentionDays: 7,
-      })
-
-      const syncA = setupSync(configWithProtect(pathA, 'client-a'))
-      const syncB = setupSync(configWithProtect(pathB, 'client-b'))
-
-      // Client A: レコード追加 → sync
-      const dbA1 = new Database(pathA)
-      dbA1
-        .prepare(
-          `INSERT INTO users (id, name, email, updatedAt) VALUES (?, ?, ?, ?)`
-        )
-        .run('u1', 'Alice', 'alice@example.com', '2024-01-01T00:00:00Z')
-      dbA1.close()
-      await syncA.syncNow()
-
-      // Client B: sync → レコード取得
-      await syncB.syncNow()
-      expect(getUser(pathB, 'u1')).toBeTruthy()
-
-      // Client A: レコード削除 → sync
-      const dbA2 = new Database(pathA)
-      dbA2.prepare(`DELETE FROM users WHERE id = ?`).run('u1')
-      dbA2.close()
-      await syncA.syncNow()
-
-      // Client B: 再sync → deleteProtectedなのでレコードは残る
-      const resultB = await syncB.syncNow()
-      syncA.stop()
-      syncB.stop()
-
-      expect(resultB.deleted).toBe(0)
-      expect(getUser(pathB, 'u1')).toBeTruthy()
     })
   })
 
@@ -645,14 +594,14 @@ describe('Integration Tests', () => {
       const dbB = new Database(pathB)
       dbB.exec(`
         CREATE TABLE users (
-          id TEXT PRIMARY KEY,
+          id TEXT PRIMARY KEY NOT NULL,
           name TEXT NOT NULL,
           updatedAt TEXT NOT NULL
         )
       `)
       dbB.exec(`
         CREATE TABLE posts (
-          id TEXT PRIMARY KEY,
+          id TEXT PRIMARY KEY NOT NULL,
           title TEXT NOT NULL,
           body TEXT,
           userId TEXT NOT NULL,

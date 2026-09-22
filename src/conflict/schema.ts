@@ -168,7 +168,7 @@ export function cachedBySchema<T>(
  * テーブルが存在するか。
  *
  * 同期用の内部テーブル（`_changelog` / `_tombstone` など）は、利用者のDBが
- * `setupChangelog` を通していない場合や、旧バージョン由来の場合に無い。触る前に確かめる。
+ * ライブラリの取り付けを通していない場合や、旧バージョン由来の場合に無い。触る前に確かめる。
  * @internal
  */
 export function hasTable(db: Database.Database, tableName: string): boolean {
@@ -406,5 +406,41 @@ export function rowKeyColumns(
       .sort((a, b) => a.pk - b.pk)
       .map((column) => column.name)
     return keyColumns.length > 0 ? keyColumns : ['rowid']
+  })
+}
+
+/**
+ * この表の**主キーそのものを外部キーが兼ねている**親表を挙げる。
+ *
+ * `tag_profiles(id TEXT PRIMARY KEY REFERENCES tags(id))` のような1:1の子がこの形で、
+ * ここでは**行の id を持っているのは親である**。親が畳まれれば子の id はそのまま動く
+ * （{@link repointChild}）し、**親が決めた向きと逆向きに子だけを畳むことはできない**
+ * —— 畳んだ先の id には親が居ないからである。だから畳む向きの決着は、この形の表では
+ * 子の時刻ではなく親の帳簿が握る（{@link isFoldClaimOutranked}）。
+ *
+ * 主キーは**スキーマから引く**（同期の設定の主キー名を引き回さない）。この問いに
+ * 要るのは「その列がこの表の主キーか」だけで、`PRAGMA table_info` がそれを答える。
+ * 帳簿の入口（{@link recordMerge}）まで設定を運ぶと、同じ問いに答える場所が増える。
+ *
+ * **キャッシュの寿命**は `PRAGMA schema_version` が変わるまで（{@link cachedBySchema}）。
+ * @internal
+ */
+export function findIdentityOwningParents(
+  db: Database.Database,
+  tableName: string
+): string[] {
+  return cachedBySchema(db, `idowner:${foldIdentifier(tableName)}`, () => {
+    // 宣言された主キーが無い表（`rowKeyColumns` が `rowid` を返す）では、
+    // 下の `includesPrimaryKeyColumn` が必ず偽になるので空で返る
+    const primaryKey = rowKeyColumns(db, tableName)[0]
+    return readForeignKeys(db, tableName, primaryKey)
+      .filter((foreignKey) =>
+        includesPrimaryKeyColumn(
+          db,
+          tableName,
+          foreignKey.columns.map((column) => column.childColumn)
+        )
+      )
+      .map((foreignKey) => foreignKey.parentTable)
   })
 }
