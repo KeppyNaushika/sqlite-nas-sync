@@ -17,8 +17,6 @@
  * JS で真似ると必ずずれる。かぶりは「一時 DB へ入れてみて、どのエラーで落ちたか」で
  * 決め、勝者は「索引の項の値でその一時 DB を引く」ことで決める（設計書 §1.5）。
  *
- * この版（段階1）ではまだ `setupSync` から呼ばれない。純粋な計算だけを置く。
- *
  * @module rows/derive
  * @internal
  */
@@ -39,16 +37,6 @@ interface RowsTable {
   ddl: string
   /** `CREATE [UNIQUE] INDEX` 文（部分索引・式索引を含んでよい） */
   indexes?: string[]
-  /**
-   * 削除の版が**表示の計算で勝たない**表（`TableConfig.deleteProtected`）。
-   *
-   * この表では、行の版が1つでもあれば `Max` はその中の最強のものになり、
-   * 削除の版は見ない。削除の版しか無い id だけが死んだ id になる。
-   *
-   * **全端末で同じ値である前提**（前提 P4）。違うと同じ版の集合から
-   * 端末ごとに違う見え方が出る。
-   */
-  deleteProtected?: boolean
 }
 
 /** 同期する表の一覧。**外部キーの依存の順に並んでいなくてよい**（中で並べ替える）。 */
@@ -56,8 +44,13 @@ export interface RowsSchema {
   tables: RowsTable[]
 }
 
-/** 候補（＝ `Max` が行の版だった id）の行き先。設計書 §1.4〜§1.6。 */
-export type Placement = 'placed' | 'hidden' | 'unplaceable'
+/**
+ * 候補（＝ `Max` が行の版だった id）の行き先。設計書 §1.4〜§1.6。
+ *
+ * `discarded` だけは他と質が違う —— 版そのものを捨てる（原則4）。
+ * 他の3つはアプリの表での置き場所の話で、版は `_sns_rows_<表>` に残る。
+ */
+export type Placement = 'placed' | 'hidden' | 'unplaceable' | 'discarded'
 
 /** 1つの候補について分かったこと。 */
 export interface CandidateResult {
@@ -76,13 +69,18 @@ export interface CandidateResult {
    * `constraint` は行に閉じた制約（NOT NULL / CHECK / 型）で SQLite が拒んだもの
    */
   reasonKind?: 'parent' | 'constraint'
+  /** 捨てる原因になった親（原則4）。`placement` が `discarded` のときだけ入る */
+  cause?: { table: string; key: string }
 }
 
 /** {@link derive} の結果。 */
 interface DerivedRows {
   /** 表 → 真の id の正規形 → 候補の結果 */
   candidates: Map<string, Map<string, CandidateResult>>
-  /** 表 → 真の id の正規形 → `Res`（表示上の主キーの値の組。`⊥` は null。設計書 §1.6） */
+  /**
+   * 表 → 真の id の正規形 → `Res`（表示上の主キーの値の組。`⊥` は null。設計書 §1.6）。
+   * 死んでいる id は載らない（載っていないのは `⊥` と同じに扱う）
+   */
   res: Map<string, Map<string, SqlValue[] | null>>
   /** 表 → 置く行（`SELECT *` と同じ列の並びの、アプリの表の行） */
   rows: Map<string, Record<string, SqlValue>[]>
@@ -158,8 +156,6 @@ interface TableMeta {
   uniqueIndexes: UniqueIndexDefinition[]
   /** 置いた行を指し直すための列（主キー。無い表では全列） */
   identityColumns: string[]
-  /** 削除の版を `Max` から外す（{@link RowsTable.deleteProtected}） */
-  deleteProtected: boolean
 }
 
 /** 判定用の一時 DB に置いた行1つ（勝者を引くときの行き先）。 */
@@ -210,16 +206,6 @@ function deriveWith(
       perTable.set(key, version)
       continue
     }
-    // `deleteProtected` の表では、削除の版は行の版に勝たない（設計書 §1.3 の
-    // 例外）。順序 `≺` そのものは変えない —— 変えると取り込みの `Max` まで
-    // 変わり、設定を外したときに削除が効かなくなる。ここで**見え方の計算だけ**
-    // が削除の版を見ない
-    if (model.tables.get(version.table)?.deleteProtected === true) {
-      if (current.kind !== version.kind) {
-        if (version.kind === 'row') perTable.set(key, version)
-        continue
-      }
-    }
     if (values.compareVersions(current, version) < 0) {
       perTable.set(key, version)
     }
@@ -229,6 +215,11 @@ function deriveWith(
   const res = new Map<string, Map<string, SqlValue[] | null>>()
   const rows = new Map<string, Record<string, SqlValue>[]>()
   const dead = new Map<string, Set<string>>()
+  /**
+   * 消えている id（原則4）。表 → 真の id の正規形 → 大元の削除（`<表>:<id>`）。
+   * 親が先に並んでいるので（`model.order`）、子を見るときには親のぶんが揃っている。
+   */
+  const gone = new Map<string, Map<string, string>>()
 
   for (const name of model.order) {
     const table = model.tables.get(name) as TableMeta
@@ -237,14 +228,19 @@ function deriveWith(
     const tableRes = new Map<string, SqlValue[] | null>()
     const tableRows: Record<string, SqlValue>[] = []
     const tableDead = new Set<string>()
+    const tableGone = new Map<string, string>()
     /** 判定用の DB に置いた行の「同一性の列の値」→ どの候補か */
     const placedByIdentity = new Map<string, PlacedRow>()
 
-    // 2. 候補（設計書 §1.3）。死んだ id は `Res` の `mergedInto` の規則のために覚える
+    // 2. 候補（設計書 §1.3）。死んだ id は `dead` として返す
     const living: RowVersion[] = []
     for (const [key, version] of perTable) {
       if (version.kind === 'row') living.push(version)
-      else tableDead.add(key)
+      else {
+        tableDead.add(key)
+        // 削除そのものが大元。子から見た原因はこの id になる
+        tableGone.set(key, `${name}:${key}`)
+      }
     }
 
     // 3〜4. 版の順序の強い順。すべて等しければ真の id の正規形の小さい順（設計書 §1.6）
@@ -258,15 +254,31 @@ function deriveWith(
 
     for (const version of living) {
       const key = values.idKey(version.id)
-      const display = displayValues(
+      const shown = displayValues(
         values,
         model,
         table,
         version,
         res,
-        candidates
+        candidates,
+        gone
       )
-      if (display === null) {
+      if (shown.kind === 'discard') {
+        // 親が削除されている。版ごと捨てる（原則4）。捨てた中身は呼び出し元が報告する
+        tableCandidates.set(key, {
+          table: name,
+          key,
+          placement: 'discarded',
+          display: { ...(version.content ?? {}) },
+          reason: `親が削除されている（${shown.cause.table}:${shown.cause.key}）`,
+          reasonKind: 'parent',
+          cause: shown.cause,
+        })
+        tableRes.set(key, null)
+        tableGone.set(key, `${shown.cause.table}:${shown.cause.key}`)
+        continue
+      }
+      if (shown.kind === 'unplaceable') {
         tableCandidates.set(key, {
           table: name,
           key,
@@ -278,6 +290,7 @@ function deriveWith(
         tableRes.set(key, null)
         continue
       }
+      const display = shown.display
       // 主キーが NULL の候補は置かない行にする。`INTEGER PRIMARY KEY` に NULL を
       // 入れると SQLite が rowid を割り当ててしまい、**ライブラリが id を捏造する**
       // ことになる（目標 (c) に反する）
@@ -353,16 +366,11 @@ function deriveWith(
       tableRes.set(row.key, tableRes.get(winner) ?? null)
     }
 
-    // 死んでいて、削除の版が旧版の `mergedInto` を持つときの `Res`（設計書 §1.6）
-    for (const key of tableDead) {
-      const target = resolveMerged(values, perTable, key, new Set())
-      tableRes.set(key, target === null ? null : (tableRes.get(target) ?? null))
-    }
-
     candidates.set(name, tableCandidates)
     res.set(name, tableRes)
     rows.set(name, tableRows)
     dead.set(name, tableDead)
+    gone.set(name, tableGone)
   }
 
   return { candidates, res, rows, dead }
@@ -414,30 +422,30 @@ function findWinner(
   return best === null ? null : best.key
 }
 
-/** 死んだ id の `mergedInto` をたどる（循環は `⊥`）。 */
-function resolveMerged(
-  values: ValueOrdering,
-  perTable: Map<string, RowVersion>,
-  key: string,
-  seen: Set<string>
-): string | null {
-  if (seen.has(key)) return null
-  seen.add(key)
-  const version = perTable.get(key)
-  if (version === undefined || version.mergedInto === undefined) return null
-  const next = values.idKey(version.mergedInto)
-  const target = perTable.get(next)
-  if (target === undefined) return null
-  if (target.kind === 'row') return next
-  return resolveMerged(values, perTable, next, seen)
-}
+/** {@link displayValues} の答え。 */
+type DisplayOutcome =
+  /** 置ける（表示値が決まった） */
+  | { kind: 'values'; display: Record<string, SqlValue> }
+  /** 置かない行。版は `_sns_rows_<表>` に残る */
+  | { kind: 'unplaceable' }
+  /** 版ごと捨てる（原則4）。`cause` は削除されている親 */
+  | { kind: 'discard'; cause: { table: string; key: string } }
 
 /**
- * 表示値（設計書 §1.4）。`null` を返したら**置かない行**。
+ * 表示値（設計書 §1.4、原則4）。
  *
  * 外部キーの列は、同期する親を指していれば `Res_p` で読み替える。親が置かれていなければ
  * 宣言された `ON DELETE` に従う。主キーが親を指している（1:1 の）表では、主キーも
  * 読み替える —— `Res_p = ⊥` ならその行は置かない行になる。
+ *
+ * **親が「置かれていない」のか「削除されている」のかを分ける**（原則4）。
+ * 削除されているなら、その子の版は捨てる —— 宣言が `ON DELETE CASCADE` である以上、
+ * あとから届いた子も、その時刻によらず消える。置かない行にして版を残すと、
+ * その行はアプリの表に入らないまま `_sns_rows_<表>` に永遠に残る。
+ *
+ * 分けられるのは**親の主キーを指している外部キーだけ**である。主キー以外の
+ * `UNIQUE` 列を指しているときは、その値を持っていた親がどれだったかが決まらず、
+ * 「どの削除が原因か」を答えられない。その場合は従来どおり置かない行にする。
  */
 function displayValues(
   values: ValueOrdering,
@@ -445,8 +453,9 @@ function displayValues(
   table: TableMeta,
   version: RowVersion,
   res: Map<string, Map<string, SqlValue[] | null>>,
-  candidates: Map<string, Map<string, CandidateResult>>
-): Record<string, SqlValue> | null {
+  candidates: Map<string, Map<string, CandidateResult>>,
+  gone: Map<string, Map<string, string>>
+): DisplayOutcome {
   const display: Record<string, SqlValue> = {}
   for (const column of table.storedColumns) {
     display[column] = version.content?.[column] ?? null
@@ -474,26 +483,31 @@ function displayValues(
     const isPrimary =
       key.columns.length === table.primaryKey.length &&
       key.columns.every((column) => table.primaryKey.includes(column))
+    // 親が削除されているなら、置かない行ではなく捨てる行（原則4）
+    const cause = goneParent(values, model, key, trueValues, gone)
+    const out = (): DisplayOutcome =>
+      cause === null ? { kind: 'unplaceable' } : { kind: 'discard', cause }
     // `ON DELETE` の綴りを読むのは `rows/on-delete.ts` の1か所だけ（写しを増やさない）
     switch (missingParentAction(key.onDelete)) {
       case 'setNull': {
-        if (isPrimary) return null // 1:1 の主キーは NULL にできない
-        if (key.columns.some((column) => table.notNull.has(column))) return null
+        if (isPrimary) return out() // 1:1 の主キーは NULL にできない
+        if (key.columns.some((column) => table.notNull.has(column)))
+          return out()
         for (const column of key.columns) display[column] = null
         break
       }
       case 'setDefault': {
-        if (isPrimary) return null
+        if (isPrimary) return out()
         const defaults = key.columns.map((column) =>
           literalDefault(model, table, column)
         )
-        if (defaults.some((value) => value === undefined)) return null
+        if (defaults.some((value) => value === undefined)) return out()
         const asValues = defaults as SqlValue[]
         // 既定値の指す親が置かれていなければ、置かない行
         if (
           resolveParent(values, model, key, asValues, res, candidates) === null
         ) {
-          return null
+          return out()
         }
         key.columns.forEach((column, index) => {
           display[column] = asValues[index]
@@ -502,10 +516,40 @@ function displayValues(
       }
       default:
         // 'drop'（CASCADE / RESTRICT / NO ACTION）
-        return null
+        return out()
     }
   }
-  return display
+  return { kind: 'values', display }
+}
+
+/**
+ * 消えている親（原則4）。削除の版が勝っているか、親自身が捨てられたか。
+ *
+ * `gone` は表 → 真の id の正規形 → **原因の表示**（`<表>:<id>` の形）で、
+ * 親が捨てられた行だったときは、その親を捨てさせた大元の削除を指す。
+ * 連鎖の根を答えるのは、利用者が「どの削除でこの行が消えたか」を1つ知れば
+ * 足りるからである。
+ *
+ * 主キー以外の `UNIQUE` 列を指す外部キーでは `null`（どの親だったか決まらない）。
+ */
+function goneParent(
+  values: ValueOrdering,
+  model: SchemaModel,
+  key: ForeignKey,
+  trueValues: SqlValue[],
+  gone: Map<string, Map<string, string>>
+): { table: string; key: string } | null {
+  const parent = model.tables.get(key.parentTable) as TableMeta
+  const parentColumns = model.parentColumnsOf(key)
+  const isParentPrimaryKey =
+    parentColumns.length === parent.primaryKey.length &&
+    parentColumns.every((column) => parent.primaryKey.includes(column))
+  if (!isParentPrimaryKey) return null
+  const parentKey = values.idKey(trueValues[0])
+  const root = gone.get(key.parentTable)?.get(parentKey)
+  if (root === undefined) return null
+  const at = root.indexOf(':')
+  return { table: root.slice(0, at), key: root.slice(at + 1) }
 }
 
 /**
@@ -654,7 +698,6 @@ class SchemaModel {
       foreignKeys: this.readForeignKeys(table.name),
       uniqueIndexes: readUniqueIndexes(this.judge, table.name),
       identityColumns: primaryKey.length > 0 ? primaryKey : selectColumns,
-      deleteProtected: table.deleteProtected === true,
     }
   }
 

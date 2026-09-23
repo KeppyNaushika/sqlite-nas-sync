@@ -371,10 +371,12 @@ describe('トリガー —— 作成・更新・削除', () => {
       expect(graves).toHaveLength(1)
       expect(graves[0]).toMatchObject({
         recordId: 'n1',
-        _sns_ts: '2026-01-01T00:00:00.000Z',
         _sns_lamport: 2,
         _sns_instance: INSTANCE,
       })
+      // 原則2: 順序に使うのは削除を実行した時刻。消した行の updatedAt ではない
+      expect(graves[0]._sns_ts).toBe(graves[0].deletedAt)
+      expect(graves[0]._sns_ts).not.toBe('2026-01-01T00:00:00.000Z')
     } finally {
       db.close()
     }
@@ -393,8 +395,7 @@ describe('トリガー —— 作成・更新・削除', () => {
       ).run()
       const row = rowsOf(db, 'notes')[0]
       const grave = tombstonesOf(db, 'notes')[0]
-      expect(row._sns_ts).toBe('2026-06-01T00:00:00.000Z')
-      expect(grave._sns_ts).toBe('2026-06-01T00:00:00.000Z')
+      expect(row._sns_ts).toBe(grave._sns_ts)
       // 同着の時刻なので lamport で決まる。行の版のほうが後
       expect(Number(row._sns_lamport)).toBeGreaterThan(
         Number(grave._sns_lamport)
@@ -407,11 +408,13 @@ describe('トリガー —— 作成・更新・削除', () => {
   it('墓標は弱い版で上書きされない（ON CONFLICT … WHERE STRONGER）', () => {
     const db = open([NOTES], ['notes'])
     try {
+      // 大きく未来の時刻で作って消す。削除を実行した時刻よりも強い墓標になる
       db.prepare(
-        `INSERT INTO notes VALUES ('n1','a','b','2026-06-01T00:00:00.000Z')`
+        `INSERT INTO notes VALUES ('n1','a','b','2099-06-01T00:00:00.000Z')`
       ).run()
       db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
       const strong = tombstonesOf(db, 'notes')[0]
+      expect(strong._sns_ts).toBe('2099-06-01T00:00:00.000Z')
       // 手で弱い版を作って（取り込みの真似）、そのあとアプリが同じ id を作って消す
       db.prepare(
         `INSERT INTO notes VALUES ('n1','a','b','2020-01-01T00:00:00.000Z')`
@@ -422,6 +425,97 @@ describe('トリガー —— 作成・更新・削除', () => {
       expect(Number(after._sns_lamport)).toBeGreaterThan(
         Number(strong._sns_lamport)
       )
+    } finally {
+      db.close()
+    }
+  })
+})
+
+/* ================================================================== *
+ * 統合した行の DELETE（原則3）
+ * ================================================================== */
+
+describe('統合した行の DELETE', () => {
+  /** `UNIQUE` がかぶって n2 が n1 の後ろに隠れている状態を作る。 */
+  function withHidden(db: Database.Database): void {
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1','同じ名前','b','2026-01-01T00:00:00.000Z')`
+    ).run()
+    // 隠れている側の版を直に置く（アプリの表には現れない）
+    db.prepare(
+      `INSERT INTO _sns_rows_notes (id, title, body, updatedAt, _sns_ts, _sns_lamport, _sns_instance)
+       VALUES ('n2','同じ名前','y','2025-01-01T00:00:00.000Z','2025-01-01T00:00:00.000Z',1,'bbbb')`
+    ).run()
+    db.prepare(`INSERT INTO _sns_hidden VALUES ('notes','n2','n1')`).run()
+  }
+
+  it('隠れていた側の主キーにも削除の版が書かれる', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      withHidden(db)
+      db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
+      const graves = tombstonesOf(db, 'notes')
+      expect(graves.map((row) => row.recordId)).toEqual(['n1', 'n2'])
+      // 1回の `DELETE` なので、どちらも同じ実行時刻になる
+      expect(graves[1]._sns_ts).toBe(graves[0]._sns_ts)
+      expect(graves[1]._sns_ts).toBe(graves[1].deletedAt)
+      // 隠れていた側の行の版も落ちる
+      expect(rowsOf(db, 'notes')).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('隠れていた側の主キーも _changelog で告げる', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      withHidden(db)
+      db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
+      const told = db
+        .prepare(
+          `SELECT DISTINCT recordId FROM _changelog
+            WHERE tableName='notes' AND operation='DELETE' ORDER BY recordId`
+        )
+        .all() as Row[]
+      expect(told.map((row) => row.recordId)).toEqual(['n1', 'n2'])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('隠れていた側の版のほうが強ければ、削除の版もその強さで書かれる', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      db.prepare(
+        `INSERT INTO notes VALUES ('n1','同じ名前','b','2026-01-01T00:00:00.000Z')`
+      ).run()
+      db.prepare(
+        `INSERT INTO _sns_rows_notes (id, title, body, updatedAt, _sns_ts, _sns_lamport, _sns_instance)
+         VALUES ('n2','同じ名前','y','2099-01-01T00:00:00.000Z','2099-01-01T00:00:00.000Z',1,'bbbb')`
+      ).run()
+      db.prepare(`INSERT INTO _sns_hidden VALUES ('notes','n2','n1')`).run()
+      db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
+      const graves = tombstonesOf(db, 'notes')
+      // n2 の削除の版が n2 の行の版より弱いと、消したはずの行が戻る
+      expect(graves[1]).toMatchObject({
+        recordId: 'n2',
+        _sns_ts: '2099-01-01T00:00:00.000Z',
+      })
+      expect(rowsOf(db, 'notes')).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('勝者のいない隠れた行は巻き込まない', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      withHidden(db)
+      db.prepare(`UPDATE _sns_hidden SET winnerId = NULL`).run()
+      db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
+      expect(tombstonesOf(db, 'notes').map((row) => row.recordId)).toEqual([
+        'n1',
+      ])
     } finally {
       db.close()
     }
@@ -552,14 +646,16 @@ describe('1:1 の表（_sns_shown を shownId 側から引く）', () => {
       db.prepare(`INSERT INTO t VALUES (5,'a','2026-06-01')`).run()
       db.prepare(`DELETE FROM t WHERE id=5`).run()
       expect(tombstonesOf(db, 't').map((row) => row.recordId)).toEqual(['5'])
+      const grave = tombstonesOf(db, 't')[0]
       // '05' という別の id の墓標は、この行とは突き合わない
       db.prepare(
         `INSERT INTO _tombstone (tableName, recordId, deletedAt, _sns_ts, _sns_lamport, _sns_instance)
          VALUES ('t','05','2026-01-01','2099-01-01',1,'zzzz')`
       ).run()
       db.prepare(`INSERT INTO t VALUES (5,'b','2026-01-01')`).run()
-      // 引き上げに使われたのは '5' の墓標（2026-06-01）であって、'05' の 2099 ではない
-      expect(rowsOf(db, 't')[0]._sns_ts).toBe('2026-06-01')
+      // 引き上げに使われたのは '5' の墓標であって、'05' の 2099 ではない
+      expect(rowsOf(db, 't')[0]._sns_ts).toBe(grave._sns_ts)
+      expect(rowsOf(db, 't')[0]._sns_ts).not.toBe('2099-01-01')
     } finally {
       db.close()
     }
@@ -664,7 +760,7 @@ describe('書き方のいろいろ', () => {
       const row = rowsOf(db, 'notes')[0]
       const grave = tombstonesOf(db, 'notes')[0]
       expect(row).toMatchObject({ title: 'z', body: null })
-      expect(row._sns_ts).toBe('2026-06-01T00:00:00.000Z')
+      expect(row._sns_ts).toBe(grave._sns_ts)
       expect(Number(row._sns_lamport)).toBeGreaterThan(
         Number(grave._sns_lamport)
       )
@@ -785,29 +881,31 @@ describe('取り込みの直後（_sns_rows_* に行が無い窓）', () => {
       ).run()
       // 取り込みが強い削除の版を受け取り、負けた行の版を消した状態
       db.prepare(`DELETE FROM _sns_rows_notes WHERE id='n1'`).run()
+      // 削除を実行した時刻より強い墓標にしておく。弱い値に落ちたら分かる
       db.prepare(
         `INSERT INTO _tombstone (tableName, recordId, deletedAt, _sns_ts, _sns_lamport, _sns_instance)
-         VALUES ('notes','n1','2026-09-01','2026-09-01T00:00:00.000Z',9,'zzzz')`
+         VALUES ('notes','n1','2099-09-01','2099-09-01T00:00:00.000Z',9,'zzzz')`
       ).run()
       db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
       const grave = tombstonesOf(db, 'notes')[0]
       // `COALESCE` で書くと OLD.updatedAt（2026-01-01）に落ちて Max が後退する
-      expect(grave._sns_ts).toBe('2026-09-01T00:00:00.000Z')
+      expect(grave._sns_ts).toBe('2099-09-01T00:00:00.000Z')
     } finally {
       db.close()
     }
   })
 
-  it('_sns_rows_* にも _tombstone にも行が無ければ OLD の時刻列に落ちる（訂正3）', () => {
+  it('_sns_rows_* にも _tombstone にも行が無ければ OLD の時刻列も見る（訂正3）', () => {
     const db = open([NOTES], ['notes'])
     try {
+      // OLD の時刻列が削除を実行した時刻より強い場合。弱いほうへ下がらない
       db.prepare(
-        `INSERT INTO notes VALUES ('n1','a','b','2026-01-01T00:00:00.000Z')`
+        `INSERT INTO notes VALUES ('n1','a','b','2099-01-01T00:00:00.000Z')`
       ).run()
       db.prepare(`DELETE FROM _sns_rows_notes WHERE id='n1'`).run()
       db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
       expect(tombstonesOf(db, 'notes')[0]._sns_ts).toBe(
-        '2026-01-01T00:00:00.000Z'
+        '2099-01-01T00:00:00.000Z'
       )
     } finally {
       db.close()
@@ -818,13 +916,34 @@ describe('取り込みの直後（_sns_rows_* に行が無い窓）', () => {
     const db = open([NOTES], ['notes'])
     try {
       db.prepare(
-        `INSERT INTO notes VALUES ('n1','a','b','2026-01-01T00:00:00.000Z')`
+        `INSERT INTO notes VALUES ('n1','a','b','2099-01-01T00:00:00.000Z')`
       ).run()
       db.prepare(
         `UPDATE _sns_rows_notes SET _sns_ts = NULL WHERE id='n1'`
       ).run()
       db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
-      expect(tombstonesOf(db, 'notes')[0]._sns_ts).toBe(null)
+      // 行の版はあるので OLD（2099）には落ちない。削除を実行した時刻になる
+      const grave = tombstonesOf(db, 'notes')[0]
+      expect(grave._sns_ts).not.toBe('2099-01-01T00:00:00.000Z')
+      expect(grave._sns_ts).toBe(grave.deletedAt)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('時刻列が数値の表では、削除を実行した時刻を順序に使わない（群の取り違え）', () => {
+    const db = open(
+      [
+        `CREATE TABLE n (id TEXT PRIMARY KEY NOT NULL, v TEXT, updatedAt INTEGER)`,
+      ],
+      ['n']
+    )
+    try {
+      db.prepare(`INSERT INTO n VALUES ('n1','a',1700000000000)`).run()
+      db.prepare(`DELETE FROM n WHERE id='n1'`).run()
+      // ISO の文字列（群3）を入れると、数値（群1）より常に強くなってしまう。
+      // 比べられないので、削除の版は行の版の時刻のまま
+      expect(tombstonesOf(db, 'n')[0]._sns_ts).toBe(1700000000000)
     } finally {
       db.close()
     }

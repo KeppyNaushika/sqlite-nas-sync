@@ -1,6 +1,6 @@
 /**
  * `performSync` の基本動作 —— INSERT / UPDATE / DELETE の伝播、スキーマ版の突き合わせ、
- * heartbeat、リモートが開けないときの続行。
+ * リモートが開けないときの続行。
  *
  * 別id・同一ユニークキーの畳みは `sync-unique-fold.test.ts`、
  * changelog に隙間があるときのフルマージは `sync-full-merge.test.ts` にある。
@@ -268,53 +268,5 @@ describe('performSync', () => {
     expect(tombstone).toBeTruthy()
 
     dbA.close()
-  })
-
-  it('heartbeatがsync時に自動更新される', async () => {
-    const { db: dbA, dbPath: pathA } = createClientDb('client-a')
-    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-
-    const heartbeat = dbA
-      .prepare(
-        `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
-      )
-      .get() as any
-    expect(heartbeat).toBeTruthy()
-
-    const today = new Date().toISOString().slice(0, 10)
-    expect(heartbeat.updatedAt).toBe(`${today}T12:00:00Z`)
-
-    dbA.close()
-  })
-
-  it('heartbeatがchangelogに記録される', async () => {
-    const { db: dbA, dbPath: pathA } = createClientDb('client-a')
-    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-
-    const entry = dbA
-      .prepare(`SELECT * FROM _changelog WHERE tableName = '_heartbeat'`)
-      .get() as any
-    expect(entry).toBeTruthy()
-    expect(entry.operation).toBe('INSERT')
-
-    dbA.close()
-  })
-
-  it('heartbeatが他クライアントに伝播する', async () => {
-    const { db: dbA, dbPath: pathA } = createClientDb('client-a')
-    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-    dbA.close()
-
-    const { db: dbB, dbPath: pathB } = createClientDb('client-b')
-    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
-
-    const heartbeat = dbB
-      .prepare(
-        `SELECT * FROM _heartbeat WHERE id = '00000000-0000-0000-0000-000000000000'`
-      )
-      .get() as any
-    expect(heartbeat).toBeTruthy()
-
-    dbB.close()
   })
 })

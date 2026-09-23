@@ -5,7 +5,6 @@
  */
 import Database from 'better-sqlite3'
 import { ChangelogEntry, DEFAULTS } from './types'
-import { NOW_SQL } from './setup/sql'
 
 /**
  * 保持期間の設定値を、SQLへ渡してよい値へ均す。
@@ -107,11 +106,10 @@ export function recordChangelogPruned(
   prunedThroughId: number
 ): void {
   db.prepare(
-    `INSERT INTO _changelog_prune (onlyRow, prunedThroughId, prunedAt)
-     VALUES (0, ?, ${NOW_SQL})
+    `INSERT INTO _changelog_prune (onlyRow, prunedThroughId)
+     VALUES (0, ?)
      ON CONFLICT(onlyRow) DO UPDATE SET
-       prunedThroughId = MAX(_changelog_prune.prunedThroughId, excluded.prunedThroughId),
-       prunedAt        = ${NOW_SQL}`
+       prunedThroughId = MAX(_changelog_prune.prunedThroughId, excluded.prunedThroughId)`
   ).run(prunedThroughId)
 }
 
@@ -205,18 +203,19 @@ export function hasChangelogGap(
  * 消す。期限切れでも、そこより後ろのidに居るエントリは残す。
  *
  * 時刻だけを見て消すと、id順と時刻順がねじれている場所で**若いidを残して大きいidを
- * 消す**ことになり、changelog の途中に穴が開く。ねじれは机上の話ではない:
- * {@link mergeChangelog} が取り込んだ相手のエントリを**元の `changedAt` のまま、
- * 新しく採番したidで**書くため（`_changelog.id` は AUTOINCREMENT）、
- * フルマージの直後は必ずこの形になる。
+ * 消す**ことになり、changelog の途中に穴が開く。案A では `_changelog` に載るのは
+ * 自分の書き込みと取り込みの結果だけで、`changedAt` はどちらも書いた瞬間の
+ * `NOW_SQL` だが、**壁時計が巻き戻れば id順（`AUTOINCREMENT`）と時刻順はずれる**
+ * ——端末の時刻合わせは揃っているとは限らない。接頭辞しか刈らなければ、
+ * ずれていても穴は開かない。
  *
  * 接頭辞刈りを選ぶ理由は3つ:
  *
  * 1. **掃除済みの位置を読めない旧版の相手も守られる。** これは書き手側の振る舞い
  *    なので、読む側の版に依らない。
- * 2. **フルマージ直後の跳ね上がりを防ぐ。** 記録（{@link recordChangelogPruned}）
- *    だけに頼ると、取り込んだ古い `changedAt` の高いidが次の掃除で即消えて
- *    `prunedThroughId` が跳ね上がり、**その端末を読む全端末が一度フルマージに落ちる**。
+ * 2. **`prunedThroughId` の跳ね上がりを防ぐ。** 記録（{@link recordChangelogPruned}）
+ *    だけに頼ると、時刻のずれた高いidが次の掃除で即消えて `prunedThroughId` が
+ *    跳ね上がり、**その端末を読む全端末が一度フルマージに落ちる**。
  * 3. `lastSeenId` は接頭辞（「ここまで読んだ」）の意味を持つ。刈る側も接頭辞に
  *    揃えるのが構造に合う。
  *

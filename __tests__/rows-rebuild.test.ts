@@ -752,3 +752,145 @@ describe('作り直し —— worker_threads で計算する', () => {
     }
   }, 60000)
 })
+
+/* ================================================================== *
+ * 原則4 —— 親の削除にあわせて子の版を捨てる
+ * ================================================================== */
+
+describe('作り直し —— 親の削除にあわせて子の版を捨てる（原則4）', () => {
+  const FAMILY = [
+    `CREATE TABLE tags (
+       id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, updatedAt TEXT)`,
+    `CREATE TABLE tag_notes (
+       id TEXT PRIMARY KEY NOT NULL,
+       tagId TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+       body TEXT NOT NULL, updatedAt TEXT)`,
+  ]
+
+  /** 親を消した端末と、その親の子を作った端末を用意して、片方へ取り込む。 */
+  function openPair(): { mine: Database.Database; peer: Database.Database } {
+    const mine = openClient('aaaa', {
+      statements: FAMILY,
+      tables: ['tags', 'tag_notes'],
+    })
+    const peer = openClient('bbbb', {
+      statements: FAMILY,
+      tables: ['tags', 'tag_notes'],
+    })
+    for (const db of [mine, peer]) {
+      db.prepare(`INSERT INTO tags VALUES ('g1','t1','2026-01-01')`).run()
+    }
+    // 相手だけが子を作る。しかも親の削除より新しい時刻で
+    peer
+      .prepare(
+        `INSERT INTO tag_notes VALUES ('n1','g1','b1','2099-01-01T00:00:00.000Z')`
+      )
+      .run()
+    // 手元は親を消す
+    mine.prepare(`DELETE FROM tags WHERE id='g1'`).run()
+    return { mine, peer }
+  }
+
+  it('あとから届いた子の版は、時刻によらず _sns_rows_* から落ちる', () => {
+    const { mine, peer } = openPair()
+    try {
+      seedFromPeer(mine, peer, ['tags', 'tag_notes'])
+      expect(
+        countOf(mine, `SELECT COUNT(*) AS n FROM _sns_rows_tag_notes`)
+      ).toBe(1)
+
+      const outcome = rebuildOnce(mine, {
+        tables: ['tags', 'tag_notes'],
+        state: createRebuildState(),
+      })
+      expect(outcome.status).toBe('applied')
+      // アプリの表にも、版の表にも残らない
+      expect(countOf(mine, `SELECT COUNT(*) AS n FROM tag_notes`)).toBe(0)
+      expect(
+        countOf(mine, `SELECT COUNT(*) AS n FROM _sns_rows_tag_notes`)
+      ).toBe(0)
+      // 置かない行としては数えない（永遠に警告が出続けることになる）
+      expect(countOf(mine, `SELECT COUNT(*) AS n FROM _sns_unplaceable`)).toBe(
+        0
+      )
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('捨てた行の中身と、原因になった親を知らせる', () => {
+    const { mine, peer } = openPair()
+    try {
+      seedFromPeer(mine, peer, ['tags', 'tag_notes'])
+      const outcome = rebuildOnce(mine, {
+        tables: ['tags', 'tag_notes'],
+        state: createRebuildState(),
+      })
+      expect(outcome.discarded).toHaveLength(1)
+      expect(outcome.discarded[0]).toMatchObject({
+        table: 'tag_notes',
+        trueId: 'n1',
+        causeTable: 'tags',
+        causeId: 'g1',
+      })
+      // 中身は落とす前の値。これが無いとアプリケーションは退避できない
+      expect(outcome.discarded[0].content).toMatchObject({
+        id: 'n1',
+        tagId: 'g1',
+        body: 'b1',
+      })
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('二度目の作り直しでは、もう捨てるものが無い', () => {
+    const { mine, peer } = openPair()
+    try {
+      seedFromPeer(mine, peer, ['tags', 'tag_notes'])
+      const state = createRebuildState()
+      rebuildOnce(mine, { tables: ['tags', 'tag_notes'], state })
+      mine.prepare(`INSERT INTO _sns_dirty VALUES ('tag_notes')`).run()
+      const again = rebuildOnce(mine, { tables: ['tags', 'tag_notes'], state })
+      expect(again.discarded).toEqual([])
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('親がまだ届いていないだけの子は、版を落とさない', () => {
+    const mine = openClient('aaaa', {
+      statements: FAMILY,
+      tables: ['tags', 'tag_notes'],
+    })
+    const peer = openClient('bbbb', {
+      statements: FAMILY,
+      tables: ['tags', 'tag_notes'],
+    })
+    try {
+      peer.prepare(`INSERT INTO tags VALUES ('g1','t1','2026-01-01')`).run()
+      peer
+        .prepare(`INSERT INTO tag_notes VALUES ('n1','g1','b1','2026-01-01')`)
+        .run()
+      // 子だけを取り込む（親はまだ届いていない）
+      seedFromPeer(mine, peer, ['tag_notes'])
+      const outcome = rebuildOnce(mine, {
+        tables: ['tags', 'tag_notes'],
+        state: createRebuildState(),
+      })
+      expect(outcome.discarded).toEqual([])
+      expect(
+        countOf(mine, `SELECT COUNT(*) AS n FROM _sns_rows_tag_notes`)
+      ).toBe(1)
+      expect(countOf(mine, `SELECT COUNT(*) AS n FROM _sns_unplaceable`)).toBe(
+        1
+      )
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+})

@@ -336,29 +336,3 @@ export function openRemoteDbViaLocalCopy(
     return null
   }
 }
-
-/**
- * リモートDBを読み取り専用でオープンする（旧API）。
- *
- * @deprecated v0.9.0 以降は {@link openRemoteDbViaLocalCopy} を使うこと。
- *   NAS上のファイルを直接開くと、書き込み中の他クライアントとの衝突で
- *   I/Oエラーが発生し、changelog 暴走の原因になる。
- *
- * 互換性のため残しているが、内部からは利用していない。
- */
-export function openRemoteDb(filePath: string): Database.Database | null {
-  try {
-    const db = new Database(filePath, { readonly: true })
-    db.pragma('query_only = ON')
-
-    const result = db.pragma('integrity_check', { simple: true }) as string
-    if (result !== 'ok') {
-      db.close()
-      return null
-    }
-
-    return db
-  } catch {
-    return null
-  }
-}

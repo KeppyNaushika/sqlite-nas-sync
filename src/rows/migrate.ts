@@ -16,9 +16,9 @@
  * | 残す `_tombstone` の版 | `_sns_ts` は NULL（群0＝最小） | 移行時の削除に大きな時刻を与えない |
  * | アプリの表に居る id の墓標 | **消す** | 残すと版の鍵が完全に一致し、種類の規則で削除が勝って、最初の作り直しでその行が消える |
  * | `_changelog` | **刈らない** | 旧版の端末が残っている間に刈ると、その端末へ渡すべき事実が消える |
+ * | 旧方式の `_heartbeat` | **表とトリガーを落とす**（トリガーが先） | `_changelog` が空でも `_changelog_prune.prunedThroughId` で隙間は判る。残すと無変更の日にも転送が起き続ける |
+ * | 誰も読まない内部の列（{@link UNUSED_COLUMNS}） | **あれば落とす**（`_heartbeat` のトリガーを落としたあと） | `CREATE TABLE IF NOT EXISTS` では既存の DB から消えない。使わない列を利用者の DB に残さない |
  * | `_sns_rebuilding` の残り | 知らせて、トリガーを作る前に消す | 残っているとアプリの書き込みが1つも事実にならない |
- *
- * **段階4 ではまだ `setupSync` から呼ばれない**（切り替えるのは段階5）。
  *
  * @module rows/migrate
  * @internal
@@ -28,6 +28,7 @@ import { escapeIdentifier, foldIdentifier, NOW_SQL } from '../setup/sql'
 import { ROWS_FORMAT, readSnsFormat } from './import'
 import {
   SNS_META_KEYS,
+  dropLegacyDeleteProtected,
   ensureSyncMetaTable,
   newInstanceId,
   readSnsMeta,
@@ -175,6 +176,19 @@ export function migrateToRows(
       )
     }
 
+    // 3.5. 旧方式の `_heartbeat` を撤去する。`_changelog` が空でも
+    //      `_changelog_prune.prunedThroughId` で隙間は正しく判定できるので、
+    //      この仕掛けはもう要らない（`hasChangelogGap`）。残すと、無変更の日にも
+    //      1件ぶんの転送が起き続ける。**表より先にトリガーを落とす** ——
+    //      トリガーが残ったまま表だけ消すと、以後の `ALTER TABLE … RENAME` が
+    //      読み直しで落ちる
+    dropHeartbeat(db)
+
+    // 3.6. 誰も読まない内部の列を落とす。**`_heartbeat` のトリガーより後** ——
+    //      `DROP COLUMN` は DB の全トリガーを読み直すので、存在しない表を指す
+    //      トリガーが残っていると `error in trigger …` で落ちる
+    dropUnusedColumns(db)
+
     // 4. 案A の表を作る（`_sns_clock` の行・`_sns_tick` の行も）
     const existed = new Map<string, boolean>()
     for (const spec of specs) {
@@ -222,6 +236,9 @@ export function migrateToRows(
       writeSnsMeta(db, SNS_META_KEYS.lastLamport, 0)
       writeSnsMeta(db, SNS_META_KEYS.lastInstance, instanceId)
     }
+    // 旧版が書いていた `sns.deleteProtected` は、もう誰も読まない。読まれない
+    // 設定が `_sync_meta` に残るのは紛らわしいので、ここで消す
+    dropLegacyDeleteProtected(db)
     writeRowsSchemaVersion(db, options.appSchemaVersion)
     for (const spec of specs) {
       db.prepare(
@@ -291,6 +308,64 @@ function dropLegacyTriggers(
   }
 }
 
+/**
+ * 旧版が作っていた `_heartbeat` の表とトリガーを落とす（冪等）。
+ *
+ * `_heartbeat` は「変更が1件も無い日でも `_changelog` に1件入れて、保持期間で
+ * changelog が空になるのを防ぐ」ための仕掛けだった。`_changelog` が空でも
+ * `_changelog_prune.prunedThroughId` で隙間は正しく判定できる（`hasChangelogGap`）
+ * ので廃止した。
+ *
+ * **トリガーを先に落とす。** 表だけ消してトリガーを残すと、以後
+ * `ALTER TABLE … RENAME TO` がすべてのトリガーを読み直すときに
+ * `no such table: main._heartbeat` で落ちる。
+ */
+function dropHeartbeat(db: Database.Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS "_changelog_after_insert__heartbeat"`)
+  db.exec(`DROP TRIGGER IF EXISTS "_changelog_after_update__heartbeat"`)
+  db.exec(`DROP TABLE IF EXISTS "_heartbeat"`)
+}
+
+/**
+ * 書かれるだけで誰も読まない内部の列（0.20.0 までの DB に残っている）。
+ *
+ * | 列 | なぜ要らないか |
+ * | --- | --- |
+ * | `_tombstone.mergedInto` | 旧方式の「畳み」の先。案A のトリガーは書かず、移行も写さないので値が入らない |
+ * | `_tombstone.revokedAt` | 旧方式の「畳み」の取り消し。同上 |
+ * | `_sns_unplaceable.reasonKind` | 読むのは `tableName`・`trueId`・`reason` だけ |
+ * | `_sns_unplaceable.noticedAt` | 「同じ警告を繰り返さない」は行の有無で決まり、時刻を使わない |
+ * | `_changelog_prune.prunedAt` | 隙間の判定（`hasChangelogGap`）は `prunedThroughId` しか見ない |
+ *
+ * どの列も、ライブラリのトリガー・索引・ビューから参照されていない（参照があると
+ * `DROP COLUMN` が落ちる）。
+ */
+const UNUSED_COLUMNS: readonly { table: string; column: string }[] = [
+  { table: '_tombstone', column: 'mergedInto' },
+  { table: '_tombstone', column: 'revokedAt' },
+  { table: '_sns_unplaceable', column: 'reasonKind' },
+  { table: '_sns_unplaceable', column: 'noticedAt' },
+  { table: '_changelog_prune', column: 'prunedAt' },
+  { table: '_sync_state', column: 'lastSyncedAt' },
+]
+
+/**
+ * {@link UNUSED_COLUMNS} を、**列があるときだけ**落とす（冪等）。
+ *
+ * 表が無ければ `PRAGMA table_info` は空を返すので、何もしない。
+ */
+function dropUnusedColumns(db: Database.Database): void {
+  for (const { table, column } of UNUSED_COLUMNS) {
+    const columns = db.pragma(
+      `table_info(${escapeIdentifier(table)})`
+    ) as RowsColumn[]
+    if (!columns.some((entry) => entry.name === column)) continue
+    db.exec(
+      `ALTER TABLE ${escapeIdentifier(table)} DROP COLUMN ${escapeIdentifier(column)}`
+    )
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * `_tombstone` と `_changelog` の作り直し（§3.9 の F）
  * ------------------------------------------------------------------ */
@@ -313,8 +388,8 @@ function rebuildLedgers(
   instanceId: string
 ): LedgerCounts {
   // **`legacy_alter_table` を立てる。** 素の `ALTER TABLE … RENAME TO` は、
-  // その DB の**すべてのトリガーを読み直して**参照を書き換える。旧方式の
-  // `_heartbeat` のトリガーは `_changelog` を指しているので、作り直しの途中
+  // その DB の**すべてのトリガーを読み直して**参照を書き換える。旧方式の DB に
+  // 残っている `_heartbeat` のトリガーは `_changelog` を指しているので、作り直しの途中
   // （古い `_changelog` を落としたあと）では読み直しが
   // `no such table: main._changelog` で落ちる。ここで名前を付け替える相手
   // （`_sns_…_new`）を指しているものは1つも無いので、書き換えは要らない

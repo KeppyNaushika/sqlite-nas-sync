@@ -10,7 +10,7 @@ import * as path from 'path'
 import Database from 'better-sqlite3'
 import { setupRowsLedgers } from '../../src/setup'
 import { migrateToRows } from '../../src/rows/migrate'
-import { newInstanceId, writeDeleteProtected } from '../../src/rows/meta'
+import { newInstanceId } from '../../src/rows/meta'
 import { SyncConfig, TableConfig } from '../../src/types'
 
 export const TABLES: TableConfig[] = [
@@ -32,7 +32,6 @@ export const TABLES: TableConfig[] = [
  *
  * - `migrateToRows` —— `_sns_rows_<表>`・`_sns_clock`・4本のトリガー・
  *   `_tombstone` と `_changelog` を作る
- * - `writeDeleteProtected` —— 作り直しの計算が読む鍵（§3.1）
  * - `setupRowsLedgers` —— 表に触らない帳簿（`_sync_state` ほか）
  */
 export function setupRowsDb(
@@ -44,11 +43,9 @@ export function setupRowsDb(
     tables: tables.map((t) => ({
       name: t.name,
       timestampColumn: t.timestampColumn,
-      deleteProtected: t.deleteProtected,
     })),
     instanceId,
   })
-  writeDeleteProtected(db, tables)
   setupRowsLedgers(db)
 }
 

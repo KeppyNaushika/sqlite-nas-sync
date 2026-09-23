@@ -14,13 +14,13 @@
  * | `_sns_hidden` | 隠れた行と、その勝者 |
  * | `_sns_unplaceable` | 置かない行（警告の重複を避けるため） |
  * | `_sns_rebuilding` | 作り直しの最中である旗 |
+ * | `_tombstone` | 削除の版（表ごとでない。`IF NOT EXISTS` なので既存の DB には触らない） |
+ * | `_changelog` | 変更の記録（同上） |
  *
  * **`_sns_rows_<表>` に制約を写さない理由**: ここは「受け取った事実」の置き場で、
  * 置けるかどうかを決める場所ではない。制約を写すと、他端末から届いた版が
  * 手元の UNIQUE に当たって**保存できずに消える**。かぶりの判定は作り直しのときに
  * 一時 DB へ入れて SQLite に決めさせる（設計書 §1.5）。
- *
- * **段階2 ではまだ `setupSync` から呼ばれない**（切り替えるのは段階5）。
  *
  * @module rows/schema
  * @internal
@@ -37,16 +37,6 @@ export interface RowsTableSpec {
    * @defaultValue `'updatedAt'`
    */
   timestampColumn?: string
-  /**
-   * 削除の版が**表示の計算で勝たない**表（`TableConfig.deleteProtected`）。
-   *
-   * 行の版がある限り、その行は置かれる。取り込みは削除の版が勝っても
-   * 行の版を消さない（消すと設定を外したときに戻せない）。
-   *
-   * **全端末で同じ値である前提**（違うと端末ごとに見え方が変わる）。
-   * 食い違いは `_sync_meta` の `sns.deleteProtected` で検出して警告する。
-   */
-  deleteProtected?: boolean
 }
 
 /** 時刻列の既定。 */
@@ -223,11 +213,9 @@ function createSharedTables(db: Database.Database): void {
   // 置かない行（設計書 §1.4）。警告の重複を避けるためだけに持つ。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _sns_unplaceable (
-      tableName  TEXT NOT NULL,
-      trueId     TEXT NOT NULL,
-      reasonKind TEXT,
-      reason     TEXT,
-      noticedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
+      tableName TEXT NOT NULL,
+      trueId    TEXT NOT NULL,
+      reason    TEXT,
       PRIMARY KEY (tableName, trueId)
     )
   `)
@@ -250,8 +238,6 @@ function createSharedTables(db: Database.Database): void {
       tableName  TEXT NOT NULL,
       recordId   TEXT NOT NULL,
       deletedAt  TEXT NOT NULL DEFAULT (${NOW_SQL}),
-      mergedInto TEXT,
-      revokedAt  TEXT,
       PRIMARY KEY (tableName, recordId)
     )
   `)

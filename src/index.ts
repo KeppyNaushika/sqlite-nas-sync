@@ -52,7 +52,7 @@ import { computeSchemaHash, readSchemaVersion } from './setup'
 import { setupRowsLedgers } from './setup/rows-ledgers'
 import { checkRowsPreconditions } from './setup/rows-preflight'
 import { migrateToRows } from './rows/migrate'
-import { newInstanceId, writeDeleteProtected } from './rows/meta'
+import { newInstanceId } from './rows/meta'
 import { clearRebuildingFlag } from './rows/restore-detect'
 import { createRebuildState } from './rows/rebuild'
 import { RowsSyncRuntime, performSync } from './sync'
@@ -151,19 +151,14 @@ export function setupSync(config: SyncConfig): SyncInstance {
     tables: tables.map((t) => ({
       name: t.name,
       timestampColumn: t.timestampColumn,
-      deleteProtected: t.deleteProtected,
     })),
     instanceId,
     appSchemaVersion,
   })
   setupWarnings.push(...migration.warnings)
 
-  // `deleteProtected` は**この DB に書き残す**（§3.1 の鍵）。作り直しの計算は
-  // ここから読み、相手の写しにも同じ鍵が載るので食い違いを見つけられる
-  writeDeleteProtected(db, tables)
-
-  // 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_heartbeat` /
-  // `_sync_meta`）。移行が `_sync_state` を空にしたあとで作る
+  // 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_sync_meta`）。
+  // 移行が `_sync_state` を空にしたあとで作る
   setupRowsLedgers(db)
 
   // `migrateToRows` が書いた `<アプリの版>;sns-format=rows1` をそのまま持ち回る
@@ -302,6 +297,7 @@ export type {
   SyncTransfers,
   SkippedRemote,
   RecordFold,
+  DiscardedRecord,
   SyncStatus,
   SyncEvent,
   SyncEventCallback,

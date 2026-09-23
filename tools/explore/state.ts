@@ -27,7 +27,6 @@
  * - `_sync_meta`（**self-check が「どこまで見直したか」を changelog の id で置いている**。
  *   前任の途中成果はこれを外していた。外すと「見直し済みの位置だけが違う2状態」を
  *   同じと見て、見直しが走らない側の反例を見逃す）
- * - `_heartbeat`（在るかどうかで、次の同期が changelog を1件増やすかが決まる）
  * - スキーマ（`sqlite_master` の全 SQL の要約）。作り直しはトリガを外して付け直すので、
  *   付け直し損ねた状態を同じと見ないため
  * - NAS ディレクトリにある、端末のコピー以外のファイル名（`.tmp` の残骸など）
@@ -51,8 +50,6 @@
  *
  * ## 含めないもの
  *
- * - `_sync_state.lastSyncedAt`、`_changelog_prune.prunedAt` —— 書かれるだけで、
- *   ライブラリのどこからも読まれない（`grep` で確認済み）
  * - SQLite の空きページ・ファイルの大きさ —— 論理的な中身だけが振る舞いに効く
  *
  * ## 採番値（`_changelog.id` など）は**生のまま**含める
@@ -88,9 +85,6 @@
  * すべて「この実行が始まってから」なので常に保持期間内、1 の値はすべて保持期間より
  * 古いので、どちらも状態によらず答えが決まっている。**この前提は毎回確かめ、
  * 崩れていたら例外で止める**（{@link TimeLabeler}）。黙って続けると嘘の「反例なし」になる。
- *
- * `_heartbeat.updatedAt`（その日の正午）は壁時計の日付から作られる定数で、
- * 他の時刻と比べられないので字面のまま持つ。
  *
  * @module tools/explore/state
  */
@@ -173,7 +167,6 @@ function readDb(db: Database.Database, dataTables: readonly string[]): RawDb {
     `SELECT remoteClientId, lastSeenId FROM _sync_state ORDER BY remoteClientId`
   )
   read('_sync_meta', `SELECT key, value FROM _sync_meta ORDER BY key`)
-  read('_heartbeat', `SELECT id, updatedAt FROM _heartbeat ORDER BY id`)
   const schemaRows = db
     .prepare(`SELECT type, name, sql FROM sqlite_master ORDER BY type, name`)
     .raw(true)
@@ -409,9 +402,9 @@ export class TimeLabeler {
   }
 }
 
-/** 時刻として札を付ける列か（名前が `At` で終わる列。`_heartbeat` は除く） */
-function isTimeColumn(section: string, column: string): boolean {
-  return section !== '_heartbeat' && column.endsWith('At')
+/** 時刻として札を付ける列か（名前が `At` で終わる列） */
+function isTimeColumn(column: string): boolean {
+  return column.endsWith('At')
 }
 
 function stampValues(raw: RawWorld): Set<string> {
@@ -425,7 +418,7 @@ export function collectTimes(raw: RawWorld): string[] {
     if (db === null) return
     for (const section of db.sections) {
       section.columns.forEach((column, index) => {
-        if (!isTimeColumn(section.name, column)) return
+        if (!isTimeColumn(column)) return
         for (const row of section.rows) {
           const value = row[index]
           if (typeof value === 'string' && TIME_PATTERN.test(value)) {
@@ -648,7 +641,7 @@ export function serializeState(
               }
             }
           }
-          if (typeof value === 'string' && isTimeColumn(section.name, column)) {
+          if (typeof value === 'string' && isTimeColumn(column)) {
             return labels.get(value) ?? value
           }
           return value

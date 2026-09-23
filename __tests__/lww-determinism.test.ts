@@ -1,11 +1,15 @@
 /**
  * 削除 vs 更新の決定論的LWW回帰テスト。
  *
- * 修正前の2大バグを固定する:
+ * 修正前のバグを固定する:
  *  1. 順序依存: pullNormal の changelog DELETE が無条件適用で、クライアント処理順により
  *     「削除 vs より新しい更新」の勝敗が変わっていた。
- *  2. フォーマット不一致: updatedAt(ISO-T) と deletedAt(datetime('now') スペース形式) の
- *     文字列比較が壊れ、同日の削除vs更新で削除が常に負けていた。
+ *  2. 時刻の精度: `datetime('now')` の秒切り捨てで、同じ秒の中の削除と更新の
+ *     前後が失われていた。
+ *
+ * 書式の違う時刻どうしの比較（ISO-T vs スペース形式）は、案A では
+ * `src/rows/versions.ts` の版の順序（群の判定）が受け持つ。そちらの性質は
+ * `__tests__/rows-versions.test.ts` で確かめてある。
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'fs'
@@ -13,32 +17,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
-import { compareTimestamps } from '../src/sync/timestamp'
 import { setupRowsDb } from './helpers/sync-fixtures'
-
-describe('compareTimestamps: フォーマット差(ISO-T vs スペース)を吸収する', () => {
-  let db: Database.Database
-  beforeEach(() => {
-    db = new Database(':memory:')
-  })
-  afterEach(() => db.close())
-
-  it('スペース形式の削除が1秒後でも「新しい」と判定される（文字列比較では誤判定する）', () => {
-    const updatedAt = '2026-05-13T23:17:35.111+00:00' // ISO-T
-    const deletedAt = '2026-05-13 23:17:36' // スペース形式・1秒後
-    // 文字列比較は壊れている（' ' < 'T' で削除が小さく見える）
-    expect(deletedAt > updatedAt).toBe(false)
-    // julianday正規化では正しく「削除が後」
-    expect(compareTimestamps(db, deletedAt, updatedAt)).toBe(1)
-    expect(compareTimestamps(db, updatedAt, deletedAt)).toBe(-1)
-  })
-
-  it('同時刻より前の削除は「新しくない」', () => {
-    const updatedAt = '2026-05-13T23:17:35.111+00:00'
-    const deletedAt = '2026-05-13 23:17:34'
-    expect(compareTimestamps(db, deletedAt, updatedAt)).toBe(-1)
-  })
-})
 
 describe('pullNormal consolidation: 削除 vs 更新がクライアント処理順に依存しない', () => {
   let work: string
@@ -72,7 +51,6 @@ describe('pullNormal consolidation: 削除 vs 更新がクライアント処理�
       nasPath: syncDir,
       clientId,
       intervalMs: 3_600_000,
-      heartbeatEnabled: false,
     })
     const db = new Database(dbPath)
     try {

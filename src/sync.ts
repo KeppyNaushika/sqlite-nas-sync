@@ -8,7 +8,7 @@
  * 2. NAS への写し（印 → `backup()` → 取り合いの確認）
  * 3. 相手ごとに `_sns_rows_*` と `_tombstone` を突き合わせて取り込む（§4.3）
  * 4. **別のトランザクション**でアプリの表を作り直す（§3.7）
- * 5. heartbeat、`cleanupChangelog`、`onAfterSync`
+ * 5. `cleanupChangelog`、`onAfterSync`
  *
  * 旧経路（`sync/entries`・`sync/full-merge`・`sync/pull`・`conflict/*` の畳み）は
  * **段階6 で消した**。
