@@ -288,30 +288,6 @@ describe('discoverTables', () => {
     expect(warnings).toHaveLength(0)
   })
 
-  it('tableOptions の deleteProtected が適用される', () => {
-    db.exec(`
-      CREATE TABLE users (
-        id TEXT PRIMARY KEY,
-        updatedAt TEXT NOT NULL
-      )
-    `)
-    db.exec(`
-      CREATE TABLE posts (
-        id TEXT PRIMARY KEY,
-        updatedAt TEXT NOT NULL
-      )
-    `)
-
-    const tables = discoverTables(db, {
-      tableOptions: { users: { deleteProtected: true } },
-    })
-
-    const users = tables.find((t) => t.name === 'users')
-    const posts = tables.find((t) => t.name === 'posts')
-    expect(users?.deleteProtected).toBe(true)
-    expect(posts?.deleteProtected).toBeUndefined()
-  })
-
   it('tableOptions の timestampColumn でカスタム列を使える', () => {
     db.exec(`
       CREATE TABLE items (

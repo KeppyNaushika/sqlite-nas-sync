@@ -11,7 +11,7 @@
  * | モジュール | 受け持ち |
  * | --- | --- |
  * | `setup/sql` | 時刻の書式（`NOW_SQL`）と SQL の小道具 |
- * | `setup/rows-ledgers` | `_sync_state` / `_changelog_prune` / `_heartbeat` / `_sync_meta` |
+ * | `setup/rows-ledgers` | `_sync_state` / `_changelog_prune` / `_sync_meta` |
  * | `setup/rows-preflight` | 前提の確認（§1.8 の P1〜P8） |
  * | `setup/schema-version` | スキーマの指紋の読み書き |
  *

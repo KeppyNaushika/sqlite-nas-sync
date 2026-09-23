@@ -67,6 +67,37 @@ const GUARDED: RowsSchema = {
   ],
 }
 
+/** 親 → 子 → 孫 の3段（すべて `ON DELETE CASCADE`）。原則4 の連鎖を見る。 */
+const CHAIN: RowsSchema = {
+  tables: [
+    {
+      name: 'tags',
+      ddl: `CREATE TABLE tags (
+              id        TEXT PRIMARY KEY NOT NULL,
+              name      TEXT NOT NULL UNIQUE,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+    {
+      name: 'tag_notes',
+      ddl: `CREATE TABLE tag_notes (
+              id        TEXT PRIMARY KEY NOT NULL,
+              tagId     TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+              body      TEXT NOT NULL,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+    {
+      name: 'note_marks',
+      ddl: `CREATE TABLE note_marks (
+              id        TEXT PRIMARY KEY NOT NULL,
+              noteId    TEXT NOT NULL REFERENCES tag_notes(id) ON DELETE CASCADE,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+  ],
+}
+
 /** 行の版。`ts` は既定で `content.updatedAt`（引き上げが要らない場合）。 */
 function row(
   table: string,
@@ -93,18 +124,9 @@ function del(
   id: SqlValue,
   ts: SqlValue,
   lamport: number,
-  instance: string,
-  mergedInto?: SqlValue
+  instance: string
 ): RowVersion {
-  const version: RowVersion = {
-    table,
-    id,
-    kind: 'delete',
-    ts,
-    lamport,
-    instance,
-  }
-  return mergedInto === undefined ? version : { ...version, mergedInto }
+  return { table, id, kind: 'delete', ts, lamport, instance }
 }
 
 /**
@@ -112,7 +134,8 @@ function del(
  *
  * - `置く id=… name=…`: 置く行（表示値つき）
  * - `隠れ→g1`: 隠れた行（勝者の真の id）
- * - `置かない`: 置かない行
+ * - `置かない`: 置かない行（版は残る）
+ * - `捨てる→<表>:<id>`: 版ごと捨てる行と、原因になった削除（原則4）
  * - `死`: 削除の版が `Max`
  */
 export function summarize(
@@ -130,6 +153,10 @@ export function summarize(
       } else if (result.placement === 'hidden') {
         lines.push(
           `${table.name}:${key} 隠れ→${result.winner ?? '（勝者なし）'}`
+        )
+      } else if (result.placement === 'discarded') {
+        lines.push(
+          `${table.name}:${key} 捨てる→${result.cause?.table}:${result.cause?.key}`
         )
       } else {
         lines.push(`${table.name}:${key} 置かない`)
@@ -372,32 +399,101 @@ const CASES: Case[] = [
     expect: [`items:i3 置く id=i3 tagId=null label=x updatedAt=${T0}`],
   },
   {
-    name: '§1.6 死んだ id が mergedInto を持つと、Res はその先をたどる',
-    schema: FAMILY,
-    versions: [
-      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
-      del('tags', 'g2', T0, 1, 'b', 'g1'),
-      row(
-        'tag_notes',
-        'n4',
-        { id: 'n4', tagId: 'g2', body: 'b1', updatedAt: T0 },
-        2,
-        'b'
-      ),
-    ],
-    expect: [
-      `tags:g1 置く id=g1 name=t1 updatedAt=${T1}`,
-      'tags:g2 死',
-      `tag_notes:n4 置く id=n4 tagId=g1 body=b1 updatedAt=${T0}`,
-    ],
-  },
-  {
     name: '訂正: 主キーが NULL の候補は置かない行（id を捏造しない）',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: null, name: 't1', updatedAt: T0 }, 1, 'a'),
     ],
     expect: ['tags:g1 置かない'],
+  },
+  {
+    name: '原則4: 親が削除されていれば、あとから届いた子も時刻によらず捨てる',
+    schema: FAMILY,
+    versions: [
+      del('tags', 'g1', T1, 2, 'a'),
+      // 削除より新しい時刻で書かれた子。それでも捨てる
+      row(
+        'tag_notes',
+        'n1',
+        { id: 'n1', tagId: 'g1', body: 'b1', updatedAt: T2 },
+        3,
+        'b'
+      ),
+    ],
+    expect: ['tags:g1 死', 'tag_notes:n1 捨てる→tags:g1'],
+  },
+  {
+    name: '原則4: 親がまだ届いていないだけなら、置かない行のまま（版は残る）',
+    schema: FAMILY,
+    versions: [
+      row(
+        'tag_notes',
+        'n1',
+        { id: 'n1', tagId: 'g1', body: 'b1', updatedAt: T0 },
+        1,
+        'a'
+      ),
+    ],
+    expect: ['tag_notes:n1 置かない'],
+  },
+  {
+    name: '原則4: 1:1 の子は NULL にできないので捨てる',
+    schema: FAMILY,
+    versions: [
+      del('tags', 'g1', T1, 2, 'a'),
+      row(
+        'tag_profiles',
+        'g1',
+        { id: 'g1', memo: 'm1', updatedAt: T2 },
+        3,
+        'b'
+      ),
+    ],
+    expect: ['tags:g1 死', 'tag_profiles:g1 捨てる→tags:g1'],
+  },
+  {
+    name: '原則4: ON DELETE SET NULL の子は捨てずに残る',
+    schema: GUARDED,
+    versions: [
+      del('tags', 'g1', T1, 2, 'a'),
+      row(
+        'items',
+        'i1',
+        { id: 'i1', tagId: 'g1', label: 'L', updatedAt: T2 },
+        3,
+        'b'
+      ),
+    ],
+    expect: [
+      'tags:g1 死',
+      `items:i1 置く id=i1 tagId=null label=L updatedAt=${T2}`,
+    ],
+  },
+  {
+    name: '原則4: 孫まで連鎖する。原因はどちらも大元の削除',
+    schema: CHAIN,
+    versions: [
+      del('tags', 'g1', T1, 2, 'a'),
+      row(
+        'tag_notes',
+        'n1',
+        { id: 'n1', tagId: 'g1', body: 'b1', updatedAt: T2 },
+        3,
+        'b'
+      ),
+      row(
+        'note_marks',
+        'm1',
+        { id: 'm1', noteId: 'n1', updatedAt: T2 },
+        4,
+        'b'
+      ),
+    ],
+    expect: [
+      'tags:g1 死',
+      'tag_notes:n1 捨てる→tags:g1',
+      'note_marks:m1 捨てる→tags:g1',
+    ],
   },
 ]
 

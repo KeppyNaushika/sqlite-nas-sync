@@ -38,7 +38,7 @@
  * - **起動直後**（この覚えはプロセスの中にしか無いので、自動的にそうなる）
  * - 前回の読み・書きが失敗した相手（覚えを捨てるので次は読む）
  * - フルマージが要る相手（「もう一度読んでも何も起きない」が確かめられない）
- * - 版（`schemaVersion`）や `sns.deleteProtected` が変わったとき
+ * - 版（`schemaVersion`）が変わったとき
  * - NAS 上の自分の写しが消えているとき
  * - 復元・巻き戻りを見つけたとき
  *
@@ -52,7 +52,7 @@ import {
   readChangelog,
 } from '../changelog'
 import { FileStamp } from '../nas'
-import { readClockLamport, readDeleteProtectedRaw } from '../rows/meta'
+import { readClockLamport } from '../rows/meta'
 
 /**
  * 印が同じでも必ず読み直す（上げ直す）間隔。
@@ -120,7 +120,7 @@ export interface IdleMemory {
   push: PushMemo | null
   /** 相手ごとの、前に読んだときのこと */
   peers: Map<string, RemoteReadMemo>
-  /** 前に見た「版と `deleteProtected`」。変わったら全員を読み直す */
+  /** 前に見た版。変わったら全員を読み直す */
   localMeta: string | null
 }
 
@@ -154,9 +154,9 @@ function forcedRound(memory: IdleMemory): boolean {
  * | --- | --- |
  * | `_sns_clock.lamport` | アプリの書き込み・取り込み・作り直しが作った**すべての版**。案A では版が1つでも増えれば lamport が進む（§3.2） |
  * | `_sns_tick` の合計 | 表ごとの書き込みの数え上げ。lamport と重なるが、片方だけが進む壊れ方を早く見つけるために足しておく |
- * | `_changelog` の最大 id | lamport を進めない通知（`_heartbeat` の行など）。相手はこの id で差分の範囲を決めるので、増えたら知らせなければならない |
+ * | `_changelog` の最大 id | lamport を進めない通知。相手はこの id で差分の範囲を決めるので、増えたら知らせなければならない |
  * | `_changelog_prune.prunedThroughId` | 掃除した位置。相手の隙間の判定がこれを読む |
- * | 版と `sns.deleteProtected` | 相手が見送りの判定と食い違いの警告に使う。lamport を進めずに変わりうる |
+ * | 版（`schemaVersion`） | 相手が見送りの判定に使う。lamport を進めずに変わりうる |
  *
  * 逆に**入れてはいけない**のが `sns.generation` と `sns.lastLamport` である。
  * どちらも上げるたびに変わるので、入れると「上げたから次も上げる」が永久に続く。
@@ -174,23 +174,21 @@ export function localPushFingerprint(
     `T${tick}`,
     `C${String(changelogId)}`,
     `P${String(pruned)}`,
-    localMetaFingerprint(db, schemaVersion),
+    localMetaFingerprint(schemaVersion),
   ].join('|')
 }
 
 /**
- * 版と `sns.deleteProtected` の印。
+ * 版（`schemaVersion`）の印。
  *
- * 相手の振る舞い（見送り・食い違いの警告）を決めるのに、**手元の書き込みとは
- * 独立に**変わりうる値なので、別に取り出せるようにしてある。変わったときは
- * 上げ直すだけでなく、相手も読み直す（相手の設定との突き合わせをやり直すため）。
+ * 相手の振る舞い（見送り）を決めるのに、**手元の書き込みとは独立に**
+ * 変わりうる値なので、別に取り出せるようにしてある。変わったときは
+ * 上げ直すだけでなく、相手も読み直す（見送りの判定をやり直すため）。
  */
 export function localMetaFingerprint(
-  db: Database.Database,
   schemaVersion: string | undefined
 ): string {
-  const protectedRaw = readDeleteProtectedRaw(db)
-  return `V${schemaVersion ?? ''}|D${protectedRaw ?? '(null)'}`
+  return `V${schemaVersion ?? ''}`
 }
 
 /** `_sns_tick` の「表の数と tick の合計」。表が無ければ `-`。 */

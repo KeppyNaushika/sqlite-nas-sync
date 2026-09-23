@@ -130,7 +130,7 @@ export type Library = {
     runtime?: RuntimeIn
   ) => Promise<SyncResult>
   /**
-   * 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_heartbeat` / `_sync_meta`）を作る。
+   * 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_sync_meta`）を作る。
    *
    * 旧方式の `setupChangelog` は**段階6 で消えた**ので、雛形の DB は
    * `setupSync`（`src/index.ts`）と同じ順で仕立てる —— `migrateToRows` で案A の仕掛けを
@@ -740,7 +740,7 @@ function runtimeFor(
  *   （`src/sync/idle.ts` の `readWouldBeNoOp` と、取り込みが何も動かさなかった
  *   ことの確認）。読んでも読まなくても、どの表の中身も `_sync_state` も変わらない
  * - **上げない回**: 落とすのは手元の印（lamport・`_sns_tick`・`_changelog` の
- *   最大 id・掃除の位置・版・`deleteProtected`）が前に上げたときと同じ回だけ。
+ *   最大 id・掃除の位置・版）が前に上げたときと同じ回だけ。
  *   上げ直しても、NAS の写しは `sns.generation` が1つ進む以外に違いが無い ——
  *   そして `generation` は「手元と NAS の新旧関係」へ畳んであり、上げても上げなくても
  *   `local=nas` のままである（tools/explore/normalize.ts）。

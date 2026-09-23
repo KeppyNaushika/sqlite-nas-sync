@@ -53,20 +53,6 @@ const REMOVED_IN_STAGE6 =
   '案A で同じ形を踏むなら、版の比較（src/rows/versions.ts）か取り込み（src/rows/import.ts）に ' +
   '当たる壊し方を書き直すこと'
 
-/**
- * `edits` はまだ当たるが、**壊しても症状が出ない**壊し方に添える文言。
- *
- * {@link REMOVED_IN_STAGE6} と分けてあるのは、「書き換える箇所が無い」と
- * 「箇所はあるが意味が無い」では直し方が違うからである。前者は書き換え先を
- * 探し直すことになるが、後者は `find` をそのまま使えるので、**症状が出る経路を
- * 足せばそのまま駆動できる**。
- */
-const UNOBSERVABLE_IN_STAGE6 =
-  '書き換える箇所は src/ にまだ在る（`find` は1か所に当たる）が、壊しても症状が出ない。' +
-  '症状が出る経路（_changelog のエントリで他端末の見え方が決まる形）が段階6 で消え、' +
-  '案A では取り込みの入口が版の Max だけになったため。駆動するなら、まず何が壊れるのかを' +
-  '書き直すこと'
-
 export const MUTANTS: Mutant[] = [
   {
     name: 'stalemate-by-literal',
@@ -122,15 +108,17 @@ export const MUTANTS: Mutant[] = [
       '端末名で振る舞いが変わる形を見たいなら、まず symmetryActive を戻すこと',
     description:
       '【既知の不具合ではない。自己検査（--self-test）が前提の崩れを見抜けるかを確かめるための' +
-      '人工の壊し方】端末 client-a だけ _heartbeat を書かない（src/sync/rows-sync.ts）。端末名で' +
-      '振る舞いが変わるので、端末の入れ替えは対称でなくなる。--self-test はこれを検出して探索を止めること。',
+      '人工の壊し方】端末 client-a だけ `_changelog` を掃除しない（src/sync/rows-sync.ts）。端末名で' +
+      '振る舞いが変わるので、端末の入れ替えは対称でなくなる。--self-test はこれを検出して探索を止めること。' +
+      '（元は「client-a だけ _heartbeat を書かない」だった。_heartbeat は廃止したので、' +
+      '同じく端末名で終状態が変わる掃除の有無へ差し替えてある）',
     suggestedArgs: '--self-test 10 --depth 2',
     edits: [
       {
         file: 'sync/rows-sync.ts',
-        find: 'const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled',
+        find: 'cleanupChangelog(localDb, retentionDays)',
         replace:
-          "const heartbeatEnabled = (config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled) && config.clientId !== 'client-a'",
+          "if (config.clientId !== 'client-a') cleanupChangelog(localDb, retentionDays)",
       },
     ],
   },
@@ -173,12 +161,13 @@ export const MUTANTS: Mutant[] = [
   },
   {
     name: 'dedup-by-id',
-    pending: UNOBSERVABLE_IN_STAGE6,
+    pending: REMOVED_IN_STAGE6,
     description:
-      'deduplicateEntries（src/sync/state.ts）が同じ行のエントリから「最後の id」を採る形へ' +
+      'deduplicateEntries（旧 src/sync/state.ts）が同じ行のエントリから「最後の id」を採る形へ' +
       '戻す。フルマージは相手のエントリを元の changedAt のまま新しい id で写すので、id 順と' +
-      '時刻順がねじれ、同じ瞬間の削除が写された INSERT に覆い隠されて届かなくなる' +
-      '（src/sync/state.ts の deduplicateEntries のコメントにある2つ目の実測の形）。',
+      '時刻順がねじれ、同じ瞬間の削除が写された INSERT に覆い隠されて届かなくなる。' +
+      '**その関数はもう src/ に無い**（案A では取り込みの入口が版の Max だけになり、' +
+      '_changelog のエントリで他端末の見え方が決まる経路が消えたので、死んだコードとして落とした）。',
     suggestedArgs: '--tables users --ids 1 --keys 1 --depth 5',
     edits: [
       {

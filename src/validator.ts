@@ -157,7 +157,7 @@ function isInternalTable(name: string): boolean {
  * ```ts
  * const tables = discoverTables(db, {
  *   excludeTables: ['LocalCache'],
- *   tableOptions: { User: { deleteProtected: true } },
+ *   tableOptions: { User: { timestampColumn: 'modifiedAt' } },
  * });
  * ```
  */
@@ -210,8 +210,8 @@ export function discoverTables(
 
     // **表が宣言している綴りへ解決してから載せる。** 以降の処理は、この名前を
     // SQLにも**レコードのキーにも**使う。`SELECT *` が返すキーは宣言どおりの綴りな
-    // ので、設定の綴りのまま運ぶと値が取れず、LWWの比較が黙って壊れる
-    // （{@link readColumn} が最後の防波堤だが、名前は入口で揃えておく方が良い）。
+    // ので、設定の綴りのまま運ぶと値が取れず、版の順序（`rows/versions.ts`）が
+    // 黙って壊れる。**綴りを揃えるのは入口のここだけ**にする。
     const declaredTimestamp = columns.find((c) =>
       isSameIdentifier(c.name, timestampColumn)
     )
@@ -226,9 +226,6 @@ export function discoverTables(
     const config: TableConfig = { name }
     if (overrides?.timestampColumn !== undefined) {
       config.timestampColumn = declaredTimestamp.name
-    }
-    if (overrides?.deleteProtected !== undefined) {
-      config.deleteProtected = overrides.deleteProtected
     }
     result.push(config)
   }

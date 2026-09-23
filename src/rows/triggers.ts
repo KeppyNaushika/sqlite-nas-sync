@@ -28,8 +28,6 @@
  * 5. **書かなかった列は3分岐**（§3.4.3 の必須2）。`_sns_rows_<表>` に行が無い窓が
  *    あるので、`(SELECT …)` だけにすると NOT NULL の列が NULL になって行が消える
  *
- * **段階2 ではまだ `setupSync` から呼ばれない**（切り替えるのは段階5）。
- *
  * @module rows/triggers
  * @internal
  */
@@ -70,6 +68,9 @@ function timeGroupSql(value: string): string {
       ELSE (CASE WHEN julianday(${value}) IS NOT NULL AND (${shape}) THEN 3 ELSE 2 END)
     END)`
 }
+
+/** ISO 8601 の字形の文字列の群（{@link timeGroupSql} の 3）。 */
+const ISO_TEXT_GROUP = 3
 
 /**
  * `TSGT(a, b)` —— 順序用の時刻として `a` が `b` より強いか（設計書 §3.3）。
@@ -292,10 +293,31 @@ function rowTsSql(
 }
 
 /**
- * 削除の版の `_sns_ts`（設計書 §3.4.4 の必須3・訂正3）。
+ * 削除を実行した時刻のうち、順序に使ってよいぶん（原則2）。
  *
- * 削除には「新しい時刻列の値」が無いので、`_sns_rows_<表>` と `_tombstone` の
- * **強い方**を使い、**どちらにも行が無いときだけ** `OLD.<時刻列>` に落ちる。
+ * `DELETE` も1つの変更なので、行の版が `NEW.<時刻列>` を使うのと同じように、
+ * 削除の版は**削除を実行した時刻**（`_tombstone.deletedAt` と同じ {@link NOW_SQL}）を
+ * 使う。これを使わないと、消した行の `updatedAt` が相手の編集より古いというだけで
+ * 削除が負け、消したはずの行が戻る。
+ *
+ * ただし**アプリの時刻列が ISO 8601 の文字列（群3）のときだけ**に限る。
+ * `NOW_SQL` は群3 なので、時刻列が数値（群1）や ISO でない文字列（群2）の表では
+ * **常に群の差だけで削除が勝ってしまう**（設計書 §1.2.3 の群の順序）。
+ * しかも引き上げによってその行の `_sns_ts` は以後ずっと群3 に固定され、
+ * アプリのその後の書き込みが二度と勝てなくなる。比べられないときは
+ * 比べない —— 従来どおり `_sns_rows_<表>` と `_tombstone` の強い方で決める。
+ */
+function deletedAtSql(parts: TableParts): string {
+  if (parts.timestampColumn === null) return 'NULL'
+  const old = `OLD.${escapeIdentifier(parts.timestampColumn)}`
+  return `(CASE WHEN ${timeGroupSql(old)} = ${ISO_TEXT_GROUP} THEN ${NOW_SQL} END)`
+}
+
+/**
+ * 削除の版の `_sns_ts`（設計書 §3.4.4 の必須3・訂正3、原則2）。
+ *
+ * {@link deletedAtSql}・`_sns_rows_<表>`・`_tombstone` の**最大**。
+ * どれも無ければ `OLD.<時刻列>` に落ちる。
  *
  * **`COALESCE` では書けない。** `COALESCE` は「値が NULL」と「行が無い」を
  * 区別しないので、`_sns_ts` が NULL（群0）の行の版が手元にあるとき、
@@ -311,11 +333,13 @@ function deleteTsSql(
     parts.timestampColumn === null
       ? 'NULL'
       : `OLD.${escapeIdentifier(parts.timestampColumn)}`
+  const deletedAt = deletedAtSql(parts)
   return `(CASE
       WHEN NOT ${rowsExistsSql(parts, trueId)}
        AND NOT ${tombstoneExistsSql(parts, keyText)}
-      THEN ${fallback}
+      THEN ${maxTsSql([deletedAt, fallback])}
       ELSE ${maxTsSql([
+        deletedAt,
         rowsValueSql(parts, VERSION_COLUMNS.ts, trueId),
         tombstoneValueSql(parts, VERSION_COLUMNS.ts, keyText),
       ])}
@@ -406,6 +430,104 @@ function upsertTombstoneSql(
          ${escapeIdentifier(VERSION_COLUMNS.lamport)} = ${excluded.lamport},
          ${escapeIdentifier(VERSION_COLUMNS.instance)} = ${excluded.instance}
        WHERE ${strongerSql(excluded, held)};`
+}
+
+/**
+ * 統合で隠れている主キーの集合（原則3）。
+ *
+ * `_sns_hidden.winnerId` には**真の id の正規形**が入る（`src/rows/derive.ts` の
+ * `findWinner`）。`keyText` も同じ正規形なので、そのまま突き合わせてよい。
+ * かぶる相手が見つからずに隠れた行（`winnerId` が NULL）は統合ではないので、
+ * この条件では拾われない。
+ */
+function hiddenBehindSql(parts: TableParts, keyText: string): string {
+  return `FROM "_sns_hidden" AS "h"
+       WHERE "h"."tableName" = ${parts.literal}
+         AND "h"."winnerId" = ${keyText}`
+}
+
+/**
+ * 統合されていた側の主キーにも削除の版を書く（原則3）。
+ *
+ * `UNIQUE` が衝突して統合された2行は、アプリケーションから見れば1行である。
+ * その1行を `DELETE` したのに片方の主キーにしか削除の版を書かないと、
+ * 統合が崩れ、隠れていた側が次の作り直しで**中身の違う行として現れる**。
+ *
+ * 順序用の時刻は、**隠れている側が持っている版の時刻**と、削除を実行した時刻の
+ * 最大にする。隠れている側の行の版より弱いと、消したはずの行がその版に負けて
+ * 戻ってくる。`_sns_lamport` は手元の時計なので、取り込んだどの値より
+ * 進んでいる（単調化）。
+ *
+ * 削除を実行した時刻を使う条件は {@link deletedAtSql} と同じで、**隠れている側の
+ * 行が持っている時刻の種類**で決める。勝っている側の時刻をそのまま持ち込むと、
+ * 値の種類の違う2行が混ざったときに、隠れている側の `_sns_ts` だけが別の群へ
+ * 引き上がってしまう。
+ *
+ * 隠れている行はアプリの表に無く、その `DELETE` トリガーは発火しない。
+ * だからここで**まとめて**書くしかない。
+ */
+function mergedTombstoneSql(parts: TableParts, keyText: string): string {
+  const pk = escapeIdentifier(parts.primaryKey.name)
+  const heldTs = `(SELECT ${escapeIdentifier(VERSION_COLUMNS.ts)} FROM ${parts.rows}
+         WHERE CAST(${pk} AS TEXT) = "h"."trueId")`
+  const hiddenTs = maxTsSql([
+    `(CASE WHEN ${timeGroupSql(heldTs)} = ${ISO_TEXT_GROUP} THEN ${NOW_SQL} END)`,
+    heldTs,
+    `(SELECT ${escapeIdentifier(VERSION_COLUMNS.ts)} FROM "_tombstone"
+         WHERE "tableName" = ${parts.literal} AND "recordId" = "h"."trueId")`,
+  ])
+  const excluded: VersionRefs = {
+    ts: `"excluded".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+    lamport: `"excluded".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+    instance: `"excluded".${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+  }
+  const held: VersionRefs = {
+    ts: `"_tombstone".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+    lamport: `"_tombstone".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+    instance: `"_tombstone".${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+  }
+  return `INSERT INTO "_tombstone" ("tableName", "recordId", "deletedAt", ${escapeIdentifier(
+    VERSION_COLUMNS.ts
+  )}, ${escapeIdentifier(VERSION_COLUMNS.lamport)}, ${escapeIdentifier(
+    VERSION_COLUMNS.instance
+  )})
+       SELECT ${parts.literal}, "h"."trueId", ${NOW_SQL}, ${hiddenTs}, ${CLOCK_LAMPORT}, ${CLOCK_INSTANCE}
+       ${hiddenBehindSql(parts, keyText)}
+       ON CONFLICT ("tableName", "recordId") DO UPDATE SET
+         "deletedAt" = "excluded"."deletedAt",
+         ${escapeIdentifier(VERSION_COLUMNS.ts)} = ${excluded.ts},
+         ${escapeIdentifier(VERSION_COLUMNS.lamport)} = ${excluded.lamport},
+         ${escapeIdentifier(VERSION_COLUMNS.instance)} = ${excluded.instance}
+       WHERE ${strongerSql(excluded, held)};`
+}
+
+/** 統合されていた側の、負けた行の版を落とす（原則3）。 */
+function mergedRowsCleanupSql(parts: TableParts, keyText: string): string {
+  const pk = escapeIdentifier(parts.primaryKey.name)
+  const tombstone: VersionRefs = {
+    ts: `"tb".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+    lamport: `"tb".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+    instance: `"tb".${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+  }
+  const held: VersionRefs = {
+    ts: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+    lamport: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+    instance: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+  }
+  return `DELETE FROM ${parts.rows}
+       WHERE CAST(${pk} AS TEXT) IN (SELECT "h"."trueId" ${hiddenBehindSql(parts, keyText)})
+         AND EXISTS (SELECT 1 FROM "_tombstone" AS "tb"
+               WHERE "tb"."tableName" = ${parts.literal}
+                 AND "tb"."recordId" = CAST(${parts.rows}.${pk} AS TEXT)
+                 AND ${strongerSql(tombstone, held)});`
+}
+
+/** 統合されていた側の主キーも `_changelog` で告げる（原則3）。 */
+function mergedChangelogSql(parts: TableParts, keyText: string): string {
+  return `INSERT INTO "_changelog" ("tableName", "recordId", "operation", "changedAt")
+       SELECT ${parts.literal}, "h"."trueId", 'DELETE', ${NOW_SQL}
+       ${hiddenBehindSql(parts, keyText)}
+       ON CONFLICT DO NOTHING;`
 }
 
 /** `_changelog` への通知（対象の無い `ON CONFLICT DO NOTHING`）。 */
@@ -577,6 +699,7 @@ function updateMoveTrigger(parts: TableParts): string {
 function deleteTrigger(parts: TableParts): string {
   const trueId = trueIdSql(parts, 'OLD')
   const keyText = keyTextSql(parts, 'OLD')
+  const ts = deleteTsSql(parts, trueId, keyText)
   const tombstone: VersionRefs = {
     ts: `"tb".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
     lamport: `"tb".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
@@ -592,14 +715,17 @@ function deleteTrigger(parts: TableParts): string {
     WHEN ${GUARD}
     BEGIN
       ${tickSql(parts)}
-      ${upsertTombstoneSql(parts, keyText, deleteTsSql(parts, trueId, keyText), null)}
+      ${upsertTombstoneSql(parts, keyText, ts, null)}
+      ${mergedTombstoneSql(parts, keyText)}
       DELETE FROM ${parts.rows}
        WHERE ${escapeIdentifier(parts.primaryKey.name)} = ${trueId}
          AND EXISTS (SELECT 1 FROM "_tombstone" AS "tb"
                WHERE "tb"."tableName" = ${parts.literal}
                  AND "tb"."recordId" = ${keyText}
                  AND ${strongerSql(tombstone, held)});
+      ${mergedRowsCleanupSql(parts, keyText)}
       ${changelogSql(parts, keyText, 'DELETE', null)}
+      ${mergedChangelogSql(parts, keyText)}
       ${dirtySql(parts)}
     END`
 }

@@ -9,11 +9,10 @@
  * | 決定的でない関数（P8） | 例外 | 同じ行が端末や時刻によって置ける・置けないに分かれ、補題2と定理1が破れる |
  * | 独自に登録された照合順序・関数（P8） | 例外 | 一時 DB に同じものが無く、判定が別物になる |
  * | 解析できない索引（P8） | 例外 | かぶりの勝者を引けない |
+ * | 親のいない子（P5） | 警告 | 案A では親を置けない行が表に出ないので、導入前から壊れていた行が静かに消える |
  * | 時刻列の BLOB（穴7） | 例外 | 値の種類がいちばん強い群なので、入った行の順序が以後ほぼ書き込み順だけで決まる |
  * | 大きく未来の時刻（穴7） | 警告 | 引き上げは下がらないので、その行の順序が以後ほぼ書き込み順だけで決まる |
  * | 時刻列に値の種類が混ざる（§1.2.3） | 警告 | 順序は決まるが、利用者の期待とは違いうる |
- *
- * **段階1 ではまだ `setupSync` から呼ばない**（呼ぶのは段階2以降）。
  *
  * @module setup/rows-preflight
  * @internal
@@ -73,6 +72,10 @@ export function checkRowsPreconditions(
     assertIndexesAreReadable(db, table.name, custom)
     warnings.push(...checkTimestampColumn(db, table, options))
   }
+  // 外部キーだけは**表ごとのループの外**で1回。`foreign_key_check(<表>)` は
+  // 「その表が子である違反」しか返さないので、同期する表だけを回すと、
+  // 同期しない表から同期する表への違反を取りこぼす
+  warnings.push(...checkForeignKeys(db, tables))
   return { warnings }
 }
 
@@ -369,4 +372,138 @@ function checkTimestampColumn(
     )
   }
   return warnings
+}
+
+/* ------------------------------------------------------------------ *
+ * P5: 外部キー
+ * ------------------------------------------------------------------ */
+
+/** 警告に個別の表として並べる表の数の上限。超えたぶんは1行にまとめる。 */
+const FOREIGN_KEY_TABLE_LIMIT = 10
+
+/** 1つの表の警告に名前を挙げる親の表の数の上限。 */
+const FOREIGN_KEY_PARENT_LIMIT = 3
+
+/** 表1つぶんの、親のいない行の数え上げ。 */
+interface MissingParentSummary {
+  /** その表で見つかった違反の件数 */
+  count: number
+  /** 親の表ごとの件数（名前は `sqlite_master` の綴りのまま） */
+  parents: Map<string, number>
+}
+
+/**
+ * 親のいない子が残っていないこと（前提 P5）。**例外ではなく警告**である。
+ *
+ * 導入前から外部キーが壊れている DB は実在する。案A では版を
+ * `_sns_rows_<表>` に持ち、そこからアプリの表へ書き戻すが、**親を置けない行は
+ * 書き戻せない**。つまり壊れていた行は版としては残るのに、アプリの表からは
+ * 静かに消える。断って起動できなくするより、同期を1回回す前に知らせる方がよい。
+ *
+ * 検査は**引数なしで1回だけ**呼ぶ。`PRAGMA foreign_key_check(<表>)` は
+ * 「その表が子である違反」しか返さないので、同期する表だけを回すと、
+ * 同期しない表が同期する表を参照して壊れている形を取りこぼす
+ * （`src/rows/rebuild.ts` の決まりごと6 と同じ理由）。
+ *
+ * 違反は1件ずつ返る。大きな DB では数千件出うるので、**全件は文字列にしない**。
+ * 表ごとに数え上げ、代表として親の表の名前をいくつか添えるだけにする。
+ */
+function checkForeignKeys(
+  db: Database.Database,
+  tables: RowsPreflightTable[]
+): string[] {
+  const violations = db.pragma('foreign_key_check') as {
+    table: string
+    rowid: number | null
+    parent: string
+    fkid: number
+  }[]
+  if (violations.length === 0) return []
+
+  const targets = new Set(tables.map((table) => foldIdentifier(table.name)))
+  const inTargets = new Map<string, MissingParentSummary>()
+  const elsewhere = new Map<string, MissingParentSummary>()
+
+  for (const violation of violations) {
+    const child = String(violation.table)
+    // `_` で始まる表はこのライブラリが自分で作って自分で直すもので、利用者が
+    // 直せる気がかりではない。ここで挙げても手の打ちようがなく、アプリの表の
+    // 破れを埋もれさせるだけなので数えない（このライブラリの表の外部キーは、
+    // 作り直しの適用が `src/rows/rebuild.ts` で別に見ている）
+    if (child.startsWith('_')) continue
+    const folded = foldIdentifier(child)
+    // 親が同期する表なら、子が対象外でもその子は同期の影響を受ける
+    const parent = String(violation.parent)
+    const related =
+      targets.has(folded) || targets.has(foldIdentifier(parent))
+        ? inTargets
+        : elsewhere
+    let summary = related.get(child)
+    if (summary === undefined) {
+      summary = { count: 0, parents: new Map() }
+      related.set(child, summary)
+    }
+    summary.count += 1
+    summary.parents.set(parent, (summary.parents.get(parent) ?? 0) + 1)
+  }
+
+  return [
+    ...describeMissingParents(
+      inTargets,
+      (table, count, parents) =>
+        `同期する表 ${table} に、親のいない行が ${count} 件ある（親は ${parents}。前提 P5）。` +
+        `この状態で同期を始めると、その行はアプリの表から外れる（版は残る）`,
+      (count, tableCount) =>
+        `ほか ${tableCount} 表の、同期に関わる行にも親がいない（合計 ${count} 件。前提 P5）。` +
+        `この状態で同期を始めると、それらの行はアプリの表から外れる（版は残る）`
+    ),
+    ...describeMissingParents(
+      elsewhere,
+      (table, count, parents) =>
+        `同期しない表 ${table} に、親のいない行が ${count} 件ある（親は ${parents}）。` +
+        `同期は触らないが、DB がもともと壊れている印なので、あわせて直すこと`,
+      (count, tableCount) =>
+        `ほか ${tableCount} 表にも親のいない行がある（合計 ${count} 件）。` +
+        `同期は触らないが、DB がもともと壊れている印なので、あわせて直すこと`
+    ),
+  ]
+}
+
+/**
+ * 数え上げを警告の文にする。件数の多い表から順に {@link FOREIGN_KEY_TABLE_LIMIT}
+ * 表ぶんだけ個別に並べ、残りは1行にまとめる。
+ */
+function describeMissingParents(
+  summaries: Map<string, MissingParentSummary>,
+  describe: (table: string, count: number, parents: string) => string,
+  describeRest: (count: number, tableCount: number) => string
+): string[] {
+  if (summaries.size === 0) return []
+  // 件数の多い順、同数なら名前順。並びが入力の順に揺れないようにする
+  const ordered = [...summaries].sort(
+    (a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0])
+  )
+  const warnings = ordered
+    .slice(0, FOREIGN_KEY_TABLE_LIMIT)
+    .map(([table, summary]) =>
+      describe(table, summary.count, describeParents(summary.parents))
+    )
+  const rest = ordered.slice(FOREIGN_KEY_TABLE_LIMIT)
+  if (rest.length > 0) {
+    const count = rest.reduce((total, [, summary]) => total + summary.count, 0)
+    warnings.push(describeRest(count, rest.length))
+  }
+  return warnings
+}
+
+/** 親の表の名前を、件数の多い順に上限まで並べる。 */
+function describeParents(parents: Map<string, number>): string {
+  const ordered = [...parents].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+  )
+  const shown = ordered.slice(0, FOREIGN_KEY_PARENT_LIMIT).map(([name]) => name)
+  const hidden = ordered.length - shown.length
+  return hidden > 0
+    ? `${shown.join(' / ')} ほか ${hidden} 表`
+    : shown.join(' / ')
 }

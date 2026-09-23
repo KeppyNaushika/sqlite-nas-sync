@@ -278,3 +278,167 @@ describe('checkRowsPreconditions —— 時刻列（穴7・§1.2.3）', () => {
     }
   })
 })
+
+describe('checkRowsPreconditions —— P5（親のいない子）', () => {
+  /**
+   * 親の表と子の表を作り、**外部キーの強制を切ってから**親のいない子を入れる。
+   * better-sqlite3 は既定で `foreign_keys = ON` なので、切らないと壊れた形を
+   * 作れない。導入前から壊れている DB は、これと同じ姿をしている。
+   */
+  function openBroken(
+    childRows: number,
+    extra: string[] = []
+  ): Database.Database {
+    const db = open([
+      `CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL)`,
+      `CREATE TABLE notes (
+         id    TEXT PRIMARY KEY NOT NULL,
+         tagId TEXT REFERENCES tags(id)
+       )`,
+      ...extra,
+    ])
+    db.pragma('foreign_keys = OFF')
+    const insert = db.prepare(`INSERT INTO notes VALUES (?, 'missing')`)
+    for (let index = 0; index < childRows; index += 1) insert.run(`n${index}`)
+    return db
+  }
+
+  it('違反が無ければ警告が出ない', () => {
+    const db = openBroken(0)
+    try {
+      db.prepare(`INSERT INTO tags VALUES ('t1')`).run()
+      db.prepare(`INSERT INTO notes VALUES ('n1', 't1')`).run()
+      expect(
+        checkRowsPreconditions(db, [{ name: 'notes' }, { name: 'tags' }])
+          .warnings
+      ).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('子の行だけある DB では、表名・親の表名・件数が文面に入る', () => {
+    const db = openBroken(9)
+    try {
+      const warnings = checkRowsPreconditions(db, [
+        { name: 'notes' },
+        { name: 'tags' },
+      ]).warnings
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toContain('notes')
+      expect(warnings[0]).toContain('tags')
+      expect(warnings[0]).toContain('9 件')
+      expect(warnings[0]).toContain('P5')
+    } finally {
+      db.close()
+    }
+  })
+
+  // `foreign_key_check(<表>)` は「その表が子である違反」しか返さない。同期する表
+  // だけを回すと、この形（子が対象外・親が対象）を取りこぼす
+  it('同期しない表から同期する表への違反も見つかる', () => {
+    const db = openBroken(2)
+    try {
+      const warnings = checkRowsPreconditions(db, [{ name: 'tags' }]).warnings
+      expect(warnings.join('\n')).toMatch(/同期する表 notes/)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('同期に関わらない表の違反は、文面で区別が付く', () => {
+    const db = openBroken(0, [
+      `CREATE TABLE books (id TEXT PRIMARY KEY NOT NULL)`,
+      `CREATE TABLE pages (
+         id     TEXT PRIMARY KEY NOT NULL,
+         bookId TEXT REFERENCES books(id)
+       )`,
+    ])
+    try {
+      db.prepare(`INSERT INTO pages VALUES ('p1', 'missing')`).run()
+      const warnings = checkRowsPreconditions(db, [{ name: 'notes' }]).warnings
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toMatch(/^同期しない表 pages/)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('違反が多数あっても文面が暴れない（表の数と件数の上限が効く）', () => {
+    const db = new Database(':memory:')
+    try {
+      db.exec(`CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL)`)
+      const names: string[] = []
+      for (let index = 0; index < 14; index += 1) {
+        const table = `child${String(index).padStart(2, '0')}`
+        names.push(table)
+        db.exec(
+          `CREATE TABLE ${table} (
+             id    TEXT PRIMARY KEY NOT NULL,
+             tagId TEXT REFERENCES tags(id)
+           )`
+        )
+      }
+      db.pragma('foreign_keys = OFF')
+      for (const table of names) {
+        const insert = db.prepare(`INSERT INTO ${table} VALUES (?, 'missing')`)
+        for (let row = 0; row < 200; row += 1) insert.run(`r${row}`)
+      }
+      const warnings = checkRowsPreconditions(db, [{ name: 'tags' }]).warnings
+      // 個別に並ぶのは10表まで、残りの4表は1行にまとまる
+      expect(warnings).toHaveLength(11)
+      expect(warnings[10]).toContain('ほか 4 表')
+      expect(warnings[10]).toContain('800 件')
+      // 2800 件の違反があっても、文字数は素直な長さに収まる
+      expect(warnings.join('\n').length).toBeLessThan(2000)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('1つの表に親が多いとき、親の表の名前も上限までに収まる', () => {
+    const db = new Database(':memory:')
+    try {
+      const parents = ['p1', 'p2', 'p3', 'p4', 'p5']
+      for (const parent of parents) {
+        db.exec(`CREATE TABLE ${parent} (id TEXT PRIMARY KEY NOT NULL)`)
+      }
+      db.exec(
+        `CREATE TABLE child (
+           id TEXT PRIMARY KEY NOT NULL,
+           ${parents.map((parent) => `${parent}Id TEXT REFERENCES ${parent}(id)`).join(', ')}
+         )`
+      )
+      db.pragma('foreign_keys = OFF')
+      db.prepare(
+        `INSERT INTO child VALUES ('c1', 'x', 'x', 'x', 'x', 'x')`
+      ).run()
+      const warnings = checkRowsPreconditions(db, [{ name: 'child' }]).warnings
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toContain('ほか 2 表')
+    } finally {
+      db.close()
+    }
+  })
+
+  // `_` で始まる表はこのライブラリが自分で作って自分で直すもので、利用者が
+  // 手を打てない。挙げてもアプリの表の破れを埋もれさせるだけなので数えない
+  it('このライブラリの表（_ で始まる）の違反は挙げない', () => {
+    const db = open([
+      `CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL)`,
+      `CREATE TABLE _sns_shown (
+         id    TEXT PRIMARY KEY NOT NULL,
+         tagId TEXT REFERENCES tags(id)
+       )`,
+    ])
+    try {
+      db.pragma('foreign_keys = OFF')
+      db.prepare(`INSERT INTO _sns_shown VALUES ('a', 'missing')`).run()
+      expect(checkRowsPreconditions(db, [{ name: 'tags' }]).warnings).toEqual(
+        []
+      )
+    } finally {
+      db.close()
+    }
+  })
+})

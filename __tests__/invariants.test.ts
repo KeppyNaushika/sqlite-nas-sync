@@ -351,20 +351,46 @@ describe('規則: 時刻の比較は「時刻として」行う', () => {
     )
     expect(
       offenders.map((hit) => `${hit.where}: ${hit.line}`),
-      '`compareTimestamps` を使うこと'
+      '時刻の前後は `rows/versions.ts` の版の順序（群の判定）に通すこと'
     ).toEqual([])
   })
 
-  it('`julianday` で正規化するのは1か所だけ', () => {
-    // 正規化の仕方が2つあると、片方だけ直したときにもう片方が古い意味のまま残る。
-    // 時刻を数として比べたい箇所は `sync/timestamp` の `compareTimestamps` を
-    // 通ること（`changelog.ts` の掃除は「行を選ぶSQL」で、値どうしの比較ではない）。
-    const users = sourceFiles()
-      .filter((file) => /julianday\s*\(\s*\?/.test(file.text))
-      .map((file) => file.path)
-    expect(users, '時刻どうしの比較は `sync/timestamp` に集めること').toEqual([
-      path.join('sync', 'timestamp.ts'),
-    ])
+  it('`julianday` を持ち出すファイルを増やさない', () => {
+    // **この規則は書き換えた。** 元は「`julianday(?)` を書いてよいのは
+    // `sync/timestamp.ts` だけ」という形だったが、案A で時刻どうしの比較が
+    // 版の順序（群の判定）へ移り、`sync/timestamp.ts`（`compareTimestamps`）は
+    // 呼ぶ側が絶えて消えた。規則をそのまま残すと「0か所であること」を数える
+    // 空の検査になり、**次に誰かが新しい正規化を足しても何も言わない**。
+    //
+    // 守りたいことは変わっていない ——「時刻をどう読むか」の決め方が増えると、
+    // 片方だけ直したときにもう片方が古い意味のまま残る。そこで、`julianday` を
+    // 持ち出すファイルの側を数える形へ直す。下の5つ以外に増えたら、
+    // **その場で正規化を書き足していないか**を見てから許しへ足すこと。
+    //
+    // | ファイル | なぜ持ってよいか |
+    // | --- | --- |
+    // | `rows/versions.ts` | 群3（ISO の字形）の値を数にする。**時刻の物差しの本体** |
+    // | `rows/triggers.ts` | 同じ順序を SQL 側（トリガー）で書いたもの |
+    // | `changelog.ts` | 掃除で「行を選ぶSQL」。値どうしの比較ではない |
+    // | `setup/rows-preflight.ts` | 事前確認で時刻列の最大値を1つ引くだけ |
+    // | `rows/sql-functions.ts` | 決定的なSQL関数の**名前の一覧**に綴りが載るだけ |
+    const users = new Set(
+      findLines((line) => /julianday/.test(line)).map(
+        (hit) => hit.where.split(':')[0]
+      )
+    )
+    expect(
+      [...users].sort(),
+      '時刻の読み方を決める場所を増やさないこと'
+    ).toEqual(
+      [
+        'changelog.ts',
+        path.join('rows', 'sql-functions.ts'),
+        path.join('rows', 'triggers.ts'),
+        path.join('rows', 'versions.ts'),
+        path.join('setup', 'rows-preflight.ts'),
+      ].sort()
+    )
   })
 })
 

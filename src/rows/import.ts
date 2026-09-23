@@ -23,8 +23,6 @@
  *   相手に無い列は自分の既定値、相手にしかない列は無視、`sns-format` が
  *   `rows1` でなければ相手を丸ごと見送る
  *
- * **段階3 ではまだ `performSync` から呼ばれない**（切り替えるのは段階5）。
- *
  * @module rows/import
  * @internal
  */
@@ -237,7 +235,7 @@ export function importFromPeer(
         if (outcome === null) continue
         highestLamport = Math.max(highestLamport, outcome.lamport)
         // 見え方が動いたなら、`Max` が動いていなくても作り直しは要る
-        if (outcome.visibleChanged) dirty.add(table.name)
+        if (outcome.changed) dirty.add(table.name)
         if (!outcome.changed) {
           // 相手は主張したが、手元の版の方が強かった（§4.4 の `skipped`）
           result.skipped += 1
@@ -272,15 +270,6 @@ export function importFromPeer(
 /** キー1つを取り込んだ結果。 */
 interface KeyOutcome {
   changed: boolean
-  /**
-   * **見え方に効く版**が変わった（＝作り直しが要る）。
-   *
-   * `changed`（`Max` が変わった）とは別に持つ。`deleteProtected` の表では
-   * 見え方を決めるのは「行の版があればその最強のもの」で、`Max` とは違う ——
-   * 削除の版が `Max` のまま行の版が入れ替わることがあり、そこで
-   * `_sns_dirty` に載せ損ねると、取り戻した行が表に出ないまま止まる
-   */
-  visibleChanged: boolean
   /** 手元にも版があった（＝突き合わせが起きた） */
   contested: boolean
   operation: 'UPDATE' | 'DELETE'
@@ -314,12 +303,9 @@ function importOneKey(
   if (nextDelete !== null && nextDelete !== localDelete) {
     io.writeTombstone(table, key, nextDelete)
   }
-  // `deleteProtected` の表では、削除の版が勝っても**行の版を消さない**。
-  // 消すと、設定を外したときに戻すものが無くなる（版は帳簿であって、
-  // 置くか置かないかは見え方の計算（`derive`）が決める）
   const rowWins =
     nextRow !== null && io.strongest(nextRow, nextDelete) === nextRow
-  if (nextRow !== null && (rowWins || table.deleteProtected)) {
+  if (nextRow !== null && rowWins) {
     // 行の版が勝っている。手元に無い、または相手の版が強いときだけ書く
     if (nextRow !== localRow) io.writeRow(table, nextRow)
   } else if (localRow !== null) {
@@ -327,21 +313,13 @@ function importOneKey(
     io.deleteRow(table, key)
   }
 
+  // `before` / `after` は版の強い方（`Max`）で、見え方の計算（`derive`）も
+  // 同じ `Max` を見る。だから「`Max` が変わった」がそのまま「作り直しが要る」
   const changed = before === null || !io.sameVersion(before, after)
-  // 見え方は `derive` と同じ規則で見る（守られた表では行の版が先）
-  const visible = (row: Claim | null, tomb: Claim | null): Claim | null =>
-    table.deleteProtected ? (row ?? tomb) : io.strongest(row, tomb)
-  const beforeVisible = visible(localRow, localDelete)
-  const afterVisible = visible(nextRow, nextDelete)
-  const visibleChanged =
-    beforeVisible === null ||
-    afterVisible === null ||
-    !io.sameVersion(beforeVisible, afterVisible)
   const operation = after.version.kind === 'delete' ? 'DELETE' : 'UPDATE'
   if (changed) io.writeChangelog(table, key, operation)
   return {
     changed,
-    visibleChanged,
     contested: before !== null,
     operation,
     lamport: Math.max(
@@ -375,8 +353,6 @@ interface TableIo {
   /** 列 → 既定値の SQL の字面（相手に無い列を埋めるのに使う） */
   defaults: Map<string, string | null>
   rowsTable: string
-  /** 削除の版が勝っても行の版を消さない表（設計書の `deleteProtected`） */
-  deleteProtected: boolean
 }
 
 /** 取り込みの読み書きを1か所にまとめる。文はすべて使い回す。 */
@@ -384,7 +360,7 @@ class ImportIo {
   readonly skippedTables: { table: string; reason: string }[] = []
   private readonly tables = new Map<string, TableIo | null>()
   private readonly statements = new Map<string, Database.Statement>()
-  /** `_tombstone` にある列（旧版の DB には `mergedInto` などが無い） */
+  /** `_tombstone` にある列（版の列を足す前の DB には版の列が無い） */
   private readonly tombstoneColumns: Set<string>
   private readonly peerHasTombstone: boolean
 
@@ -453,7 +429,6 @@ class ImportIo {
         columns.map((column) => [column.name, defaultOf(column)])
       ),
       rowsTable,
-      deleteProtected: spec.deleteProtected === true,
     }
   }
 
@@ -674,8 +649,6 @@ class ImportIo {
       'tableName',
       'recordId',
       'deletedAt',
-      'mergedInto',
-      'revokedAt',
       ...Object.values(VERSION_COLUMNS),
     ]
     return wanted.filter((column) => this.tombstoneColumns.has(column))

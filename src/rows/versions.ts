@@ -16,8 +16,6 @@
  * 素の比較に任せると **`COLLATE NOCASE` で宣言された時刻列**では `'ABC'` と `'abc'` が
  * 同着になり、値が違うのに順序が付かない（設計書 §1.2.3 の穴4）。
  *
- * この版（段階1）ではまだ `setupSync` から呼ばれない。純粋な計算だけを置く。
- *
  * @module rows/versions
  * @internal
  */
@@ -66,8 +64,6 @@ export interface RowVersion {
   instance: string
   /** 行の版のときの、全列の真の値（生成列を除く） */
   content?: Record<string, SqlValue>
-  /** 旧版から移ってきた削除の版が持つ、畳んだ先の id（設計書 §1.6 の表） */
-  mergedInto?: SqlValue
 }
 
 /**

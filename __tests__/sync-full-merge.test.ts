@@ -99,20 +99,20 @@ describe('フルマージ（ギャップ検出時）', () => {
 
     // フルマージ後のchangelogエントリ数
     // トリガーOFFなのでデータマージ分は増えない
-    // heartbeatの1件 + changelogマージ分のみ
+    // changelogマージ分のみ
     const afterCount = (
       dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any
     ).cnt
 
     // u1, u2の既存レコードのマージではchangelogが増えないことを確認
     // （全レコード分のINSERT/UPDATEエントリが生成されていないこと）
-    // Aのchangelogマージ分 + heartbeat分のみ
+    // Aのchangelogマージ分のみ
     expect(afterCount).toBeLessThan(beforeCount + 10)
 
     dbB.close()
   })
 
-  it('フルマージ後にheartbeatが更新されchangelogが延命する', async () => {
+  it('フルマージのあと `_changelog` を延命させる書き込みは1件も起きない', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a')
     const { db: dbB, dbPath: pathB } = createClientDb('client-b')
 
@@ -136,11 +136,20 @@ describe('フルマージ（ギャップ検出時）', () => {
     )
     expect(resultB.hadChangelogGap).toBe(true)
 
-    // heartbeatがchangelogに記録されている
+    // `_heartbeat` は廃止した。表もトリガーも無く、`_changelog` にその名前の
+    // エントリも載らない（無変更の日に転送が起き続ける原因だった）
+    const heartbeatTable = dbB
+      .prepare(`SELECT name FROM sqlite_master WHERE name = '_heartbeat'`)
+      .all()
+    expect(heartbeatTable).toEqual([])
     const heartbeatEntries = dbB
       .prepare(`SELECT * FROM _changelog WHERE tableName = '_heartbeat'`)
       .all()
-    expect(heartbeatEntries.length).toBeGreaterThanOrEqual(1)
+    expect(heartbeatEntries).toEqual([])
+
+    // 延命しなくてもフルマージで事実は届いている（A が入れた u1 が B に在る）
+    const u1 = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get() as any
+    expect(u1?.name).toBe('Alice')
 
     dbB.close()
   })
@@ -382,8 +391,8 @@ describe('フルマージ（ギャップ検出時）', () => {
 
     // C が B を読む。B の changelog には穴が開いているので C はフルマージへ落ち、
     // 穴に入っていた行も B の実データから受け取れる。
-    // ここで隙間を見落とすと、C は残っているぶん（heartbeat だけ）を読んで
-    // カーソルを進め、u1 / u2 の変更は**二度と差分経路に現れない**。
+    // ここで隙間を見落とすと、C は残っているぶんだけを読んでカーソルを進め、
+    // u1 / u2 の変更は**二度と差分経路に現れない**。
     const { db: dbC, dbPath: pathC } = createClientDb('client-c')
     const resultC = await performSync(
       dbC,
@@ -412,7 +421,7 @@ describe('フルマージ（ギャップ検出時）', () => {
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
 
     // A の changelog を「掃除で」全部消す（記録が残る形）。
-    // heartbeat のぶんも含めて期限切れにしてから掃除する。
+    // 全件を期限切れにしてから掃除する。
     dbA
       .prepare(`UPDATE _changelog SET changedAt = '2020-01-01T00:00:00.000Z'`)
       .run()
@@ -421,9 +430,8 @@ describe('フルマージ（ギャップ検出時）', () => {
     expect(prunedThroughId).toBeGreaterThan(0)
     expect(getMaxChangelogId(dbA)).toBe(0)
 
-    // 掃除後の姿を NAS へ置く。**heartbeat を回さない**ため、
-    // `performSync` を通さず直接コピーする（通すと changelog に1件載って
-    // `MAX(id) > 0` になり、この形が作れない）。
+    // 掃除後の姿（`MAX(id) = 0` で掃除済み位置だけが残る形）をそのまま NAS へ置く。
+    // `performSync` を通すと写しの前に掃除の順が入って形がぶれるので、直接コピーする。
     await copyToNas(dbA, nasDir, 'client-a')
     dbA.close()
 
