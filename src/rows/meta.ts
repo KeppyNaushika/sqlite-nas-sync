@@ -11,14 +11,11 @@
  * **鍵の名前は固定**（§3.1 の H）。後ろ2つは §3.10 の「復元・巻き戻り」と
  * 「写しの取り合い」の判定に使うので、綴りが端末ごとに違うと検出が効かない。
  *
- * **段階4 ではまだ `setupSync` / `performSync` から呼ばれない**（切り替えは段階5）。
- *
  * @module rows/meta
  * @internal
  */
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
-import { foldIdentifier } from '../setup/sql'
 
 /** `_sync_meta` に置く案A の鍵（設計書 §3.1）。 */
 export const SNS_META_KEYS = {
@@ -26,7 +23,6 @@ export const SNS_META_KEYS = {
   generation: 'sns.generation',
   lastInstance: 'sns.lastInstance',
   lastLamport: 'sns.lastLamport',
-  deleteProtected: 'sns.deleteProtected',
 } as const
 
 /** {@link SNS_META_KEYS} の値の型。 */
@@ -97,60 +93,23 @@ export function writeSnsMeta(
   ).run(key, String(value))
 }
 
-/* ------------------------------------------------------------------ *
- * `deleteProtected`（削除の版が表示の計算で勝たない表）
- * ------------------------------------------------------------------ */
-
-/** 名前と `deleteProtected` だけを見る、表の指定の最小形。 */
-interface DeleteProtectedSpec {
-  name: string
-  deleteProtected?: boolean
-}
-
 /**
- * `sns.deleteProtected` に書く字面。
+ * 旧版（v0.20 まで）が書いていた `sns.deleteProtected` の鍵。
  *
- * **綴りを畳んで、並べ替えて、`,` でつなぐ。** 端末ごとに綴りや並びが違っても
- * 同じ設定なら同じ字面になるようにしないと、食い違いの検出が空振りする。
+ * `TableConfig.deleteProtected` を落としたので、もう誰も読まない。残っていても
+ * 害は無いが、読まれない設定が残るのは紛らわしいので移行のときに消す。
  */
-export function encodeDeleteProtected(
-  tables: readonly DeleteProtectedSpec[]
-): string {
-  const names = new Set<string>()
-  for (const table of tables) {
-    if (table.deleteProtected === true) names.add(foldIdentifier(table.name))
+const LEGACY_DELETE_PROTECTED_KEY = 'sns.deleteProtected'
+
+/** 読まれなくなった `sns.deleteProtected` を消す（無ければ何もしない）。 */
+export function dropLegacyDeleteProtected(db: Database.Database): void {
+  try {
+    db.prepare(`DELETE FROM _sync_meta WHERE key = ?`).run(
+      LEGACY_DELETE_PROTECTED_KEY
+    )
+  } catch {
+    // `_sync_meta` がまだ無い DB。消すものも無い
   }
-  return [...names].sort().join(',')
-}
-
-/** `sns.deleteProtected` を書く。 */
-export function writeDeleteProtected(
-  db: Database.Database,
-  tables: readonly DeleteProtectedSpec[]
-): void {
-  writeSnsMeta(db, SNS_META_KEYS.deleteProtected, encodeDeleteProtected(tables))
-}
-
-/**
- * `sns.deleteProtected` の字面。鍵が無ければ `null`。
- *
- * `null`（鍵が無い）と `''`（守る表が1つも無い）は**別物**である。前者は
- * 「この端末の設定が分からない」で、食い違いの警告を出す材料にならない。
- */
-export function readDeleteProtectedRaw(db: Database.Database): string | null {
-  return readSnsMeta(db, SNS_META_KEYS.deleteProtected)
-}
-
-/**
- * 削除から守る表の集合（畳んだ綴り）。
- *
- * 作り直しの計算（`rebuild-plan`）は、渡された設定ではなく**この DB に
- * 書いてある設定**を読む。ワーカーで計算するときも同じ答えになるようにするため。
- */
-export function readDeleteProtectedTables(db: Database.Database): Set<string> {
-  const raw = readDeleteProtectedRaw(db)
-  if (raw === null || raw === '') return new Set()
-  return new Set(raw.split(',').filter((name) => name !== ''))
 }
 
 /** `_sns_clock.lamport`。行が無ければ `null`（§3.10 の「仕掛けの欠け」）。 */

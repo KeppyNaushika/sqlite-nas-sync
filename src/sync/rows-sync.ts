@@ -7,8 +7,8 @@
  * | --- | --- |
  * | 0 | `writeSchemaVersion`。**取り込みより前**に §3.10 の復元・巻き戻りの判定。仕掛けの欠けの確認と手当て |
  * | 1 | 相手の列挙と、隙間の事前確認 |
- * | 2 | 隙間なし: 印 → 写し → 取り合いの確認 → 相手ごとに取り込み → 作り直し。隙間あり: 取り込み → 作り直し → heartbeat → 印 → 写し → 取り合いの確認 |
- * | 3〜5 | heartbeat、`cleanupChangelog`、`onAfterSync` |
+ * | 2 | 隙間なし: 印 → 写し → 取り合いの確認 → 相手ごとに取り込み → 作り直し。隙間あり: 取り込み → 作り直し → 印 → 写し → 取り合いの確認 |
+ * | 3〜5 | `cleanupChangelog`、`onAfterSync` |
  *
  * **やっても何も変わらない転送はしない**（`sync/idle`）。段階1 で相手のファイルの
  * 素性（`stat`）を見て、前に読んだときのままなら写さない。段階2 で手元の印を見て、
@@ -68,7 +68,6 @@ import {
 } from './idle'
 import { readSchemaVersion, writeSchemaVersion } from '../setup'
 import { getSyncState, recordSkippedRemote, updateSyncState } from './state'
-import { updateHeartbeat } from './state'
 import {
   ROWS_FORMAT,
   RowsImportKey,
@@ -92,14 +91,7 @@ import {
 } from '../rows/restore-detect'
 import { migrateToRows } from '../rows/migrate'
 import { RowsTableSpec } from '../rows/schema'
-import { canonicalTableSpecs } from '../rows/table-name'
-import {
-  SNS_META_KEYS,
-  encodeDeleteProtected,
-  readDeleteProtectedRaw,
-  readSnsMeta,
-  writeDeleteProtected,
-} from '../rows/meta'
+import { SNS_META_KEYS, readSnsMeta } from '../rows/meta'
 
 /**
  * `SyncInstance` が全体で1つ持つ記憶（設計書 §3.7.4）。
@@ -142,11 +134,9 @@ export async function performRowsSync(
   const configuredRetentionDays =
     config.changelogRetentionDays ?? DEFAULTS.changelogRetentionDays
   const retentionDays = normalizeRetentionDays(configuredRetentionDays)
-  const heartbeatEnabled = config.heartbeatEnabled ?? DEFAULTS.heartbeatEnabled
   const specs: RowsTableSpec[] = tables.map((table) => ({
     name: table.name,
     timestampColumn: table.timestampColumn,
-    deleteProtected: table.deleteProtected,
   }))
   const tableNames = specs.map((spec) => spec.name)
 
@@ -174,6 +164,7 @@ export async function performRowsSync(
     conflictsResolved: 0,
     folds: [],
     restores: [],
+    discarded: [],
     warnings: [],
     skippedRemotes: [],
     hadChangelogGap: false,
@@ -248,33 +239,9 @@ export async function performRowsSync(
   const instanceId =
     state.instanceId ?? readSnsMeta(localDb, SNS_META_KEYS.instanceId) ?? ''
 
-  // `deleteProtected` の設定を DB に書き残す（§3.1 の鍵）。
-  //
-  // 1. 作り直しの計算はここから読む（ワーカーで計算しても同じ答えになる形は
-  //    これ1つである）
-  // 2. 写しにそのまま載るので、相手との食い違いを取り込みのときに見つけられる
-  //
-  // **設定が変わったら全表を `_sns_dirty` に載せる。** 載せないと、版が1つも
-  // 動かない限り作り直しが走らず、設定を外しても削除がいつまでも効かない
-  const previousProtected = readDeleteProtectedRaw(localDb)
-  const currentProtected = encodeDeleteProtected(specs)
-  writeDeleteProtected(localDb, specs)
-  if (previousProtected !== null && previousProtected !== currentProtected) {
-    const mark = localDb.prepare(
-      `INSERT INTO "_sns_dirty" ("tableName") VALUES (?)
-         ON CONFLICT ("tableName") DO NOTHING`
-    )
-    // `_sns_dirty.tableName` は `sqlite_master` の綴りでなければ引けない
-    for (const spec of canonicalTableSpecs(localDb, specs)) mark.run(spec.name)
-    result.warnings.push(
-      `deleteProtected の設定が変わった（${previousProtected === '' ? '(無し)' : previousProtected}` +
-        ` → ${currentProtected === '' ? '(無し)' : currentProtected}）ので、全表を作り直す`
-    )
-  }
-
-  // 版と `deleteProtected` が変わったら、相手の覚えを捨てて全員読み直す。
-  // 見送りの判定も食い違いの警告も、この2つと相手の中身の突き合わせで決まる
-  const metaFingerprint = localMetaFingerprint(localDb, schemaVersion)
+  // 版が変わったら、相手の覚えを捨てて全員読み直す。
+  // 見送りの判定は、これと相手の中身の突き合わせで決まる
+  const metaFingerprint = localMetaFingerprint(schemaVersion)
   if (idle.localMeta !== metaFingerprint) {
     idle.peers.clear()
     idle.localMeta = metaFingerprint
@@ -390,7 +357,6 @@ export async function performRowsSync(
     } else {
       importAll(localDb, peers, config, schemaVersion, specs, idle, result)
       await rebuild(localDb, config, tableNames, state, result)
-      if (heartbeatEnabled) updateHeartbeat(localDb)
       if (!(await publish())) return stop(localDb, config, result)
     }
 
@@ -402,8 +368,6 @@ export async function performRowsSync(
   /* -------------------------------------------------------------- *
    * 段階 3〜5
    * -------------------------------------------------------------- */
-  if (!hasAnyGap && heartbeatEnabled) updateHeartbeat(localDb)
-
   // 案A の `_changelog` は**通知の索引**であって事実そのものではない。
   // 取りこぼした相手は `hasChangelogGap` でフルマージに落ち、相手の
   // `_sns_rows_*` を丸ごと読み直すので、刈っても事実は失われない（§3.9 の G が
@@ -500,20 +464,6 @@ function importAll(
             `（こちらは ${ROWS_FORMAT}）`
         )
         continue
-      }
-
-      // `deleteProtected` は全端末で同じである前提（前提 P4）。違うと同じ版の
-      // 集合から端末ごとに違う見え方が出るので、見送りはせずに**警告だけ**出す
-      // （見送ると、設定を直すための版すら届かなくなる）
-      const mineProtected = encodeDeleteProtected(specs)
-      const peerProtected = readDeleteProtectedRaw(peerDb)
-      if (peerProtected !== null && peerProtected !== mineProtected) {
-        result.warnings.push(
-          `deleteProtected が ${remote.clientId} と食い違っている` +
-            `（相手: ${peerProtected === '' ? '(無し)' : peerProtected}` +
-            `／こちら: ${mineProtected === '' ? '(無し)' : mineProtected}）。` +
-            `全端末で同じにしないと、端末ごとに見え方が変わる`
-        )
       }
 
       const { lastSeenId } = getSyncState(localDb, remote.clientId)
@@ -708,6 +658,16 @@ async function rebuild(
   result.inserted += outcome.counts.inserted
   result.updated += outcome.counts.updated
   result.deleted += outcome.counts.deleted
+  // 捨てた子の中身は、ここでしか渡せない（`_sns_rows_<表>` から落としてある）
+  for (const entry of outcome.discarded) {
+    result.discarded.push({
+      tableName: entry.table,
+      recordId: entry.trueId,
+      content: entry.content,
+      causeTable: entry.causeTable,
+      causeId: entry.causeId,
+    })
+  }
   if (outcome.status === 'deferred') {
     result.warnings.push(
       `Rebuild deferred: ${outcome.reason ?? '不明'}（見送り ${outcome.skips} 回目）`

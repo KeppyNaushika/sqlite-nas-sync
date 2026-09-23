@@ -82,6 +82,38 @@ const GUARDED: OracleSchema = {
   ],
 }
 
+/** 親 → 子 → 孫と外部キーが続く表（原則4 の連鎖を見る）。 */
+const CHAIN: OracleSchema = {
+  tables: [
+    {
+      name: 'tags',
+      ddl: `CREATE TABLE tags (
+              id        TEXT PRIMARY KEY,
+              name      TEXT NOT NULL UNIQUE,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+    {
+      name: 'tag_notes',
+      ddl: `CREATE TABLE tag_notes (
+              id        TEXT PRIMARY KEY,
+              tagId     TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+              body      TEXT NOT NULL,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+    {
+      name: 'note_marks',
+      ddl: `CREATE TABLE note_marks (
+              id        TEXT PRIMARY KEY,
+              noteId    TEXT NOT NULL REFERENCES tag_notes(id) ON DELETE CASCADE,
+              mark      TEXT NOT NULL,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+  ],
+}
+
 /** 照合順序が索引ごとに効くこと（かぶりの判定を JS でやると外れる形）。 */
 const NOCASE: OracleSchema = {
   tables: [
@@ -130,18 +162,9 @@ function del(
   id: SqlValue,
   ts: SqlValue,
   lamport: number,
-  instance: string,
-  mergedInto?: SqlValue
+  instance: string
 ): Version {
-  const version: Version = {
-    table,
-    id,
-    kind: 'delete',
-    ts,
-    lamport,
-    instance,
-  }
-  return mergedInto === undefined ? version : { ...version, mergedInto }
+  return { table, id, kind: 'delete', ts, lamport, instance }
 }
 
 /**
@@ -149,7 +172,8 @@ function del(
  *
  * - `置く id=… name=…`: 置く行（表示値つき）
  * - `隠れ→g1`: 隠れた行（勝者の真の id）
- * - `置かない`: 置かない行
+ * - `置かない`: 置かない行（版は残る）
+ * - `捨てる`: 版ごと捨てる行（原則4。親が削除されている）
  * - `死`: 削除の版が `Max`
  */
 function summarize(derived: Derived, schema: OracleSchema): string[] {
@@ -165,6 +189,11 @@ function summarize(derived: Derived, schema: OracleSchema): string[] {
       } else if (result.placement === 'hidden') {
         lines.push(
           `${table.name}:${key} 隠れ→${result.winner ?? '（勝者なし）'}`
+        )
+      } else if (result.placement === 'discarded') {
+        const cause = result.cause
+        lines.push(
+          `${table.name}:${key} 捨てる←${cause === undefined ? '？' : `${cause.table}:${cause.key}`}`
         )
       } else {
         lines.push(`${table.name}:${key} 置かない`)
@@ -475,23 +504,54 @@ const CASES: Case[] = [
     expect: ['items:i3 置く id=i3 tagId=null label=x updatedAt=' + T0],
   },
   {
-    name: '§1.6 死んだ id が mergedInto を持つと、Res はその先をたどる',
+    name: '原則4 親が削除されているなら、あとから届いた子は版ごと捨てる',
     schema: FAMILY,
     versions: [
-      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
-      del('tags', 'g2', T0, 1, 'b', 'g1'),
+      del('tags', 'g1', T0, 1, 'a'),
+      // 親の削除より新しい時刻でも、子は戻らない（宣言が CASCADE である以上消える）
       row(
         'tag_notes',
-        'n4',
-        { id: 'n4', tagId: 'g2', body: 'b1', updatedAt: T0 },
+        'n5',
+        { id: 'n5', tagId: 'g1', body: 'b1', updatedAt: T2 },
         2,
         'b'
       ),
     ],
+    expect: ['tags:g1 死', 'tag_notes:n5 捨てる←tags:g1'],
+  },
+  {
+    name: '原則4 捨てた子を親とする孫も捨てる（連鎖。原因は大元の削除）',
+    schema: CHAIN,
+    versions: [
+      del('tags', 'g1', T0, 1, 'a'),
+      row(
+        'tag_notes',
+        'n6',
+        { id: 'n6', tagId: 'g1', body: 'b1', updatedAt: T1 },
+        2,
+        'b'
+      ),
+      row(
+        'note_marks',
+        'k1',
+        { id: 'k1', noteId: 'n6', mark: 'x', updatedAt: T1 },
+        3,
+        'b'
+      ),
+      // 届いていないだけの親を指す孫は、従来どおり置かない行のまま
+      row(
+        'note_marks',
+        'k2',
+        { id: 'k2', noteId: 'n9', mark: 'y', updatedAt: T1 },
+        4,
+        'b'
+      ),
+    ],
     expect: [
-      'tags:g1 置く id=g1 name=t1 updatedAt=' + T1,
-      'tags:g2 死',
-      'tag_notes:n4 置く id=n4 tagId=g1 body=b1 updatedAt=' + T0,
+      'tags:g1 死',
+      'tag_notes:n6 捨てる←tags:g1',
+      'note_marks:k1 捨てる←tags:g1',
+      'note_marks:k2 置かない',
     ],
   },
 ]

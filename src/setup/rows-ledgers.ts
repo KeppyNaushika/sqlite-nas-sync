@@ -12,7 +12,6 @@
  * | --- | --- |
  * | `_sync_state` | 相手ごとの `lastSeenId`（§4.3） |
  * | `_changelog_prune` | 掃除した位置（隙間の検出） |
- * | `_heartbeat` | `_changelog` の延命 |
  * | `_sync_meta` | `schemaVersion` と `sns.*` の鍵（§3.8・§3.10） |
  *
  * `_changelog` と `_tombstone` は `createRowsTables` が作る。
@@ -22,35 +21,27 @@
  */
 import Database from 'better-sqlite3'
 import { sweepStaleRemoteCopies } from '../nas'
-import { NOW_SQL, dropStaleTrigger } from './sql'
 
 /**
  * 案A の帳簿を冪等に作る。アプリの表には触らない。
  *
- * `_heartbeat` にだけは `_changelog` へ書くトリガーを付ける。`_heartbeat` は
- * 同期する表ではないので案A のトリガーが付かず、これが無いと
- * 「変更が1件も無い日は `_changelog` が保持期間で空になる」が戻ってくる。
- * 相手はこのキーを「同期しない表」として読み飛ばす（§4.3）。
+ * 旧版はここで `_heartbeat` の表と、そこから `_changelog` へ書くトリガーを
+ * 作っていた（「変更が1件も無い日に `_changelog` が保持期間で空になる」のを
+ * 防ぐため）。`_changelog` が空でも `_changelog_prune.prunedThroughId` で
+ * 隙間は正しく判定できる（`hasChangelogGap`）ので、この仕掛けは廃止した。
+ * 旧 DB に残っている表とトリガーは `migrateToRows` が撤去する。
  */
 export function setupRowsLedgers(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS _sync_state (
       remoteClientId TEXT    PRIMARY KEY,
-      lastSeenId     INTEGER NOT NULL DEFAULT 0,
-      lastSyncedAt   TEXT
+      lastSeenId     INTEGER NOT NULL DEFAULT 0
     )
   `)
   db.exec(`
     CREATE TABLE IF NOT EXISTS _changelog_prune (
       onlyRow         INTEGER PRIMARY KEY CHECK (onlyRow = 0),
-      prunedThroughId INTEGER NOT NULL DEFAULT 0,
-      prunedAt        TEXT    NOT NULL DEFAULT (${NOW_SQL})
-    )
-  `)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS _heartbeat (
-      id        TEXT PRIMARY KEY,
-      updatedAt TEXT NOT NULL
+      prunedThroughId INTEGER NOT NULL DEFAULT 0
     )
   `)
   db.exec(`
@@ -58,25 +49,6 @@ export function setupRowsLedgers(db: Database.Database): void {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     )
-  `)
-
-  dropStaleTrigger(db, '_changelog_after_insert__heartbeat')
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS _changelog_after_insert__heartbeat
-    AFTER INSERT ON _heartbeat FOR EACH ROW
-    BEGIN
-      INSERT INTO _changelog (tableName, recordId, operation, changedAt)
-      VALUES ('_heartbeat', NEW.id, 'INSERT', ${NOW_SQL});
-    END
-  `)
-  dropStaleTrigger(db, '_changelog_after_update__heartbeat')
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS _changelog_after_update__heartbeat
-    AFTER UPDATE ON _heartbeat FOR EACH ROW
-    BEGIN
-      INSERT INTO _changelog (tableName, recordId, operation, changedAt)
-      VALUES ('_heartbeat', NEW.id, 'UPDATE', ${NOW_SQL});
-    END
   `)
 
   db.pragma('journal_mode = WAL')

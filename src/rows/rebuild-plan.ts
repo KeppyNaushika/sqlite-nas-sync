@@ -20,9 +20,8 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { escapeIdentifier, foldIdentifier } from '../setup/sql'
+import { escapeIdentifier } from '../setup/sql'
 import { CandidateResult, RowsSchema, derive } from './derive'
-import { readDeleteProtectedTables } from './meta'
 import {
   VERSION_COLUMNS,
   primaryKeyColumn,
@@ -73,8 +72,23 @@ interface RebuildPlanHidden {
 interface RebuildPlanUnplaceable {
   table: string
   trueId: string
-  reasonKind: string | null
   reason: string | null
+}
+
+/**
+ * 版ごと捨てる行（原則4）。親が削除されているので、`_sns_rows_<表>` から落とす。
+ *
+ * **中身を持ち歩く**のは、落としたあとには誰も読めなくなるからである。
+ * ライブラリは退避しない。必要ならアプリケーションが `SyncResult` から拾う。
+ */
+export interface RebuildPlanDiscarded {
+  table: string
+  trueId: string
+  /** 大元の削除（`<表>:<id>`） */
+  causeTable: string
+  causeId: string
+  /** 落とす行の中身（`_sns_rows_<表>` に入っていた値） */
+  content: Record<string, SqlValue>
 }
 
 /** {@link computeRebuildPlan} の結果。**構造化複製でそのまま渡せる形**。 */
@@ -85,6 +99,8 @@ export interface RebuildPlan {
   shown: RebuildPlanShown[]
   hidden: RebuildPlanHidden[]
   unplaceable: RebuildPlanUnplaceable[]
+  /** 版ごと捨てる行（原則4） */
+  discarded: RebuildPlanDiscarded[]
   /** 計算の対象にしなかった表と、その理由 */
   skipped: { table: string; reason: string }[]
 }
@@ -140,6 +156,7 @@ export function computeRebuildPlan(
       const shown: RebuildPlanShown[] = []
       const hidden: RebuildPlanHidden[] = []
       const unplaceable: RebuildPlanUnplaceable[] = []
+      const discarded: RebuildPlanDiscarded[] = []
       for (const table of order) {
         if (!targets.has(table)) continue
         const meta = metas.get(table) as TableMeta
@@ -153,10 +170,18 @@ export function computeRebuildPlan(
         for (const candidate of (
           derived.candidates.get(table) ?? new Map<string, CandidateResult>()
         ).values()) {
-          collectOutputs(values, meta, candidate, shown, hidden, unplaceable)
+          collectOutputs(
+            values,
+            meta,
+            candidate,
+            shown,
+            hidden,
+            unplaceable,
+            discarded
+          )
         }
       }
-      return { token, apply, shown, hidden, unplaceable, skipped }
+      return { token, apply, shown, hidden, unplaceable, discarded, skipped }
     } finally {
       values.close()
     }
@@ -248,10 +273,6 @@ function readSchema(
     `SELECT sql FROM sqlite_master
       WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`
   )
-  // `deleteProtected` は**この DB に書いてある設定**から読む（渡された設定では
-  // ない）。ワーカーは `_sync_meta` しか見られないので、主スレッドで計算しても
-  // ワーカーで計算しても同じ答えになる形はこれ1つである
-  const protectedTables = readDeleteProtectedTables(db)
   return {
     tables: tables.map((table) => {
       const row = ddlOf.get(table) as { sql: string | null } | undefined
@@ -264,7 +285,6 @@ function readSchema(
         indexes: (indexesOf.all(table) as { sql: string }[]).map(
           (index) => index.sql
         ),
-        deleteProtected: protectedTables.has(foldIdentifier(table)),
       }
     }),
   }
@@ -308,8 +328,6 @@ function readVersions(
       const version = versionOf(row, table, row['recordId'] ?? null)
       if (version === null) continue
       version.kind = 'delete'
-      const merged = row['mergedInto']
-      if (merged !== null && merged !== undefined) version.mergedInto = merged
       versions.push(version)
     }
   }
@@ -473,7 +491,8 @@ function collectOutputs(
   candidate: CandidateResult,
   shown: RebuildPlanShown[],
   hidden: RebuildPlanHidden[],
-  unplaceable: RebuildPlanUnplaceable[]
+  unplaceable: RebuildPlanUnplaceable[],
+  discarded: RebuildPlanDiscarded[]
 ): void {
   if (candidate.placement === 'placed') {
     const displayed = values.idKey(candidate.display[meta.primaryKey] ?? null)
@@ -494,10 +513,19 @@ function collectOutputs(
     })
     return
   }
+  if (candidate.placement === 'discarded') {
+    discarded.push({
+      table: meta.name,
+      trueId: candidate.key,
+      causeTable: candidate.cause?.table ?? meta.name,
+      causeId: candidate.cause?.key ?? candidate.key,
+      content: { ...candidate.display },
+    })
+    return
+  }
   unplaceable.push({
     table: meta.name,
     trueId: candidate.key,
-    reasonKind: candidate.reasonKind ?? null,
     reason: candidate.reason ?? null,
   })
 }

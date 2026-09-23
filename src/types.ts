@@ -2,7 +2,7 @@
  * 公開型の定義と、設定の既定値。
  *
  * 利用者が触れるのは {@link SyncConfig} と {@link SyncResult} の2つで、残りは
- * その中身か、結果に載る内訳（{@link RecordFold}）である。
+ * その中身か、結果に載る内訳（{@link RecordFold} と {@link DiscardedRecord}）である。
  *
  * ここの doc は**利用者向けの説明そのもの**として読まれる（typedoc がそのまま
  * APIリファレンスへ出す）。実装の都合ではなく、「何が起きるか」「どう設定するか」を書く。
@@ -26,21 +26,6 @@ export interface TableConfig {
    * @defaultValue `'updatedAt'`
    */
   timestampColumn?: string
-  /**
-   * `true` の場合、この表では**削除の版が表示の計算で勝たない**。
-   *
-   * 行の版がある限り、その行はアプリの表に置かれる。つまり**アプリがその行を消しても、
-   * 次の作り直しで置き直される**（消した端末でも戻る）。削除の事実そのものは
-   * `_tombstone` に格納されるので、設定を外せばそのとき初めて削除が効く。
-   *
-   * 旧方式（v0.19 まで）の「利用者操作による削除を**他端末から**適用しない」とは
-   * 意味が違う。旧方式では消した端末ではその行は消えたままだった。
-   *
-   * **設定は全端末で同じであること。** 違うと、同じ事実の集まりから端末ごとに違う
-   * 表示が出る。食い違いは取り込みのときに検出して `warnings` へ名指しで出すが、
-   * 同期は止めない（止めると、設定を直すための版すら届かなくなる）。
-   */
-  deleteProtected?: boolean
 }
 
 /**
@@ -72,7 +57,7 @@ export interface DiscoverOptions {
   excludeTables?: string[]
   /**
    * テーブル別の追加オプション。
-   * 指定しないテーブルはデフォルト動作（`updatedAt` / `deleteProtected: false`）。
+   * 指定しないテーブルはデフォルト動作（`updatedAt`）。
    * @defaultValue `{}`
    */
   tableOptions?: Record<string, TableOptions>
@@ -117,7 +102,6 @@ export interface DiscoverOptions {
  * const config: SyncConfig = {
  *   // ...
  *   tableOptions: {
- *     User: { deleteProtected: true },
  *     Audit: { timestampColumn: 'modifiedAt' },
  *   },
  * };
@@ -185,17 +169,6 @@ export interface SyncConfig {
   schemaVersion?: string
 
   /**
-   * heartbeat 機能を有効にするかどうか。
-   *
-   * `true` の場合、sync時に当日のheartbeatが未実行であれば
-   * `_heartbeat` テーブルを更新し、changelogにエントリを追加する。
-   * これによりchangelogが7日間で空になるのを防止する。
-   *
-   * @defaultValue `true`
-   */
-  heartbeatEnabled?: boolean
-
-  /**
    * テーブル自動検出時の警告ログコールバック。
    *
    * `id` を持つが `updatedAt` が無いテーブルが見つかった際に呼ばれる。
@@ -233,8 +206,8 @@ export interface SyncConfig {
    * （{@link SyncResult} の中身・最終的な収束）は変わらない。判断の根拠と
    * 見逃しへの備えは `src/sync/idle.ts` にある。
    *
-   * **起動直後・前回の失敗・版や `deleteProtected` の変化・フルマージが要る相手・
-   * 一定回数ごと**は、この設定に関わらず必ず読み・上げる。
+   * **起動直後・前回の失敗・版の変化・フルマージが要る相手・一定回数ごと**は、
+   * この設定に関わらず必ず読み・上げる。
    *
    * @defaultValue `true`
    */
@@ -354,6 +327,29 @@ export interface RecordFold {
 }
 
 /**
+ * 親の削除にあわせて**捨てた**子の行の記録（{@link SyncResult.discarded}）。
+ *
+ * 親に削除のバージョンがあるとき、宣言された `ON DELETE` に従って子のバージョンを
+ * 捨てる（原則4）。`ON DELETE CASCADE` なら、あとから届いた子も、その時刻に
+ * よらず消える。
+ *
+ * **ライブラリは捨てた行を保持しない。** この記録が出るのは1回だけで、
+ * 次の同期では出ない。残す必要があるなら、受け取ってアプリケーションが退避する。
+ */
+export interface DiscardedRecord {
+  /** 捨てた行の表 */
+  tableName: string
+  /** 捨てた行の主キー */
+  recordId: string
+  /** 捨てた行の中身。列名 → 値 */
+  content: Record<string, unknown>
+  /** 原因になった削除の表 */
+  causeTable: string
+  /** 原因になった削除の主キー */
+  causeId: string
+}
+
+/**
  * 同期実行の結果統計。
  *
  * {@link SyncInstance.syncNow} の戻り値として返される。
@@ -414,6 +410,16 @@ export interface SyncResult {
    */
   restores?: RecordFold[]
   /**
+   * 親の削除にあわせて**捨てた**子の行（原則4）。
+   *
+   * 親に削除の版があるとき、宣言された `ON DELETE` に従って子の版を捨てる。
+   * `ON DELETE CASCADE` なら、あとから届いた子も、その時刻によらず消える。
+   *
+   * **ライブラリは捨てた行を保持しない。** 次の同期では、この配列にも載らない。
+   * 残す必要があるなら、ここで受け取ってアプリケーションが退避すること。
+   */
+  discarded: DiscardedRecord[]
+  /**
    * 致命的でない警告メッセージの配列。
    *
    * 同期そのものは続いているが、**利用者に伝えないと黙って消えることになる**ものが
@@ -427,8 +433,6 @@ export interface SyncResult {
    * - `Rebuild failed: …` — 外部キーの違反が残るので、その表を作り直しの対象から外した
    * - `Skipped remote <id>: …` / `Skipped table <表>: …` — その相手・その表を
    *   今回は読めなかった
-   * - `deleteProtected が <id> と食い違っている …` — 設定は全端末で揃えること
-   *   （違うと同じ事実から端末ごとに違う表示が出る）
    * - 復元・巻き戻り・仕掛けの欠け・写しの取り合いの検出。
    *   **写しの取り合いは同期を止める**
    * - `changelogRetentionDays: … is not a usable number of days …` — 設定を
@@ -535,5 +539,4 @@ export const DEFAULTS = {
   primaryKey: 'id',
   intervalMs: 30000,
   changelogRetentionDays: 7,
-  heartbeatEnabled: true,
 } as const

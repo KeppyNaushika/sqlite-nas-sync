@@ -9,7 +9,6 @@
  * @module setup/sql
  * @internal
  */
-import Database from 'better-sqlite3'
 
 /**
  * SQLiteの識別子は大文字小文字を区別しないため、名前を畳んで比較する。
@@ -73,27 +72,6 @@ export interface ColumnInfo {
  * @internal
  */
 export const NOW_SQL = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
-
-/**
- * 秒精度の `datetime('now')` で作られた古いトリガを落とす（冪等）。
- *
- * トリガは `CREATE TRIGGER IF NOT EXISTS` で作るため、**既に在るDBでは中身が
- * 古いまま残る**。時刻の精度を上げても、旧版で作られたトリガが動いているかぎり
- * `_changelog.changedAt` と `_tombstone.deletedAt` は秒のままになる。
- * 定義そのものを見て、古い書き方をしているものだけ作り直す
- * （新しい定義で作られていれば何もしないので、毎回の起動でスキーマは動かない）。
- *
- * @internal
- */
-export function dropStaleTrigger(db: Database.Database, name: string): void {
-  const stale = db
-    .prepare(
-      `SELECT name FROM sqlite_master
-        WHERE type = 'trigger' AND name = ? AND sql LIKE '%datetime(''now'')%'`
-    )
-    .get(name)
-  if (stale) db.exec(`DROP TRIGGER ${escapeIdentifier(name)}`)
-}
 
 /**
  * SQL識別子をダブルクォートでエスケープする。

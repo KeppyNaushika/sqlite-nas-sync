@@ -22,7 +22,6 @@
  * 6. **`PRAGMA foreign_key_check(<表>)` は、その表が子である違反しか返さない**。
  *    適用した表・後始末で触った表・それらを親として参照する表を1つずつ回す
  *
- * **段階3 ではまだ `setupSync` / `performSync` から呼ばれない**（段階5 で切り替える）。
  * 公開 API ではない。
  *
  * @module rows/rebuild
@@ -40,10 +39,11 @@ import {
   dependencyOrder,
   foreignKeysOf,
   readRebuildToken,
+  RebuildPlanDiscarded,
   reviveRebuildPlan,
   sameRebuildToken,
 } from './rebuild-plan'
-import { RowsColumn } from './schema'
+import { RowsColumn, primaryKeyColumn, rowsTableName } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import { SqlValue, ValueOrdering } from './versions'
 
@@ -132,6 +132,13 @@ interface RowsRebuildOutcome {
    * 突き合わせて**数える。`status` が `applied` でなければ全部 0。
    */
   counts: RowsRebuildCounts
+  /**
+   * 版ごと捨てた行（原則4）。親が削除されているので `_sns_rows_<表>` から落とした。
+   *
+   * **中身を載せる**のは、落としたあとには誰も読めなくなるからである。
+   * ライブラリは退避しない。必要ならアプリケーションが受け取って退避する。
+   */
+  discarded: RebuildPlanDiscarded[]
 }
 
 /** アプリの表に当てた差の内訳。 */
@@ -402,7 +409,8 @@ function applyRebuild(
       mode,
       report.applied,
       undefined,
-      report.counts
+      report.counts,
+      report.discarded
     )
   }
 
@@ -439,6 +447,8 @@ interface ApplyReport {
   violations: string[]
   /** アプリの表に当てた差の内訳（入れ替える**前**に数える） */
   counts: RowsRebuildCounts
+  /** 版ごと落とした行（原則4） */
+  discarded: RebuildPlanDiscarded[]
 }
 
 /** トランザクションの中身（設計書 §3.7.2 の箱の中）。 */
@@ -465,8 +475,11 @@ function applyPlan(
   restoreApplicationTriggers(db, dropped)
   const violations = checkForeignKeys(db, applied, touched)
   if (violations.length > 0) {
-    return { applied, touched, violations, counts }
+    return { applied, touched, violations, counts, discarded: [] }
   }
+  // 親が削除されている子の版を落とす（原則4）。**外部キーの検査を通ってから**
+  // 落とすのは、巻き戻す回で版を失わないためである
+  const discarded = dropDiscardedVersions(db, plan, applied)
   // 旗が立っている間に消す（下ろしてから消すと、その間の汚れまで消える）
   if (applied.length > 0) {
     db.prepare(
@@ -477,7 +490,43 @@ function applyPlan(
   }
   lowerFlag(db)
   void options
-  return { applied, touched, violations, counts }
+  return { applied, touched, violations, counts, discarded }
+}
+
+/**
+ * 親が削除されている子の版を `_sns_rows_<表>` から落とす（原則4）。
+ *
+ * 落とすのは**適用した表のぶんだけ**。祖先について計算しただけの表には触らない。
+ *
+ * 墓標は書かない。親の削除の版がすでに他のクライアントへ渡っており、
+ * 同じ計算をすれば同じ子が落ちる。子ごとに墓標を書くと、
+ * `ON DELETE CASCADE` の連鎖1回で `_tombstone` が子孫の数だけ膨らむ。
+ *
+ * @returns 実際に落ちた行（落ちなかったぶんは載せない）
+ */
+function dropDiscardedVersions(
+  db: Database.Database,
+  plan: RebuildPlan,
+  applied: readonly string[]
+): RebuildPlanDiscarded[] {
+  if (plan.discarded.length === 0) return []
+  const appliedSet = new Set(applied.map(foldIdentifier))
+  const dropped: RebuildPlanDiscarded[] = []
+  const statements = new Map<string, Database.Statement>()
+  for (const entry of plan.discarded) {
+    if (!appliedSet.has(foldIdentifier(entry.table))) continue
+    let statement = statements.get(entry.table)
+    if (statement === undefined) {
+      const primaryKey = primaryKeyColumn(db, entry.table).name
+      statement = db.prepare(
+        `DELETE FROM ${escapeIdentifier(rowsTableName(entry.table))}
+          WHERE CAST(${escapeIdentifier(primaryKey)} AS TEXT) = ?`
+      )
+      statements.set(entry.table, statement)
+    }
+    if (statement.run(entry.trueId).changes > 0) dropped.push(entry)
+  }
+  return dropped
 }
 
 /**
@@ -838,7 +887,8 @@ function rewriteOutputs(
     hidden.run(entry.table, entry.trueId, entry.winnerId)
   }
   // `_sns_unplaceable` は**警告の重複を避けるため**の表なので、すでに知らせた
-  // 行の `noticedAt` は残す。いま置けるようになった行だけを落とす
+  // 行は消さずに残し（行があれば同じ警告を繰り返さない）、いま置けるようになった
+  // 行だけを落とす
   const keep = new Set(
     plan.unplaceable
       .filter((entry) => appliedSet.has(foldIdentifier(entry.table)))
@@ -858,14 +908,14 @@ function rewriteOutputs(
     remove.run(row.tableName, row.trueId)
   }
   const upsert = db.prepare(
-    `INSERT INTO "_sns_unplaceable" ("tableName", "trueId", "reasonKind", "reason")
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO "_sns_unplaceable" ("tableName", "trueId", "reason")
+     VALUES (?, ?, ?)
      ON CONFLICT ("tableName", "trueId") DO UPDATE SET
-       "reasonKind" = "excluded"."reasonKind", "reason" = "excluded"."reason"`
+       "reason" = "excluded"."reason"`
   )
   for (const entry of plan.unplaceable) {
     if (!appliedSet.has(foldIdentifier(entry.table))) continue
-    upsert.run(entry.table, entry.trueId, entry.reasonKind, entry.reason)
+    upsert.run(entry.table, entry.trueId, entry.reason)
   }
 }
 
@@ -887,7 +937,8 @@ function outcome(
   mode: 'normal' | 'merged',
   tables: string[],
   reason?: string,
-  counts?: RowsRebuildCounts
+  counts?: RowsRebuildCounts,
+  discarded?: RebuildPlanDiscarded[]
 ): RowsRebuildOutcome {
   return {
     status,
@@ -898,6 +949,7 @@ function outcome(
     warnings: [...state.warnings],
     reason,
     counts: counts ?? { inserted: 0, updated: 0, deleted: 0 },
+    discarded: discarded ?? [],
   }
 }
 
@@ -919,7 +971,13 @@ function hasWork(db: Database.Database, options: RowsRebuildOptions): boolean {
   return db.prepare(`SELECT 1 FROM "_sns_dirty" LIMIT 1`).get() !== undefined
 }
 
-/** ライブラリの表を除いた、この DB のふつうの表。 */
+/**
+ * ライブラリの表を除いた、この DB のふつうの表。
+ *
+ * `_heartbeat` と `_id_merge` は**もう作らない**が、除外の名前は残す。旧版で
+ * 作られた DB にはこれらの表がまだ在りうるので、外すと「アプリの表」として
+ * 拾われてしまう。
+ */
 function allUserTables(db: Database.Database): string[] {
   return (
     db

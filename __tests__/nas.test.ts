@@ -7,7 +7,6 @@ import {
   copyToNas,
   ensureDirectory,
   listRemoteClients,
-  openRemoteDb,
   openRemoteDbViaLocalCopy,
 } from '../src/nas'
 
@@ -310,32 +309,6 @@ describe('NASが思いどおりでないとき', () => {
       ensureDirectory(dir)
       expect(() => ensureDirectory(dir)).not.toThrow()
       expect(fs.existsSync(dir)).toBe(true)
-    })
-  })
-
-  describe('openRemoteDb（旧API）', () => {
-    it('存在しないファイルなら null', () => {
-      expect(openRemoteDb(path.join(testDir, 'none.sqlite'))).toBeNull()
-    })
-
-    it('壊れたファイルなら null', () => {
-      const badPath = path.join(testDir, 'bad.sqlite')
-      fs.writeFileSync(badPath, 'not a database')
-      expect(openRemoteDb(badPath)).toBeNull()
-    })
-
-    it('健全なファイルなら読み取り専用で開ける', () => {
-      const okPath = path.join(testDir, 'ok.sqlite')
-      const db = new Database(okPath)
-      db.exec(`CREATE TABLE t (id TEXT PRIMARY KEY)`)
-      db.close()
-
-      const remote = openRemoteDb(okPath)
-      expect(remote).not.toBeNull()
-      expect(() =>
-        remote!.prepare(`INSERT INTO t (id) VALUES (?)`).run('x')
-      ).toThrow()
-      remote!.close()
     })
   })
 })

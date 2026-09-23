@@ -125,6 +125,39 @@ describe('旧方式の DB を案A へ移す', () => {
     expect(needsRowsMigration(db)).toBe(false)
   })
 
+  it('旧方式の `_heartbeat` は、表もトリガーも撤去される', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', NULL, '2026-01-01')`
+    ).run()
+    // 旧版の DB には表とトリガー2本が在る
+    expect(
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE name LIKE '%heartbeat%' ORDER BY name`
+        )
+        .all()
+    ).toEqual([
+      { name: '_changelog_after_insert__heartbeat' },
+      { name: '_changelog_after_update__heartbeat' },
+      { name: '_heartbeat' },
+      { name: 'sqlite_autoindex__heartbeat_1' },
+    ])
+
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+
+    expect(
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE name LIKE '%heartbeat%'`)
+        .all()
+    ).toEqual([])
+
+    // 撤去したあとも、表の付け替え（`ALTER TABLE … RENAME`）が通る
+    expect(() =>
+      migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+    ).not.toThrow()
+  })
+
   it('時刻列が無い表では `_sns_ts` が NULL になる', () => {
     const db = legacyDb(
       [`CREATE TABLE plain (id TEXT PRIMARY KEY NOT NULL, v TEXT)`],
@@ -360,6 +393,119 @@ describe('旧方式の DB を案A へ移す', () => {
     expect(b.prepare(`SELECT title FROM notes`).get()).toEqual({
       title: '新しい',
     })
+  })
+})
+
+/* ================================================================== *
+ * 誰も読まない内部の列の撤去
+ * ================================================================== */
+
+describe('誰も読まない内部の列を落とす', () => {
+  function columnsOf(db: Database.Database, table: string): string[] {
+    return (
+      db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    ).map((row) => row.name)
+  }
+
+  /**
+   * 0.20.0 の形の DB を作る。案A へ移したあと、0.20.0 が作っていた列を手で足す
+   * （`_tombstone.revokedAt` はさらに前の版が足していた列）。
+   */
+  function version020Db(): Database.Database {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO notes VALUES ('n1', 'いち', 'ほん', '2026-01-01')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    db.exec(`ALTER TABLE _tombstone ADD COLUMN mergedInto TEXT`)
+    db.exec(`ALTER TABLE _tombstone ADD COLUMN revokedAt TEXT`)
+    db.exec(`ALTER TABLE _sns_unplaceable ADD COLUMN reasonKind TEXT`)
+    db.exec(
+      `ALTER TABLE _sns_unplaceable ADD COLUMN noticedAt TEXT NOT NULL DEFAULT '2026-01-01'`
+    )
+    db.exec(
+      `ALTER TABLE _changelog_prune ADD COLUMN prunedAt TEXT NOT NULL DEFAULT '2026-01-01'`
+    )
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt, mergedInto)
+       VALUES ('notes', 'gone', '2026-01-02', 'n1')`
+    ).run()
+    db.prepare(
+      `INSERT INTO _sns_unplaceable (tableName, trueId, reasonKind, reason)
+       VALUES ('notes', 'x1', 'constraint', 'CHECK')`
+    ).run()
+    db.prepare(
+      `INSERT INTO _changelog_prune (onlyRow, prunedThroughId) VALUES (0, 7)
+       ON CONFLICT (onlyRow) DO UPDATE SET prunedThroughId = 7`
+    ).run()
+    db.exec(`ALTER TABLE _sync_state ADD COLUMN lastSyncedAt TEXT`)
+    db.prepare(
+      `INSERT OR REPLACE INTO _sync_state (remoteClientId, lastSeenId, lastSyncedAt)
+       VALUES ('peer', 5, '2026-01-03')`
+    ).run()
+    return db
+  }
+
+  it('0.20.0 の形の DB から、使わない列が消え、中身は残る', () => {
+    const db = version020Db()
+    expect(columnsOf(db, '_tombstone')).toContain('mergedInto')
+
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+
+    expect(columnsOf(db, '_tombstone')).not.toContain('mergedInto')
+    expect(columnsOf(db, '_tombstone')).not.toContain('revokedAt')
+    expect(columnsOf(db, '_sns_unplaceable')).toEqual([
+      'tableName',
+      'trueId',
+      'reason',
+    ])
+    expect(columnsOf(db, '_changelog_prune')).toEqual([
+      'onlyRow',
+      'prunedThroughId',
+    ])
+    // 行はそのまま残る
+    expect(tombstonesOf(db).map((row) => row.recordId)).toEqual(['gone'])
+    expect(db.prepare(`SELECT * FROM _sns_unplaceable`).all()).toEqual([
+      { tableName: 'notes', trueId: 'x1', reason: 'CHECK' },
+    ])
+    expect(db.prepare(`SELECT * FROM _changelog_prune`).all()).toEqual([
+      { onlyRow: 0, prunedThroughId: 7 },
+    ])
+    // `_sync_state` は移行が毎回空にする（手順7。移行のあとはフルマージさせる）ので、列だけ見る
+    expect(columnsOf(db, '_sync_state')).toEqual([
+      'remoteClientId',
+      'lastSeenId',
+    ])
+    // 落としたあともトリガーが墓標を書ける
+    db.prepare(`DELETE FROM notes WHERE id = 'n1'`).run()
+    expect(tombstonesOf(db).map((row) => row.recordId)).toEqual(['gone', 'n1'])
+  })
+
+  it('二度走らせても落ちない（列が無ければ何もしない）', () => {
+    const db = version020Db()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a2' })
+    expect(() =>
+      migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a3' })
+    ).not.toThrow()
+    expect(columnsOf(db, '_sns_unplaceable')).toEqual([
+      'tableName',
+      'trueId',
+      'reason',
+    ])
+  })
+
+  it('旧方式の DB からも落とす（`_heartbeat` のトリガーを先に落とすので通る）', () => {
+    const db = legacyDb()
+    // 旧方式の `_changelog_prune` は `prunedAt` を持ち、`_heartbeat` のトリガーもある
+    expect(columnsOf(db, '_changelog_prune')).toContain('prunedAt')
+    expect(triggerNamesOf(db).has('_changelog_after_insert__heartbeat')).toBe(
+      true
+    )
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    expect(columnsOf(db, '_changelog_prune')).toEqual([
+      'onlyRow',
+      'prunedThroughId',
+    ])
   })
 })
 

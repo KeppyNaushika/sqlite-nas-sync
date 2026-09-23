@@ -177,10 +177,11 @@ describe('無駄な転送の抑制', () => {
   it('手元が変われば上げる', async () => {
     const pathA = createDb('a')
     const syncA = setupSync(makeConfig(pathA, 'a'))
-    // 1回目は必ず上げる。2回目は heartbeat が `_changelog` に1件足した直後なので
-    // まだ上げる（1日1回）。3回目で落ち着く
-    await syncA.syncNow()
-    await syncA.syncNow()
+    // 1回目は必ず上げる。2回目も上げる —— 1回目は写しを作った**あと**に手元が
+    // 動いている（下ごしらえと作り直し）ので、写しと手元が食い違ったままに
+    // ならないよう上げ直す。3回目で落ち着く
+    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
+    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
 
     write(pathA, 'n-a', 'from a', '2026-09-01T00:00:00.000Z')
