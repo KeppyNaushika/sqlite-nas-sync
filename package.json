@@ -1,6 +1,6 @@
 {
   "name": "sqlite-nas-sync",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "Sync SQLite databases across multiple clients via NAS by exchanging per-row versions and rebuilding the app tables from them",
   "type": "commonjs",
   "exports": {

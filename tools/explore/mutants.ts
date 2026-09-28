@@ -290,8 +290,8 @@ export const MUTANTS: Mutant[] = [
     description:
       '4本のトリガーの番人（`GUARD`。src/rows/triggers.ts）を外す。作り直しの適用は' +
       'アプリの表から行を消して入れ直すので、番人が無いと**適用そのものが削除の版を作り**、' +
-      '他端末のその行を消す（設計書 §3.7.2 の旗 `_sns_rebuilding`）。判定2（同期が事実を作らない）・' +
-      '判定17（適用で lamport・_tombstone・_sns_dirty が増えない）・判定1 で出ること。',
+      '他端末のその行を消す（設計書 §3.7.2 の旗 `_sns_rebuilding`）。適用のたびに新しい版ができるので' +
+      '同期が止まらず、「不動点に達しない」反例が遷移1回で出ること。',
     suggestedArgs: '--tables tags --ids 2 --keys 1 --depth 2',
     edits: [
       {
