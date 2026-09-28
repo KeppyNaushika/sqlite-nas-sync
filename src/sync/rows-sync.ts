@@ -7,7 +7,7 @@
  * | --- | --- |
  * | 0 | `writeSchemaVersion`。**取り込みより前**に §3.10 の復元・巻き戻りの判定。仕掛けの欠けの確認と手当て |
  * | 1 | 相手の列挙と、隙間の事前確認 |
- * | 2 | 隙間なし: 印 → 写し → 取り合いの確認 → 相手ごとに取り込み → 作り直し。隙間あり: 取り込み → 作り直し → 印 → 写し → 取り合いの確認 |
+ * | 2 | 相手ごとに取り込み → 作り直し → 印 → 写し → 取り合いの確認 |
  * | 3〜5 | `cleanupChangelog`、`onAfterSync` |
  *
  * **やっても何も変わらない転送はしない**（`sync/idle`）。段階1 で相手のファイルの
@@ -56,8 +56,6 @@ import {
 import {
   IdleMemory,
   canSkipPush,
-  forgetPushIfChanged,
-  totalChanges,
   canSkipRemoteRead,
   canSkipRestoreCheck,
   createIdleMemory,
@@ -236,6 +234,9 @@ export async function performRowsSync(
     result.warnings.push(
       `欠けていた同期の仕組みを作り直した（${migrationWording(migration.from)}）`
     )
+    // 取り付け直しは `_tombstone` や `_changelog` を作り直す。印が前と同じ値に
+    // 戻ることもありうるので、印に頼らず必ず上げ直す
+    idle.push = null
   }
   const instanceId =
     state.instanceId ?? readSnsMeta(localDb, SNS_META_KEYS.instanceId) ?? ''
@@ -309,10 +310,6 @@ export async function performRowsSync(
       // 印 → 写し → 取り合いの確認（§3.10）。**印は写しの前**でなければ、
       // 写しの中に次回比べる値が入らない
       markBeforeCopy(localDb, instanceId)
-      // 写す中身が決まった瞬間を覚えておく（`PushMemo.changesAtCopy`）。
-      // 写している最中の書き込みは「写しに入っていない」側へ倒したいので、
-      // `backup()` を呼ぶ**前**に測る
-      const changesAtCopy = totalChanges(localDb)
       const written = await copyToNas(localDb, config.nasPath, config.clientId)
       transfers.uploads += 1
       transfers.bytes += fileSize(selfPath)
@@ -335,7 +332,7 @@ export async function performRowsSync(
           return false
         }
       }
-      idle.push = { fingerprint, selfStamp: nowStamp, changesAtCopy }
+      idle.push = { fingerprint, selfStamp: nowStamp }
       return true
     }
 
@@ -345,17 +342,24 @@ export async function performRowsSync(
     // 隠れた行の差分は**作り直しの直後**に取る。写しの `await` を挟むと、その間に
     // アプリが書いた行まで「統合が解けた」の判定に混ざる。また、写しで止まったときに
     // 差分を載せずに返すと、次の回の「前」はもう新しい状態なので、二度と知らせられない
-    if (!hasAnyGap) {
-      if (!(await publish())) return stop(localDb, config, result)
-      importAll(localDb, peers, schemaVersion, specs, idle, result)
+    // 上げるのは取り込みと作り直しの**あと**である。取り込みで変わった版は、
+    // 中継の通知と一緒にこの回の写しに載る。先に上げると、それが載るのは次の回になり、
+    // その回の上げ直しを読んだ相手がさらに次の回に上げ直す、と転送が1巡ずつ後ろへ延びる。
+    // 作り直しが例外で止まっても、取り込んだ版と手元の書き込みは上げてから投げ直す。
+    // 作り直しの失敗は版の表を巻き戻さないので、上げる中身は変わらない
+    importAll(localDb, peers, schemaVersion, specs, idle, result)
+    let rebuildFailed = false
+    let rebuildError: unknown
+    try {
       await rebuild(localDb, config, tableNames, state, result)
       reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
-    } else {
-      importAll(localDb, peers, schemaVersion, specs, idle, result)
-      await rebuild(localDb, config, tableNames, state, result)
-      reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
-      if (!(await publish())) return stop(localDb, config, result)
+    } catch (error) {
+      rebuildFailed = true
+      rebuildError = error
     }
+    const published = await publish()
+    if (rebuildFailed) throw rebuildError
+    if (!published) return stop(localDb, config, result)
   } finally {
     for (const peer of peers) peer.handle?.cleanup()
   }
@@ -372,10 +376,6 @@ export async function performRowsSync(
   cleanupChangelog(localDb, retentionDays)
   const pruneWall = describeChangelogPruneWall(localDb, retentionDays)
   if (pruneWall) result.warnings.push(pruneWall)
-
-  // 写しを作ってから手元が動いていたら（作り直しが表を入れ替えた、など）、
-  // 上げた覚えを捨てて次の回に上げ直す
-  forgetPushIfChanged(idle, localDb)
 
   if (config.onAfterSync) config.onAfterSync(localDb, result)
   return result
@@ -488,6 +488,9 @@ function importAll(
         )
         continue
       }
+      // `Max` を変えずに格納した版は印に表れない。他の端末が読む帳簿は
+      // 変わっているので、上げた覚えを捨てて上げ直す
+      if (imported.storedQuietly > 0) idle.push = null
       result.skipped += imported.skipped
       result.conflictsResolved += imported.conflicts
       for (const skippedTable of imported.skippedTables) {

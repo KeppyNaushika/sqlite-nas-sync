@@ -15,6 +15,8 @@ import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
 import { SyncConfig, SyncInstance, SyncTransfers } from '../src/types'
 import { FORCE_EVERY } from '../src/sync/idle'
+import { performSync } from '../src/sync'
+import { createRebuildState } from '../src/rows/rebuild'
 
 /** 手元へ写した回数を数える（写した直後の `query_only = ON` を数える）。 */
 const copyCounter = { copies: 0 }
@@ -187,19 +189,13 @@ describe('無駄な転送の抑制', () => {
   it('手元が変われば上げる', async () => {
     const pathA = createDb('a')
     const syncA = setup(makeConfig(pathA, 'a'))
-    // 1回目は必ず上げる。2回目も上げる —— 1回目は写しを作った**あと**に手元が
-    // 動いている（下ごしらえと作り直し）ので、写しと手元が食い違ったままに
-    // ならないよう上げ直す。3回目で落ち着く
-    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
+    // 1回目は必ず上げる。2回目は何も変わっていないので上げない
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
 
     write(pathA, 'n-a', 'from a', '2026-09-01T00:00:00.000Z')
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
-    // その回は、写しを作った**あと**に作り直しが表を入れ替えている。写しが手元と
-    // 食い違ったままにならないよう、もう1回だけ上げる
-    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
-    // そこからは、また何も変わっていない
+    // 作り直しがアプリの表を入れ替えても、他の端末が読む部分は変わらないので上げ直さない
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
     expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
   })
@@ -222,7 +218,7 @@ describe('無駄な転送の抑制', () => {
     expect(rows(pathA).map((row) => row.id)).toEqual(['n-b'])
   })
 
-  it('取り込んだ回の次は、自分から上げ直す（中継が止まらない）', async () => {
+  it('取り込みで手元が変わった回は、その回のうちに上げる（中継が止まらない）', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
     const syncA = setup(makeConfig(pathA, 'a'))
@@ -234,16 +230,115 @@ describe('無駄な転送の抑制', () => {
     await syncA.syncNow()
     await syncA.syncNow()
 
-    // ここからは隙間なしの経路。上げるのが取り込みの**前**なので、取り込んだ
-    // 事実が写しに載るのは次の回である
+    // ここからは隙間なしの経路。上げるのは取り込みの**あと**なので、取り込んだ
+    // 版と中継の通知はこの回の写しに載る
     write(pathB, 'n-b1', 'from b', '2026-09-02T00:00:00.000Z')
     await syncB.syncNow()
     const importing = await syncA.syncNow()
     expect(importing.hadChangelogGap).toBe(false)
     expect(rows(pathA).map((row) => row.id)).toEqual(['n-b0', 'n-b1'])
+    expect(transfersOf(importing.transfers).uploads).toBe(1)
+    const copy = new Database(path.join(nasDir, 'client-a.sqlite'), {
+      readonly: true,
+    })
+    const relayed = copy
+      .prepare(`SELECT id FROM _sns_rows_notes ORDER BY id`)
+      .all() as { id: string }[]
+    copy.close()
+    expect(relayed.map((row) => row.id)).toEqual(['n-b0', 'n-b1'])
 
-    // 取り込みで手元が変わったので、次の回は必ず上げる（中継が止まらない）
-    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(1)
+    // 次の回は、もう上げるものが無い
+    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
+  })
+
+  it('取り込みが Max を変えずに版を格納した回も、上げ直す', async () => {
+    const pathA = createDb('a')
+    const pathB = createDb('b')
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
+    write(pathA, 'x', 'v1', '2026-09-01T00:00:00.000Z')
+    await syncA.syncNow()
+    await syncB.syncNow()
+    expect(rows(pathB).map((row) => row.id)).toEqual(['x'])
+
+    // A と B がそれぞれ x を消す。削除の版の時刻は実行した時刻なので、あとから
+    // 消した B の削除の版の方が強い
+    const remove = (dbPath: string): void => {
+      const db = new Database(dbPath)
+      db.prepare(`DELETE FROM notes WHERE id = 'x'`).run()
+      db.close()
+    }
+    remove(pathA)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    remove(pathB)
+
+    // A は x を未来の時刻で書き直して上げる。この行の版はどちらの削除の版よりも強い
+    write(pathA, 'x', 'v2', '2099-01-01T00:00:00.000Z')
+    await syncA.syncNow()
+    // B は A の行の版を取り込んで上げる。B の `_tombstone` には B の削除の版が残る
+    await syncB.syncNow()
+
+    // A は B の削除の版を取り込む。手元の削除の版より強いので格納するが、
+    // 行の版の方が強いので Max は変わらず、通知も書かない
+    const quiet = await syncA.syncNow()
+    expect(rows(pathA)).toEqual([
+      { id: 'x', body: 'v2', updatedAt: '2099-01-01T00:00:00.000Z' },
+    ])
+    expect(transfersOf(quiet.transfers).uploads).toBe(1)
+
+    const tombstoneOf = (dbPath: string): unknown => {
+      const db = new Database(dbPath, { readonly: true })
+      const row = db
+        .prepare(
+          `SELECT _sns_ts, _sns_lamport, _sns_instance FROM _tombstone
+            WHERE tableName = 'notes' AND recordId = 'x'`
+        )
+        .get()
+      db.close()
+      return row
+    }
+    expect(tombstoneOf(path.join(nasDir, 'client-a.sqlite'))).toEqual(
+      tombstoneOf(pathB)
+    )
+  })
+
+  it('作り直しが例外で止まっても、取り込んだ版を上げてから投げ直す', async () => {
+    const pathA = createDb('a')
+    const pathB = createDb('b')
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
+    await syncA.syncNow()
+    write(pathB, 'n-b', 'from b', '2026-09-01T00:00:00.000Z')
+    await syncB.syncNow()
+
+    // A の作り直しを、見送りにならない例外で止める
+    const db = new Database(pathA)
+    db.pragma('foreign_keys = ON')
+    db.pragma('recursive_triggers = ON')
+    try {
+      await expect(
+        performSync(db, makeConfig(pathA, 'a'), [{ name: 'notes' }], {
+          rebuild: createRebuildState(),
+          forceMainThread: true,
+          hooks: {
+            beginImmediate: () => {
+              throw new Error('作り直しの失敗')
+            },
+          },
+        })
+      ).rejects.toThrow('作り直しの失敗')
+    } finally {
+      db.close()
+    }
+
+    // アプリの表には入っていないが、取り込んだ版は A の写しに載っている
+    expect(rows(pathA)).toEqual([])
+    const copy = new Database(path.join(nasDir, 'client-a.sqlite'), {
+      readonly: true,
+    })
+    const relayed = copy.prepare(`SELECT id FROM _sns_rows_notes`).all()
+    copy.close()
+    expect(relayed).toEqual([{ id: 'n-b' }])
   })
 
   it('自分の写しを自分以外が書いたら、上げない回でも気づいて上げ直す', async () => {

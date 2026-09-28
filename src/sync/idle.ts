@@ -16,7 +16,7 @@
  * | 抑制 | 落としてよい条件 | なぜ何も変わらないか |
  * | --- | --- | --- |
  * | 相手を読まない | 相手のファイルの印（{@link fileStamp}）が前に読んだときと同じで、かつ手元の `lastSeenId` もあのときのまま | 前の回に読んだとき、**同じファイルを同じ手元の位置でもう一度読んでも何も起きない**と確かめた相手だけを覚えている（{@link RemoteReadMemo.verified}）。確かめ方は2つで、差分もフルマージも残っていないこと（{@link readWouldBeNoOp}）か、その回の取り込みが何も動かさなかったことである。後者はフルマージで読んだ相手にも当てはまる。同じファイル・同じ位置なら答えも同じ |
- * | 自分を上げない | 手元の印（{@link localPushFingerprint}）が前に上げたときと同じ | 上げ直しても、写しの中身は generation が1つ進む以外に違いが無い。相手が読むのは事実であって generation ではない |
+ * | 自分を上げない | 手元の印（{@link localPushFingerprint}）が前に上げたときと同じで、上げた覚えも捨てられていない | 上げ直しても、他の端末が読む表は generation が1つ進む以外に変わらない。相手が読むのは事実であって generation ではない |
  * | 自分の写しを読まない（復元の判定） | NAS 上の自分の写しの印が、自分が最後に上げたときのままである | その写しは自分が書いたものだと分かっている。`lamport` は手元で単調なので、写しに残した値より小さくなりようが無い |
  * | 取り合いの確認で読まない | 上げた直後の自分の写しの印が、いま自分が書いた一時ファイルの印と同じ | `rename` は inode を持ち越す。印が同じならその実体は**自分が書いたもの**であり、`sns.instanceId` を読むまでもなく自分のものである |
  *
@@ -84,20 +84,6 @@ export interface PushMemo {
   fingerprint: string
   /** 上げた直後の、NAS 上の自分の写しの印。読めなければ `null` */
   selfStamp: FileStamp | null
-  /**
-   * 写しへ入る中身を決めた瞬間の `total_changes()`（この接続が変えた行の総数）。
-   *
-   * **これが要る理由**: {@link localPushFingerprint} は lamport・`_sns_tick`・`_changelog` などしか見ない。
-   * **作り直し**の書き込みは版を作らないので lamport も `_sns_tick` も進めない。
-   * それでも作り直しはアプリの表や `_sns_shown` / `_sns_hidden` / `_sns_dirty` を入れ替え、親の削除にあわせて `_sns_rows_<表>` から子のバージョンを消す（原則4）。
-   * 最後のものは相手が読む部分なので、上げ直さないと、相手が読む写しと手元とで中身が食い違ったままになる。
-   * この値との突き合わせで、こうした書き込みを拾って上げ直す。
-   *
-   * 同期の終わりにこの値と突き合わせ、動いていたら覚えを捨てて次の回に上げ直す。
-   * 測るのは `backup()` を呼ぶ**直前**である —— 写している最中の書き込みは
-   * 写しに入ったか分からないので、「入っていない」側（＝上げ直す側）へ倒す
-   */
-  changesAtCopy: number
 }
 
 /**
@@ -146,10 +132,10 @@ function forcedRound(memory: IdleMemory): boolean {
 }
 
 /**
- * 手元の印。**これが前に上げたときと同じなら、上げ直しても写しの中身は変わらない。**
+ * 手元の印。**これが前に上げたときと同じなら、上げ直しても、他の端末が読む部分は変わらない。**
  *
+ * 他の端末が読むのは `_sns_rows_<表>`・`_tombstone`・`_changelog`・`_changelog_prune`・`_sync_meta` だけである（設計書 §3.1）。
  * 見るのは、次の値である。
- * 作り直しの書き込みはここに現れないので、{@link PushMemo.changesAtCopy} で別に拾う。
  *
  * | 値 | これが拾うもの |
  * | --- | --- |
@@ -161,6 +147,15 @@ function forcedRound(memory: IdleMemory): boolean {
  *
  * 逆に**入れてはいけない**のが `sns.generation` と `sns.lastLamport` である。
  * どちらも上げるたびに変わるので、入れると「上げたから次も上げる」が永久に続く。
+ *
+ * 他の端末が読む部分への書き込みのうち、ここに表れないものが2つある。
+ * どちらも、書いた側が上げた覚え（{@link IdleMemory.push}）を捨てて上げ直させる。
+ *
+ * - 取り込みが `Max` を変えずに版を格納したとき（`importFromPeer` の `storedQuietly`）
+ * - 仕掛けの取り付け直しが `_tombstone` と `_changelog` を作り直したとき
+ *
+ * 作り直しと `_sync_state` の書き込みは、他の端末が読まない表にしか書かないので、上げ直す理由にならない。
+ * 作り直しは `_sns_rows_<表>` を書かない（設計書 §3.7.2）。
  */
 export function localPushFingerprint(
   db: Database.Database,
@@ -228,27 +223,6 @@ export function readWouldBeNoOp(
 ): boolean {
   if (needsFullMerge(peerDb, lastSeenId)) return false
   return readChangelog(peerDb, lastSeenId).length === 0
-}
-
-/** この接続がこれまでに変えた行の数（トリガーの分も入る）。 */
-export function totalChanges(db: Database.Database): number {
-  const row = db.prepare(`SELECT total_changes() AS n`).get() as {
-    n: number | bigint
-  }
-  return Number(row.n)
-}
-
-/**
- * 写しを作ってから手元が動いていたら、上げた覚えを捨てる（同期の終わりに呼ぶ）。
- *
- * 捨てると次の回は必ず上げ直す。動いていなければ、写しは手元そのものである。
- */
-export function forgetPushIfChanged(
-  memory: IdleMemory,
-  db: Database.Database
-): void {
-  if (memory.push === null) return
-  if (totalChanges(db) !== memory.push.changesAtCopy) memory.push = null
 }
 
 /**
