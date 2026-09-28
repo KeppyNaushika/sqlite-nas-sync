@@ -1,14 +1,19 @@
 /**
  * DBスキーマのバリデーションおよび同期対象テーブルの自動検出機能。
  *
- * - {@link validateDatabase}: 与えられたテーブル群が必要な構造（TEXT型PK、updatedAtカラム）を満たすか検証
+ * - {@link validateDatabase}: 与えられたテーブル群が必要な構造（設定の主キー列が宣言された主キーでTEXT型、updatedAtカラム）を満たすか検証
  * - {@link discoverTables}: SQLiteの `sqlite_master` から同期可能なテーブルを自動検出
  *
  * @module validator
  */
 import Database from 'better-sqlite3'
 import { DiscoverOptions, TableConfig, TableOptions, DEFAULTS } from './types'
-import { foldIdentifier, isSameIdentifier } from './setup/sql'
+import {
+  ColumnInfo,
+  escapeIdentifier,
+  foldIdentifier,
+  isSameIdentifier,
+} from './setup/sql'
 
 /**
  * バリデーションエラーの詳細。
@@ -22,31 +27,21 @@ interface ValidationError {
   message: string
 }
 
-/** @internal SQLiteの `PRAGMA table_info` が返すカラム情報 */
-interface ColumnInfo {
-  cid: number
-  name: string
-  type: string
-  notnull: number
-  dflt_value: unknown
-  pk: number
-}
-
-/**
- * SQL識別子をダブルクォートでエスケープする。
- * @internal
- */
-function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`
-}
-
 /**
  * データベースのスキーマをバリデーションする。
  *
  * 各テーブルに対して以下をチェックする:
- * 1. テーブルが存在するか
- * 2. 指定された主キーカラムが存在し、TEXT型であるか
+ * 1. 指定された主キーカラムが存在し、TEXT型であるか
+ * 2. 表が主キーを1列だけ宣言しているなら、それが指定された主キーカラムであるか
  * 3. `updatedAt` カラムが存在するか
+ *
+ * 2 が要るのは、同期が使う主キーは表で宣言された主キーであって、設定の名前ではないからである。
+ * 一致を確かめないと、`id TEXT` と `uuid TEXT PRIMARY KEY` を持つ表が、設定では `id` を指しているのに `uuid` をキーにして同期される。
+ * 大文字小文字の違いは同じ列とみなす。
+ * 主キーが無い表と複合主キーの表は、`setupSync` の前提の確認（`src/setup/rows-preflight.ts`）が例外にする。
+ *
+ * テーブルが存在するかは見ない。
+ * 呼び出し元の `setupSync` は {@link discoverTables} が `sqlite_master` から見つけた表だけを渡す。
  *
  * @param db - 検証対象のSQLiteデータベース接続
  * @param tables - 検証するテーブル設定の配列
@@ -70,17 +65,8 @@ export function validateDatabase(
 
   for (const tableConfig of tables) {
     const table = tableConfig.name
-    const timestampColumn = tableConfig.timestampColumn ?? 'updatedAt'
-
-    // テーブル存在確認
-    const exists = db
-      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
-      .get(table)
-
-    if (!exists) {
-      errors.push({ table, message: `Table does not exist` })
-      continue
-    }
+    const timestampColumn =
+      tableConfig.timestampColumn ?? DEFAULTS.timestampColumn
 
     // カラム情報取得
     const columns = db
@@ -95,6 +81,22 @@ export function validateDatabase(
       errors.push({
         table,
         message: `Primary key column '${primaryKey}' does not exist`,
+      })
+      continue
+    }
+
+    // 宣言された主キーが設定の主キー列であること
+    const declared = columns.filter((col) => col.pk > 0)
+    if (
+      declared.length === 1 &&
+      !isSameIdentifier(declared[0].name, primaryKey)
+    ) {
+      errors.push({
+        table,
+        message:
+          `Primary key column '${primaryKey}' is not the declared PRIMARY KEY ` +
+          `(the table declares '${declared[0].name}'). Set primaryKey to the ` +
+          `declared primary key column, or declare '${primaryKey}' as the PRIMARY KEY`,
       })
       continue
     }
@@ -206,7 +208,8 @@ export function discoverTables(
 
     // tableOptions で timestampColumn が上書きされていればそれを優先
     const overrides = optionsFor(name)
-    const timestampColumn = overrides?.timestampColumn ?? 'updatedAt'
+    const timestampColumn =
+      overrides?.timestampColumn ?? DEFAULTS.timestampColumn
 
     // **表が宣言している綴りへ解決してから載せる。** 以降の処理は、この名前を
     // SQLにも**レコードのキーにも**使う。`SELECT *` が返すキーは宣言どおりの綴りな

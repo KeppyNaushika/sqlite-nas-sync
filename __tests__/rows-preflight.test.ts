@@ -222,15 +222,106 @@ describe('checkRowsPreconditions —— P8（決定的でないもの）（完�
   })
 })
 
-describe('checkRowsPreconditions —— 時刻列（穴7・§1.2.3）', () => {
-  it('時刻列に BLOB があれば例外', () => {
+describe('checkRowsPreconditions —— 時刻列（P15・穴7）', () => {
+  /** 時刻列に1つずつ値を入れた表を作り、前提の検査の例外を返す。 */
+  function rejectionOf(values: unknown[], declaration = 'updatedAt'): string {
     const db = open([
-      `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, updatedAt)`,
+      `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, ${declaration})`,
     ])
     try {
-      db.prepare(`INSERT INTO t VALUES ('a', ?)`).run(Buffer.from('x', 'utf8'))
+      const insert = db.prepare(`INSERT INTO t VALUES (?, ?)`)
+      values.forEach((value, at) => insert.run(`r${at}`, value))
+      try {
+        checkRowsPreconditions(db, [{ name: 't' }], {
+          now: () => Date.parse('2026-01-01T00:00:00.000Z'),
+        })
+      } catch (error) {
+        return (error as Error).message
+      }
+      throw new Error('例外にならなかった')
+    } finally {
+      db.close()
+    }
+  }
+
+  it.each([
+    ['整数', 1767225600000, '1767225600000'],
+    ['実数', 2460676.5, '2460676.5'],
+    ['ISO でない文字列', 'yesterday', "'yesterday'"],
+    ['NULL', null, 'NULL'],
+    ['BLOB', Buffer.from('x', 'utf8'), 'BLOB（1 バイト）'],
+  ])('時刻列に %s があれば例外', (_label, value, shown) => {
+    const message = rejectionOf(['2026-01-01T00:00:00.000Z', value])
+    expect(message).toContain(
+      '同期する表 t の時刻列 updatedAt に、ISO-8601 の文字列でない値が 1 件ある'
+    )
+    expect(message).toContain(`（例: ${shown}）`)
+    expect(message).toContain(
+      '時刻列は ISO-8601 の文字列（例: 2026-01-01T00:00:00.000Z）で書くこと'
+    )
+  })
+
+  it('例外の文面には件数と、代表の値がいくつか入る', () => {
+    const message = rejectionOf([
+      1,
+      2,
+      3,
+      4,
+      null,
+      'x',
+      '2026-01-01T00:00:00.000Z',
+    ])
+    expect(message).toContain('ISO-8601 の文字列でない値が 6 件ある')
+    // 代表は値の種類ごとに1つ（種類の名前の順。JS の数値は REAL で入る）
+    expect(message).toContain("（例: NULL, 1, 'x'）")
+  })
+
+  it('ISO 8601 の文字列ならどの書き方でも通る（Z・+00:00・スペース区切り・日付だけ）', () => {
+    const db = open([
+      `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, updatedAt TEXT)`,
+    ])
+    try {
+      const insert = db.prepare(`INSERT INTO t VALUES (?, ?)`)
+      insert.run('a', '2026-01-01T00:00:00.000Z')
+      insert.run('b', '2025-12-30T23:56:25.448+00:00')
+      insert.run('c', '2026-01-01 00:00:01')
+      insert.run('d', '2026-06-01')
+      const result = checkRowsPreconditions(db, [{ name: 't' }], {
+        now: () => Date.parse('2026-01-01T00:00:00.000Z'),
+      })
+      expect(result.warnings).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('時刻列の名前の大文字小文字が設定と違っても検査する', () => {
+    const db = open([
+      `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, UpdatedAt INTEGER)`,
+    ])
+    try {
+      db.prepare(`INSERT INTO t VALUES ('a', 1767225600000)`).run()
       expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
-        /BLOB がある/
+        /同期する表 t の時刻列 UpdatedAt に、ISO-8601 の文字列でない値が 1 件ある/
+      )
+      expect(() =>
+        checkRowsPreconditions(db, [
+          { name: 't', timestampColumn: 'UPDATEDAT' },
+        ])
+      ).toThrow(/時刻列 UpdatedAt/)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('WITHOUT ROWID の表でも検査できる', () => {
+    const db = open([
+      `CREATE TABLE t (id TEXT PRIMARY KEY, updatedAt) WITHOUT ROWID`,
+    ])
+    try {
+      db.prepare(`INSERT INTO t VALUES ('a', 5)`).run()
+      expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
+        /ISO-8601 の文字列でない値が 1 件ある（例: 5）/
       )
     } finally {
       db.close()
@@ -253,26 +344,111 @@ describe('checkRowsPreconditions —— 時刻列（穴7・§1.2.3）', () => {
     }
   })
 
-  it('時刻列に値の種類が混ざっていれば警告', () => {
+  it('時刻列が無い表では、時刻にまつわる検査を飛ばす', () => {
+    const db = open([`CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, a TEXT)`])
+    try {
+      db.prepare(`INSERT INTO t VALUES ('a', 'x')`).run()
+      expect(checkRowsPreconditions(db, [{ name: 't' }]).warnings).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+})
+
+describe('checkRowsPreconditions —— P14（同期する表を親とする外部キーは親の主キーを参照する）', () => {
+  const PARENT = `CREATE TABLE parent (
+    id   TEXT PRIMARY KEY NOT NULL,
+    code TEXT NOT NULL UNIQUE
+  )`
+
+  it('親の主キーを参照する外部キーは通る', () => {
     const db = open([
-      `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, updatedAt)`,
+      PARENT,
+      `CREATE TABLE child (id TEXT PRIMARY KEY NOT NULL,
+         parentId TEXT REFERENCES parent(id) ON DELETE CASCADE)`,
     ])
     try {
-      db.prepare(`INSERT INTO t VALUES ('a', '2026-01-01T00:00:00.000Z')`).run()
-      db.prepare(`INSERT INTO t VALUES ('b', 1767225600000)`).run()
-      const result = checkRowsPreconditions(db, [{ name: 't' }], {
-        now: () => Date.parse('2200-01-01T00:00:00.000Z'),
-      })
-      expect(result.warnings.join('\n')).toMatch(/値の種類が混ざっている/)
+      expect(() =>
+        checkRowsPreconditions(db, [{ name: 'parent' }, { name: 'child' }])
+      ).not.toThrow()
     } finally {
       db.close()
     }
   })
 
-  it('時刻列が無い表では、時刻にまつわる検査を飛ばす', () => {
-    const db = open([`CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, a TEXT)`])
+  it('列を書かない参照（REFERENCES parent）は主キーを指すので通る', () => {
+    const db = open([
+      PARENT,
+      `CREATE TABLE child (id TEXT PRIMARY KEY NOT NULL,
+         parentId TEXT REFERENCES parent)`,
+    ])
     try {
-      expect(checkRowsPreconditions(db, [{ name: 't' }]).warnings).toEqual([])
+      expect(() =>
+        checkRowsPreconditions(db, [{ name: 'parent' }, { name: 'child' }])
+      ).not.toThrow()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('大文字小文字の違う列名で主キーを参照するのは通る', () => {
+    const db = open([
+      PARENT,
+      `CREATE TABLE child (id TEXT PRIMARY KEY NOT NULL,
+         parentId TEXT REFERENCES Parent(ID))`,
+    ])
+    try {
+      expect(() =>
+        checkRowsPreconditions(db, [{ name: 'parent' }, { name: 'child' }])
+      ).not.toThrow()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('UNIQUE 列を参照する外部キーは例外（子が同期する表）', () => {
+    const db = open([
+      PARENT,
+      `CREATE TABLE child (id TEXT PRIMARY KEY NOT NULL,
+         parentCode TEXT REFERENCES parent(code))`,
+    ])
+    try {
+      expect(() =>
+        checkRowsPreconditions(db, [{ name: 'parent' }, { name: 'child' }])
+      ).toThrow(
+        '表 child の外部キー（parentCode）が、同期する表 parent の主キーでない列（code）を参照している。' +
+          '同期する表を親とする外部キーは、親の主キー（id）を参照すること。'
+      )
+    } finally {
+      db.close()
+    }
+  })
+
+  it('UNIQUE 列を参照する外部キーは例外（子が同期しない表）', () => {
+    const db = open([
+      PARENT,
+      `CREATE TABLE local_only (id INTEGER PRIMARY KEY,
+         parentCode TEXT REFERENCES parent(code))`,
+    ])
+    try {
+      expect(() => checkRowsPreconditions(db, [{ name: 'parent' }])).toThrow(
+        /表 local_only の外部キー（parentCode）が、同期する表 parent の主キーでない列（code）を参照している/
+      )
+    } finally {
+      db.close()
+    }
+  })
+
+  it('同期しない表を親とする外部キーは見ない', () => {
+    const db = open([
+      PARENT,
+      `CREATE TABLE child (id TEXT PRIMARY KEY NOT NULL,
+         parentCode TEXT REFERENCES parent(code))`,
+    ])
+    try {
+      expect(() =>
+        checkRowsPreconditions(db, [{ name: 'child' }])
+      ).not.toThrow()
     } finally {
       db.close()
     }
@@ -328,7 +504,7 @@ describe('checkRowsPreconditions —— P5（親のいない子）', () => {
       expect(warnings[0]).toContain('notes')
       expect(warnings[0]).toContain('tags')
       expect(warnings[0]).toContain('9 件')
-      expect(warnings[0]).toContain('P5')
+      expect(warnings[0]).toContain('親のいない行')
     } finally {
       db.close()
     }

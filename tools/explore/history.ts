@@ -16,8 +16,7 @@
  * ```
  *
  * どちらの実験でも全端末は一致しているので、一致の検査では反例にならない。壊れているのは
- * 「**アプリの操作が同じなら、同期のタイミングが違っても結果が同じか**」である
- * （設計: docs/fold-restore-design.md）。
+ * 「**アプリの操作が同じなら、同期のタイミングが違っても結果が同じか**」である。
  *
  * ## 何を「同じ操作」とみなすか —— 検査器が発行した操作の列
  *
@@ -96,23 +95,15 @@ export function isAppWrite(op: Op): boolean {
   return op.kind !== 'pruneChangelog'
 }
 
-/**
- * 履歴の鍵。`permutation[元の端末] = 新しい端末` の並びで直列化してハッシュにする
- * （対称性で畳んだ正準な並びに合わせるため）。
- */
-export function historyKey(
-  history: History,
-  permutation: number[],
-  mode: ScheduleKeyMode
-): string {
-  const arranged: unknown[] = new Array<unknown>(history.length)
-  history.forEach((issued, from) => {
-    arranged[permutation[from]] = issued.map((entry) =>
+/** 履歴の鍵。端末の番号の順に直列化してハッシュにする。 */
+export function historyKey(history: History, mode: ScheduleKeyMode): string {
+  const arranged = history.map((issued) =>
+    issued.map((entry) =>
       mode === 'ops'
         ? describeOpForHistory(entry.op)
         : [describeOpForHistory(entry.op), entry.status]
     )
-  })
+  )
   return hashString(JSON.stringify(arranged))
 }
 
@@ -163,17 +154,6 @@ function ownVersions(
       ]
     case 'upsertUser':
       return [{ table: 'users', id: op.id, at: op.at, content: op.name }]
-    case 'upsertPlain':
-      // 数値の時刻も字面で持つ（ここは P1・I5 の突き合わせにしか使わない。順序を決める
-      // 必要がある場所＝参照実装では、値の種類のまま扱う。oracles/from-history.ts）
-      return [
-        {
-          table: op.table,
-          id: op.id,
-          at: String(op.at),
-          content: op.name,
-        },
-      ]
     case 'upsertDecision':
       return [
         {
@@ -184,8 +164,8 @@ function ownVersions(
         },
       ]
     case 'deleteRecreate':
-      // 作り直した版は、書いた時刻をそのまま名乗る（削除の版の時刻は手元の Max なので、
-      // 発行した操作だけからは決められない。参照実装の側で「決められない」に倒す）
+      // 作り直した版は、書いた時刻をそのまま名乗る（削除の版の時刻は実行した時刻と手元の Max の
+      // 大きい方なので、発行した操作だけからは決められない。参照実装の側で候補を全部試す）
       return [
         {
           table: op.table,

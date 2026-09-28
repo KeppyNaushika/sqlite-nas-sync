@@ -123,13 +123,14 @@ describe('規則: 日数を SQL の綴りへ埋め込むなら、必ず均して
   it("`'-' || ? || ' days'` を組み立てる文は `normalizeRetentionDays` を通った値を受け取る", () => {
     // 保持期間は**SQLの綴りへ埋め込まれる**（`'-' || ? || ' days'`）。負値を渡すと
     // `--1 days` という解析できない綴りになり、`julianday()` が NULL を返す。
-    // NULL との比較は常に偽なので、掃除は1件も消さず、フルマージは1件も取り込まない
-    // ——どちらも例外にならないまま黙って止まる。
+    // NULL との比較は常に偽なので、掃除は1件も消さず、例外にならないまま黙って止まる。
     //
-    // 実際に踏んだ形: この綴りは今2箇所にある（`changelog.ts` の `cleanupChangelog` と
-    // `sync/full-merge.ts` の `mergeChangelog`）。前者だけを直して**後者を数え落とした**。
-    // 「規則の側から数える」と書いておいて、字面の2箇所目を見落としたので、
-    // 3箇所目が素の値を渡したらここで落ちるようにする。
+    // 旧方式で実際に踏んだ形。
+    // この綴りは当時 `changelog.ts` の `cleanupChangelog` と `sync/full-merge.ts` の `mergeChangelog` の2箇所にあった。
+    // 前者だけを直して後者を数え落とした。
+    // いまこの綴りは2箇所あり、どちらも `changelog.ts` にある。
+    // `cleanupChangelog` と `describeChangelogPruneWall` である。
+    // 次に増えた箇所が素の値を渡したら、ここで落ちるようにする。
     const offenders: string[] = []
     let checked = 0
 
@@ -337,7 +338,7 @@ describe('規則: 時刻の比較は「時刻として」行う', () => {
     // 比べる値は書き手によって書式が違う（アプリが書くISO-T形式と、0.19.0 以前の
     // `datetime('now')` による秒精度のスペース形式）。同じ瞬間でも字面は揃わない。
     //
-    // 実際に踏んだ形: `isPreferredOverRival` が同着かどうかを `!==` で見ていた。
+    // 旧方式で実際に踏んだ形: `isPreferredOverRival` が同着かどうかを `!==` で見ていた。
     // 書式が違うだけで「差がある」と判断して主キーによる同着決着へ降りず、
     // `isLaterTimestamp` は両向きとも false を返すため、**2端末が互いに相手を
     // 勝たせて**どちらも自分の行を残し、永久に収束しなかった。
@@ -345,7 +346,7 @@ describe('規則: 時刻の比較は「時刻として」行う', () => {
     // 見るのは「時刻として読んだ値」どうしの比較だけ。列名や書式の綴りを
     // 突き合わせる `=== 'updatedAt'` のような比較は対象ではない。
     const offenders = findLines((line) =>
-      /\b\w*(?:[tT]imestamp|updatedAt|deletedAt|changedAt|mergedAt|foldedAt)\w*\s*(?:!==|===)\s*\w*(?:[tT]imestamp|updatedAt|deletedAt|changedAt|mergedAt|foldedAt)\w*\b/.test(
+      /\b\w*(?:[tT]imestamp|updatedAt|deletedAt|changedAt)\w*\s*(?:!==|===)\s*\w*(?:[tT]imestamp|updatedAt|deletedAt|changedAt)\w*\b/.test(
         line
       )
     )
@@ -426,10 +427,10 @@ describe('規則: `ON DELETE` の意味を写し取る場所を増やさない',
 
 describe('規則: トリガーが働かない経路で行を変えたら、自分で `_changelog` に載せる', () => {
   it('`_changelog` へ手で書く箇所は、数え上げてある', () => {
-    // トリガー以外から `_changelog` へ書くのは、**トリガーが働かない経路の穴を
-    // 塞ぐため**だけである。どれも「この端末でしか分からないことを差分経路へ載せる」
-    // という同じ理由を持つので、一覧にして読めるようにしておく。
-    // 増やすときは、その理由がこの3つのどれかと同じ形になっているか確かめること。
+    // トリガー以外から `_changelog` へ書くのは、トリガーが働かない経路の穴を塞ぐためだけである。
+    // 理由を読めるように、一覧にしておく。
+    // いまの一覧は1件だけである。
+    // 増やすときは、その理由が一覧の理由と同じ形になっているか確かめること。
     const handWritten = new Set<string>()
     for (const file of sourceFiles()) {
       const code = withoutComments(file.text)

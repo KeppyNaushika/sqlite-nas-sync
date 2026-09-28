@@ -14,19 +14,18 @@ import { ProbeVerdict, ViolationKind } from './probe'
 /** 探索の節。`path` は遷移の添字の列（{@link enumerateTransitions} の並び）。 */
 export type FrontierNode = {
   path: number[]
-  /**
-   * 並びを変えない直列化の鍵（state.ts の CanonicalState.frameKey）。世界の上で同じ状態の節を
-   * 1つの組にまとめて、遷移を1回だけ実行するのに使う（tools/explore-worker.ts の expand）
-   */
-  frameKey: string
   /** 端末ごとの、発行した操作の列（history.ts）。子の鍵を節ごとに計算するのに要る */
   history: History
-  /** 正準な状態の鍵（再生して同じ状態に戻ったかを確かめる。見え方もこの鍵で引く） */
+  /**
+   * 正規化した状態の鍵（state.ts の CanonicalState.key）。同じ状態の節を1つの組にまとめて
+   * 遷移を1回だけ実行する（tools/explore-worker.ts の expand）、再生して同じ状態に戻ったかを
+   * 確かめる、見え方を引く、の3つに使う
+   */
   stateKey: string
   /** この列の世界での「次に操作してよい端末」（reduction.ts の PorMask） */
   mask: number
   /**
-   * 重複排除の鍵 = 正準な状態の鍵 + 発行した操作の列の鍵（tools/explore/history.ts）。
+   * 重複排除の鍵 = 状態の鍵 + 発行した操作の列の鍵（tools/explore/history.ts）。
    * 状態だけで畳むと、違う操作の列から同じ状態へ合流した列の片方を見失い、
    * 「同じ操作なら挟み方によらず同じ見え方」を調べ落とす
    */
@@ -36,10 +35,10 @@ export type FrontierNode = {
 /** 展開の仕事の単位。 */
 export type ExpandUnit = { nodes: FrontierNode[]; from: number; to: number }
 
-/** 検査の結果の覚え（正準な (状態, 次の端末) の鍵 → 結論）。 */
+/** 検査の結果の覚え（(状態, 次の端末) の鍵 → 結論）。 */
 export type MemoEntry = [string, ProbeVerdict]
 
-/** 重複排除の単位（正準な状態の鍵と、正準な並びでの集合）。 */
+/** 重複排除の単位（鍵と、次に操作してよい端末の集合）。 */
 export type SeenEntry = { key: string; stateKey: string; mask: number }
 
 export type Violation = {
@@ -98,14 +97,13 @@ export type ToWorker =
   | { type: 'stop' }
 
 export type FromWorker =
-  | { type: 'ready'; rootKey: string; rootFrameKey: string; rootMask: number }
+  | { type: 'ready'; rootKey: string }
   | {
       type: 'expanded'
       children: (FrontierNode & {
-        canonicalMask: number
-        /** 発行した操作の列の鍵（正準な並び） */
+        /** 発行した操作の列の鍵 */
         historyKey: string
-        /** アプリが受け取った結果も含めた操作の列の鍵（同じ入れ替えで作ったもの） */
+        /** アプリが受け取った結果も含めた操作の列の鍵 */
         statusKey: string
         /** 見え方を突き合わせてよい履歴か（history.ts の「比べない履歴」に当たらないか） */
         comparable: boolean

@@ -9,14 +9,15 @@ import { ChangelogEntry, DEFAULTS } from './types'
 /**
  * 保持期間の設定値を、SQLへ渡してよい値へ均す。
  *
- * **保持期間はSQLの綴りへ埋め込まれる**（`'-' || ? || ' days'`）。負値を渡すと
- * `--1 days` という解析できない綴りになり、`julianday()` が NULL を返す。
- * NULL との比較は常に偽なので、**掃除は1件も消さず、フルマージは1件も取り込まない**
- * ——どちらも例外にならないまま黙って止まる。`NaN` も同じ（バインドすると NULL になる）。
+ * **保持期間はSQLの綴りへ埋め込まれる**（`'-' || ? || ' days'`）。
+ * 負値を渡すと `--1 days` という解析できない綴りになり、`julianday()` が NULL を返す。
+ * NULL との比較は常に偽なので、{@link cleanupChangelog} は期限切れでないエントリを1件も見つけられず、例外にならないまま **changelog を全部消す**。
+ * `NaN` も同じ（バインドすると NULL になる）。
  *
- * 0へ丸めるのは選ばない。0は「今より古いものは残さない」という**有効な設定**で、
- * 間違いの受け皿にすると、設定を書き損じただけで changelog を全部消し、
- * 相手側の `lastSeenId` まで巻き戻してしまう。壊す側より、既定値へ戻す側を採る。
+ * 0へ丸めるのは選ばない。
+ * 0は「今より古いものは残さない」という**有効な設定**である。
+ * 間違いの受け皿にすると、設定を書き損じただけで changelog を全部消し、このクライアントを読む全員をフルマージに落とす。
+ * 壊す側より、既定値へ戻す側を採る。
  *
  * @param value - 設定に書かれた値
  * @returns 0以上の有限な日数。使えない値なら {@link DEFAULTS.changelogRetentionDays}
@@ -41,7 +42,7 @@ export function readChangelog(
 ): ChangelogEntry[] {
   return db
     .prepare(
-      `SELECT id, tableName, recordId, operation, changedAt FROM _changelog WHERE id > ? ORDER BY id`
+      `SELECT id, tableName, recordId FROM _changelog WHERE id > ? ORDER BY id`
     )
     .all(sinceId) as ChangelogEntry[]
 }
@@ -59,6 +60,50 @@ export function getMaxChangelogId(db: Database.Database): number {
     maxId: number | null
   }
   return row.maxId ?? 0
+}
+
+/**
+ * `_changelog` がこれまでに振った最大の id（`sqlite_sequence` の値）を読む。
+ *
+ * `_changelog` は `AUTOINCREMENT` なので、行を消してもこの値は下がらない。
+ * 取り消した書き込み（ロールバック）はこの値も戻すので、振られた id は 1 から途切れずに並ぶ。
+ * つまり「振られたのに `_changelog` に無い id」は、何かが消した id である。
+ * 例外は旧版からの移行（`src/rows/migrate.ts`）で、旧版の id を穴ごと写す。
+ * その穴は一度だけ隙間と判断されてフルマージになり、カーソルが振った最大の id へ進むので、二度目は無い。
+ * {@link hasChangelogGap} はこれを使って、掃除の記録に載らない消え方（生の `DELETE`）も見抜く。
+ *
+ * **読み取りしかしない**（{@link readChangelogPrunedThroughId} と同じ理由）。
+ *
+ * @param db - 読み取り対象のSQLiteデータベース接続（読み取り専用でよい）
+ * @returns 振った最大の id。まだ1件も振っていない、または読めないなら `null`
+ */
+export function readChangelogSequence(db: Database.Database): number | null {
+  try {
+    const row = db
+      .prepare(`SELECT seq FROM sqlite_sequence WHERE name = '_changelog'`)
+      .get() as { seq: number } | undefined
+    return row?.seq ?? null
+  } catch {
+    // `sqlite_sequence` が無い（AUTOINCREMENT の表が1つも無いDB）
+    return null
+  }
+}
+
+/**
+ * フルマージで相手を読み終えたあとの読み位置。
+ *
+ * 相手の `_changelog` の最大 id・掃除済みの位置・振った最大の id のうち最も大きいもの。
+ * 振った最大の id まで進めないと、末尾が消えていた相手（{@link hasChangelogGap} の第2の規則）を
+ * 読むたびに隙間ありと判断し、フルマージを繰り返す。
+ *
+ * @param db - 相手のDB（読み取り専用でよい）
+ */
+export function fullMergeCursor(db: Database.Database): number {
+  return Math.max(
+    getMaxChangelogId(db),
+    readChangelogPrunedThroughId(db),
+    readChangelogSequence(db) ?? 0
+  )
 }
 
 /**
@@ -125,41 +170,38 @@ export function recordChangelogPruned(
  * @param lastSeenId - 前回同期時に記録した最後のchangelog ID
  * @returns ギャップがある場合は `true`
  *
- * 判定は**独立した2つの物差しのOR**である。片方だけでは足りない:
+ * 判定は**独立した3つの物差しのOR**である。どれか1つでは足りない:
  *
  * 1. **掃除済みの位置**（{@link readChangelogPrunedThroughId}）。
  *    `prunedThroughId > lastSeenId` なら、読む前に消えたエントリがある＝真の隙間。
- *    `prunedThroughId <= lastSeenId` なら、消えたのは既読ぶんだけ＝隙間なし。
- *    **途中だけが欠けた形を見抜けるのはこちらだけ**（`MIN(id)` は残っている頭を
- *    見るので、頭が残っていれば穴に気づけない）。
- * 2. **`MIN(id)`**（下の `@remarks`）。掃除を経由しない消え方——利用者やテストの
- *    生の `DELETE FROM _changelog`、ファイルの差し替え、旧版が書いたDB——は
- *    記録に載らないので、記録を信じるだけでは何も見えない。第2の検出器として要る。
+ *    `prunedThroughId <= lastSeenId` なら、掃除が消したのは既読ぶんだけ。
+ * 2. **振った id の数**（{@link readChangelogSequence}）。`lastSeenId` より後ろに振った id が
+ *    `sequence - lastSeenId` 個あるのに、残っている数がそれより少なければ、未読の id が消えている。
+ *    掃除を経由しない消え方——利用者やテストの生の `DELETE FROM _changelog`——は
+ *    `_changelog_prune` に載らないが、`sqlite_sequence` は下がらないのでこちらで見える。
+ *    頭・途中・末尾・全部のどれが消えても拾う。
+ *    また、`lastSeenId` が振った最大の id も掃除済みの位置も追い越しているなら、
+ *    相手の id が振り直されている（ファイルの差し替え・表の作り直し）ので隙間とする。
+ * 3. **`MIN(id)`**（下の `@remarks`）。`sqlite_sequence` を読めないDB（`_changelog` に
+ *    1件も振っていない、旧版が書いた）の受け皿。
  *
  * @remarks
  * - 境界は `minId === lastSeenId + 1`。**これはギャップではない**（`lastSeenId` は
  *   {@link readChangelog} が `id > ?` で使う「読み終えた位置」なので、次に読むべき
  *   エントリがそこに在るということ）。ここを `minId > lastSeenId` と書くと、掃除が
  *   既読ぶんだけを消した通常の運用で毎回フルマージに落ちる。
- * - `lastSeenId === 0`（初回同期）にも同じ物差しを当てる。`minId === 1` なら
- *   相手の changelog は頭から残っているので隙間なし、`minId` がそれより大きければ
- *   **相手が長く走っていて古いぶんが掃除済み**ということなので、隙間として扱う。
- *   ここを「初回は常に隙間なし」と特別扱いすると、**新しい端末は相手の保持期間に
- *   残っていた窓のぶんしか受け取れず**、それより前に最後に触られた行が
- *   誰にも知らされないまま抜け落ちる（`pullNormal` に初回同期の特例は無い）。
- * - `_changelog` が空のときだけは、`lastSeenId === 0` を隙間と呼ばない。
- *   空は「掃除で全部消えた」とも「まだ何も起きていない」とも読めて区別が付かず、
- *   一律に隙間とすると**相手が何かするまで毎回フルマージを繰り返す**（相手の
- *   `lastSeenId` は0のままなので、次も同じ判断になる）。相手が1件でも書けば
- *   `minId > 1` となって上の規則が隙間を拾い、そこで取りこぼしは埋まる。
- *   読み終えた位置を持っている（`lastSeenId > 0`）のに空、という形は
- *   紛れもない全掃除なので、こちらは隙間として扱う。
+ * - まだ一度も読んでいない相手は、呼び出し元（`performSync`）がこの関数を呼ばずにフルマージで読む。
+ *   したがってここへ来る `lastSeenId === 0` は「前回 0 まで読んだ」相手であり、同じ物差しを当てる。
+ * - `_changelog` が空で、1件も振っていない（`sqlite_sequence` に行が無い）ときは、`lastSeenId === 0` を隙間と呼ばない。
+ *   一律に隙間とすると、一度も書いていない相手を読むたびにフルマージを繰り返す。
+ *   **0 まで読んだあとで相手が書き、その `_changelog` が読まれる前に直に消えた形**も
+ *   `_changelog` は空・`prunedThroughId` は 0 で同じに見えるが、`sqlite_sequence` が 1 以上なので第2の規則が拾う。
+ * - どの規則も、フルマージのあとのカーソル（{@link fullMergeCursor}）に対しては偽になる。
+ *   そうでないと、同じ相手を読むたびにフルマージを繰り返す。
  *
- * **まだ見抜けない形がある。** 見抜けるのは「{@link cleanupChangelog} が消した」
- * ぶんだけである。掃除を経由しない消え方——利用者やテストが直に打つ
- * `DELETE FROM _changelog`、DBファイルの差し替え、`_changelog_prune` を持たない
- * 旧版が開けた穴——は記録に載らないので、途中だけが欠けていても分からない。
- * その形は `MIN(id)` の規則が頭の欠けを拾えたときにだけ見つかる。
+ * **まだ見抜けない形がある。** `sqlite_sequence` ごと書き換えられた場合
+ * （DBファイルを、振った id がちょうど同じ別のファイルへ差し替えた、など）は見えない。
+ * `_changelog` に1件も振っていないDBで途中だけが欠けることは無い。
  *
  * なお「掃除が途中に穴を開ける」こと自体は {@link cleanupChangelog} が
  * **接頭辞しか刈らない**ようにして止めてある。こちらの規則は、旧版が刈った
@@ -176,18 +218,41 @@ export function hasChangelogGap(
     return true
   }
 
-  // 規則2: 残っている頭の位置から見る（掃除を経由しない消え方の受け皿）
+  // 規則2: 振った id の数と、残っている id の数を比べる（掃除を経由しない消え方の受け皿）。
+  // `lastSeenId` より後ろに振った id は `sequence - lastSeenId` 個で、途切れずに並ぶ
+  // （{@link readChangelogSequence}）。残っている数がそれより少なければ、未読の id が消えている。
+  // 頭・途中・末尾のどこが消えても、全部消えても拾える。
+  const sequence = readChangelogSequence(db)
+  if (sequence !== null && sequence > lastSeenId) {
+    const remaining = db
+      .prepare(`SELECT COUNT(*) AS n FROM _changelog WHERE id > ?`)
+      .get(lastSeenId) as { n: number }
+    if (remaining.n < sequence - lastSeenId) return true
+  }
+  // 読み位置が、相手の振った最大の id も掃除済みの位置も追い越している。
+  // 相手のファイルが差し替わった・`_changelog` が作り直されたなどで id が振り直された形で、
+  // これから振られる id は読み位置以下になり、差分では読めない。
+  // フルマージのあとのカーソル（{@link fullMergeCursor}）は相手の値へ戻るので、繰り返さない。
+  if (sequence !== null && Math.max(sequence, prunedThroughId) < lastSeenId) {
+    return true
+  }
+
+  // 規則3: 残っている頭の位置から見る（`sqlite_sequence` を読めないDBの受け皿）
   const row = db.prepare(`SELECT MIN(id) as minId FROM _changelog`).get() as {
     minId: number | null
   }
 
-  // 空の changelog（上記）。ただし掃除済みの位置が分かっているなら、そちらを信じる。
-  // ここまで来たということは `prunedThroughId <= lastSeenId`、つまり**消えたのは
-  // 既読ぶんだけ**と分かっているので隙間ではない。記録を見ずに「空 かつ
-  // `lastSeenId > 0` なら隙間」とだけ答えると、changelog を全部掃除した相手に対して
-  // **フルマージの直後も隙間ありのまま**になる（`pullFullMerge` はカーソルを
-  // 掃除済みの位置まで進めるので `lastSeenId > 0` になる）——毎回フルマージを繰り返す。
+  // 空の changelog（上記）。
   if (row.minId === null) {
+    // 振った最大の id が分かるなら、未読の id が消えた形も id の振り直しも上の規則が拾った。
+    // ここへ来たのは、消えたのが既読ぶんだけの形である
+    if (sequence !== null) return false
+    // 1件も振っていない。掃除済みの位置が分かっているなら、そちらを信じる。
+    // ここまで来たということは `prunedThroughId <= lastSeenId`、つまり**消えたのは
+    // 既読ぶんだけ**と分かっているので隙間ではない。記録を見ずに「空 かつ
+    // `lastSeenId > 0` なら隙間」とだけ答えると、changelog を全部掃除した相手に対して
+    // **フルマージの直後も隙間ありのまま**になる（フルマージはカーソルを
+    // 掃除済みの位置まで進めるので `lastSeenId > 0` になる）——毎回フルマージを繰り返す。
     if (prunedThroughId > 0) return false
     return lastSeenId > 0
   }
@@ -235,8 +300,7 @@ export function cleanupChangelog(
   retentionDays: number
 ): number {
   // 使えない値（負値・NaN）は既定値へ。理由は {@link normalizeRetentionDays}。
-  // 呼び出し元（`performSync`）でも同じ関数を通しているが、この関数は公開APIなので
-  // 直に呼ばれる経路でも同じ答えになるようにしておく。
+  // 呼び出し元（`performSync`）でも同じ関数を通しているが、試験などから直に呼ばれる経路でも同じ答えになるようにしておく。
   //
   // **接頭辞刈りでは、均し忘れの被害が以前より大きい。** 綴りが `--1 days` になると
   // `julianday()` が NULL を返し、「期限切れでないエントリ」が1件も見つからない。
@@ -245,7 +309,7 @@ export function cleanupChangelog(
   const days = normalizeRetentionDays(retentionDays)
 
   // 「境目を決める」「消す」「消したと書き残す」を1つの区切りに入れる。
-  // **別々の区切りにしてはいけない**（`runInSavepoint` と同じ理由）——
+  // **別々の区切りにしてはいけない**——
   // 途中で落ちると「消えたのに記録が無い」＝検出できない穴が永久に残る。
   // 境目の読み取りも同じ区切りに入れておくと、読んでから消すまでの間に
   // 割り込んだ書き込みで境目が古くなることも無い。

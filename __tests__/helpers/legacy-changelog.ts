@@ -13,7 +13,7 @@
  * - `sweepStaleRemoteCopies`（一時領域の掃除）は呼ばない
  */
 import Database from 'better-sqlite3'
-import { NOW_SQL } from '../../src/setup'
+import { NOW_SQL } from '../../src/setup/sql'
 
 /** 旧方式の表とトリガーを作る（当時の `setupChangelog` と同じ形）。 */
 export function setupLegacyChangelog(

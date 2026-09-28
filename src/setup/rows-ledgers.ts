@@ -1,10 +1,7 @@
 /**
- * 案A の `setupSync` が要る、表ごとでない帳簿を作る（段階5）。
+ * `setupSync` が要る、表ごとでない帳簿を作る。
  *
- * 案A では**アプリの表に付くトリガーは `src/rows/triggers.ts` の4本だけ**である。
- * 旧方式の `setupChangelog`（段階6 で削除）は同じ表に `_changelog_after_*` を
- * 足していた。両方を通すと、1回の書き込みが旧方式と案A の両方で事実になり、
- * `_tombstone` の版の3列が旧 DELETE トリガーの `INSERT OR REPLACE` に塗り潰される。
+ * **アプリの表に付くトリガーは `src/rows/triggers.ts` の4本だけ**である。
  *
  * ここで作るのは、**表に触らない**帳簿だけ:
  *
@@ -23,7 +20,7 @@ import Database from 'better-sqlite3'
 import { sweepStaleRemoteCopies } from '../nas'
 
 /**
- * 案A の帳簿を冪等に作る。アプリの表には触らない。
+ * 帳簿を冪等に作る。アプリの表には触らない。
  *
  * 旧版はここで `_heartbeat` の表と、そこから `_changelog` へ書くトリガーを
  * 作っていた（「変更が1件も無い日に `_changelog` が保持期間で空になる」のを

@@ -1,17 +1,14 @@
 /**
  * コア同期オーケストレーション。
  *
- * **v0.20.0（案A）から、既定の経路は `sync/rows-sync` である。**
+ * 中身は `sync/rows-sync` にある。
  * 1回の `performSync` はこう進む（設計書 `docs/rows-table-design.md` §4.1）:
  *
  * 1. 取り込みより前に、復元・巻き戻りと仕掛けの欠けを見る（§3.10）
- * 2. NAS への写し（印 → `backup()` → 取り合いの確認）
- * 3. 相手ごとに `_sns_rows_*` と `_tombstone` を突き合わせて取り込む（§4.3）
- * 4. **別のトランザクション**でアプリの表を作り直す（§3.7）
+ * 2. 相手を列挙し、隙間があるかを見る
+ * 3. 隙間が無ければ、NAS への写し（印 → `backup()` → 取り合いの確認）→ 相手ごとの取り込み（§4.3）→ **別のトランザクション**でのアプリの表の作り直し（§3.7）
+ * 4. 隙間があれば、取り込み → 作り直し → NAS への写し
  * 5. `cleanupChangelog`、`onAfterSync`
- *
- * 旧経路（`sync/entries`・`sync/full-merge`・`sync/pull`・`conflict/*` の畳み）は
- * **段階6 で消した**。
  *
  * @module sync
  */
@@ -20,10 +17,9 @@ import { SyncConfig, SyncResult, TableConfig } from './types'
 import { RowsSyncRuntime, performRowsSync } from './sync/rows-sync'
 
 export type { RowsSyncRuntime } from './sync/rows-sync'
-export type { RowsRebuildHooks } from './rows/rebuild'
 
 /**
- * 同期処理を1回実行する（案A）。
+ * 同期処理を1回実行する。
  *
  * @param localDb - ローカルSQLiteデータベース接続
  * @param config - 同期設定

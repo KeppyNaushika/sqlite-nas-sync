@@ -10,7 +10,7 @@ import {
   openRemoteDbViaLocalCopy,
 } from '../src/nas'
 
-describe('openRemoteDbViaLocalCopy', () => {
+describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
   const testDir = path.join(__dirname, 'test-data-nas')
   const tmpDir = path.join(testDir, 'tmp')
   const srcPath = path.join(testDir, 'remote.sqlite')
@@ -255,7 +255,7 @@ describe('NASが思いどおりでないとき', () => {
     })
   })
 
-  describe('openRemoteDbViaLocalCopy', () => {
+  describe('openRemoteDbViaLocalCopy —— 一時領域や元のファイルが使えないとき', () => {
     it('tmpDir を作れない場所でも例外にせず null を返す', () => {
       // 一時領域が用意できないのは、同期を止める理由にはなるが、
       // 呼び出し元を落とす理由にはならない（他の相手とは同期を続ける）。

@@ -1,6 +1,6 @@
 /**
  * 旧方式の DB から案A へ移す（`src/rows/migrate.ts`）。
- * 設計書 `docs/rows-table-design.md` §3.9 と、§11 の段階4。
+ * 設計書 `docs/rows-table-design.md` §3.9。
  *
  * ここで見るのは4つ:
  *
@@ -25,6 +25,7 @@ import {
 import { rowsTableName } from '../src/rows/schema'
 import { rowsTriggerNames } from '../src/rows/triggers'
 import { rebuildOnce } from '../src/rows/rebuild'
+import { clearRebuildingFlag } from '../src/rows/restore-detect'
 
 const NOTES = `CREATE TABLE notes (
   id        TEXT PRIMARY KEY NOT NULL,
@@ -183,8 +184,8 @@ describe('旧方式の DB を案A へ移す', () => {
 
     const tombstones = tombstonesOf(db)
     expect(tombstones).toHaveLength(1)
-    // §3.9 の3: 残す墓標の `_sns_ts` は NULL（群0 ＝ 最小）
-    expect(tombstones[0]._sns_ts).toBeNull()
+    // 残す墓標の `_sns_ts` は旧 `deletedAt`（削除を実行した時刻。原則2）
+    expect(tombstones[0]._sns_ts).toBe(tombstones[0].deletedAt)
     expect(tombstones[0]._sns_lamport).toBe(0)
     expect(tombstones[0]._sns_instance).toBe('iid-a')
     // 旧「畳み」の事実は捨てる
@@ -208,6 +209,61 @@ describe('旧方式の DB を案A へ移す', () => {
     }[]
     expect(after).toHaveLength(changelogBefore)
     expect(after[0].id).toBe(1)
+  })
+
+  it('残す墓標の `_sns_ts` は、旧 `deletedAt` が ISO 8601 の文字列のときだけそれを使う（原則2）', () => {
+    const db = legacyDb(
+      [NOTES, `CREATE TABLE plain (id TEXT PRIMARY KEY NOT NULL, v TEXT)`],
+      ['notes', 'plain']
+    )
+    const insert = db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt) VALUES (?, ?, ?)`
+    )
+    insert.run('notes', 'iso-t', '2026-03-01T12:00:00.000Z')
+    // 0.19.0 以前の `datetime('now')` の形も ISO 8601 として読む
+    insert.run('notes', 'iso-space', '2026-03-01 12:00:00')
+    insert.run('notes', 'not-iso', 'yesterday')
+    // 時刻列の無い表では、トリガーと同じく削除の版にも時刻を与えない
+    insert.run('plain', 'p1', '2026-03-01T12:00:00.000Z')
+    // 同期しない表の墓標も同じ規則で写す
+    insert.run('other', 'o1', '2026-03-01T12:00:00.000Z')
+
+    migrateToRows(db, { tables: ['notes', 'plain'], instanceId: 'iid-a' })
+
+    const ts = Object.fromEntries(
+      tombstonesOf(db).map((row) => [
+        `${String(row.tableName)}/${String(row.recordId)}`,
+        row._sns_ts,
+      ])
+    )
+    expect(ts).toEqual({
+      'notes/iso-t': '2026-03-01T12:00:00.000Z',
+      'notes/iso-space': '2026-03-01 12:00:00',
+      'notes/not-iso': null,
+      'other/o1': '2026-03-01T12:00:00.000Z',
+      'plain/p1': null,
+    })
+  })
+
+  it('移した墓標は、削除より古い時刻の行の版に負けない（原則2）', () => {
+    const db = legacyDb()
+    db.prepare(
+      `INSERT INTO _tombstone (tableName, recordId, deletedAt)
+       VALUES ('notes', 'gone', '2026-03-01T12:00:00.000Z')`
+    ).run()
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
+    // 別の端末から、削除より前の時刻の編集が届いた形（NULL の墓標なら編集が勝つ）
+    db.prepare(
+      `INSERT INTO _sns_rows_notes
+         (id, title, body, updatedAt, _sns_ts, _sns_lamport, _sns_instance)
+       VALUES ('gone', 'old', NULL, '2026-02-01T00:00:00.000Z',
+               '2026-02-01T00:00:00.000Z', 5, 'iid-b')`
+    ).run()
+    const outcome = rebuildOnce(db, { tables: ['notes'] })
+    expect(outcome.status).toBe('applied')
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM notes`).get()).toEqual({
+      n: 0,
+    })
   })
 
   it('旧 `_tombstone` の畳みの列（mergedInto / revokedAt）は写さない', () => {
@@ -304,16 +360,16 @@ describe('旧方式の DB を案A へ移す', () => {
     expect(readSnsMeta(db, 'schemaVersion')).toBe('app1;sns-format=rows1')
   })
 
-  it('`_sns_rebuilding` の残りは、知らせたうえでトリガーを作る前に消す（§3.10 の I）', () => {
+  it('`_sns_rebuilding` の残りを clearRebuildingFlag で消してから移すと、書き込みが版になる（§3.10 の I）', () => {
     const db = legacyDb()
     db.exec(
       `CREATE TABLE _sns_rebuilding (onlyRow INTEGER PRIMARY KEY CHECK (onlyRow = 0), startedAt TEXT)`
     )
     db.prepare(`INSERT INTO _sns_rebuilding VALUES (0, '2026-01-01')`).run()
 
-    const result = migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
-    expect(result.clearedRebuilding).toBe(true)
-    expect(result.warnings.join('\n')).toContain('_sns_rebuilding')
+    // `setupSync` と同期の段階0 と同じ順（旗を消してから移す）
+    expect(clearRebuildingFlag(db)).toBe(true)
+    migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a' })
     expect(
       db.prepare(`SELECT COUNT(*) AS n FROM _sns_rebuilding`).get()
     ).toEqual({ n: 0 })
@@ -454,10 +510,13 @@ describe('誰も読まない内部の列を落とす', () => {
 
     expect(columnsOf(db, '_tombstone')).not.toContain('mergedInto')
     expect(columnsOf(db, '_tombstone')).not.toContain('revokedAt')
+    // 親の削除の原因の2列は足される（0.20.0 の DB には無い）
     expect(columnsOf(db, '_sns_unplaceable')).toEqual([
       'tableName',
       'trueId',
       'reason',
+      'causeTable',
+      'causeId',
     ])
     expect(columnsOf(db, '_changelog_prune')).toEqual([
       'onlyRow',
@@ -466,7 +525,13 @@ describe('誰も読まない内部の列を落とす', () => {
     // 行はそのまま残る
     expect(tombstonesOf(db).map((row) => row.recordId)).toEqual(['gone'])
     expect(db.prepare(`SELECT * FROM _sns_unplaceable`).all()).toEqual([
-      { tableName: 'notes', trueId: 'x1', reason: 'CHECK' },
+      {
+        tableName: 'notes',
+        trueId: 'x1',
+        reason: 'CHECK',
+        causeTable: null,
+        causeId: null,
+      },
     ])
     expect(db.prepare(`SELECT * FROM _changelog_prune`).all()).toEqual([
       { onlyRow: 0, prunedThroughId: 7 },
@@ -487,10 +552,13 @@ describe('誰も読まない内部の列を落とす', () => {
     expect(() =>
       migrateToRows(db, { tables: ['notes'], instanceId: 'iid-a3' })
     ).not.toThrow()
+    // 親の削除の原因の2列は足される（0.20.0 の DB には無い）
     expect(columnsOf(db, '_sns_unplaceable')).toEqual([
       'tableName',
       'trueId',
       'reason',
+      'causeTable',
+      'causeId',
     ])
   })
 

@@ -60,8 +60,6 @@ interface RowsImportOptions {
    * `_tombstone` の全 `(表, id)`）になる
    */
   keys?: RowsImportKey[]
-  /** 相手の `sns-format` の確認を飛ばす（試験用） */
-  skipFormatCheck?: boolean
 }
 
 /** `Max` が変わったキー1つ。 */
@@ -80,7 +78,7 @@ interface RowsImportResult {
   reason?: string
   /** `Max` が変わったキー */
   changed: RowsImportChange[]
-  /** `_sns_dirty` に載せた表 */
+  /** `_sns_dirty` に載せた表（`changed` に載ったキーの表と同じ） */
   dirtyTables: string[]
   /** 読めなかった表と、その理由（例外にはしない） */
   skippedTables: { table: string; reason: string }[]
@@ -94,8 +92,6 @@ interface RowsImportResult {
    * （設計書 §4.4 の `conflictsResolved`）
    */
   conflicts: number
-  /** 引き上げたあとの `_sns_clock.lamport` */
-  lamport: number
 }
 
 /**
@@ -190,18 +186,15 @@ export function importFromPeer(
     skippedTables: [],
     skipped: 0,
     conflicts: 0,
-    lamport: readLamport(db),
   }
-  if (options.skipFormatCheck !== true) {
-    const format = readSnsFormat(peerDb)
-    if (format !== ROWS_FORMAT) {
-      return {
-        ...empty,
-        reason:
-          format === null
-            ? `相手の _sync_meta に sns-format が無い`
-            : `相手の sns-format が ${format}（こちらは ${ROWS_FORMAT}）`,
-      }
+  const format = readSnsFormat(peerDb)
+  if (format !== ROWS_FORMAT) {
+    return {
+      ...empty,
+      reason:
+        format === null
+          ? `相手の _sync_meta に sns-format が無い`
+          : `相手の sns-format が ${format}（こちらは ${ROWS_FORMAT}）`,
     }
   }
 
@@ -219,7 +212,6 @@ export function importFromPeer(
       skippedTables: io.skippedTables,
       skipped: 0,
       conflicts: 0,
-      lamport: empty.lamport,
     }
     // 1つのトランザクション。途中で落ちたら、その相手ぶんだけ丸ごと戻る。
     // `BEGIN IMMEDIATE`（`.immediate()`）にするのは、書き込みのロックを最初に
@@ -234,8 +226,6 @@ export function importFromPeer(
         const outcome = importOneKey(io, table, entry.key)
         if (outcome === null) continue
         highestLamport = Math.max(highestLamport, outcome.lamport)
-        // 見え方が動いたなら、`Max` が動いていなくても作り直しは要る
-        if (outcome.changed) dirty.add(table.name)
         if (!outcome.changed) {
           // 相手は主張したが、手元の版の方が強かった（§4.4 の `skipped`）
           result.skipped += 1
@@ -248,6 +238,7 @@ export function importFromPeer(
           key: entry.key,
           operation: outcome.operation,
         })
+        // 見え方は `Max` だけで決まるので、作り直しが要るのは `Max` が動いた表だけ
         dirty.add(table.name)
       }
       for (const name of dirty) io.markDirty(name)
@@ -256,7 +247,6 @@ export function importFromPeer(
       io.bumpImportTick()
     })
     run.immediate()
-    result.lamport = readLamport(db)
     return result
   } finally {
     values.close()
@@ -266,6 +256,18 @@ export function importFromPeer(
 /* ------------------------------------------------------------------ *
  * キー1つ
  * ------------------------------------------------------------------ */
+
+/**
+ * `_tombstone` へ書く列。
+ *
+ * 版の3列は取り付けのとき（`src/rows/schema.ts` の `ensureTombstoneVersionColumns`）に必ず足され、欠けていれば同期の段階0 が取り付け直すので、ここでは列の有無を確かめない。
+ */
+const TOMBSTONE_WRITE_COLUMNS: readonly string[] = [
+  'tableName',
+  'recordId',
+  'deletedAt',
+  ...Object.values(VERSION_COLUMNS),
+]
 
 /** キー1つを取り込んだ結果。 */
 interface KeyOutcome {
@@ -360,8 +362,6 @@ class ImportIo {
   readonly skippedTables: { table: string; reason: string }[] = []
   private readonly tables = new Map<string, TableIo | null>()
   private readonly statements = new Map<string, Database.Statement>()
-  /** `_tombstone` にある列（版の列を足す前の DB には版の列が無い） */
-  private readonly tombstoneColumns: Set<string>
   private readonly peerHasTombstone: boolean
 
   constructor(
@@ -370,11 +370,6 @@ class ImportIo {
     specs: RowsTableSpec[],
     private readonly values: ValueOrdering
   ) {
-    this.tombstoneColumns = new Set(
-      (db.pragma(`table_info(_tombstone)`) as RowsColumn[]).map(
-        (column) => column.name
-      )
-    )
     this.peerHasTombstone = tableExists(peerDb, '_tombstone')
     for (const spec of specs) {
       this.tables.set(foldIdentifier(spec.name), this.readTable(spec))
@@ -561,7 +556,7 @@ class ImportIo {
 
   /** `_tombstone` へ（**受け取った版をそのまま**）書く。 */
   writeTombstone(table: TableIo, key: string, claim: Claim): void {
-    const columns = this.tombstoneWriteColumns()
+    const columns = TOMBSTONE_WRITE_COLUMNS
     const statement = this.prepare(this.db, `write-tombstone`, () => {
       const excluded = {
         ts: `"excluded".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
@@ -643,16 +638,6 @@ class ImportIo {
   }
 
   /* -------------------- 内部 -------------------- */
-
-  private tombstoneWriteColumns(): string[] {
-    const wanted = [
-      'tableName',
-      'recordId',
-      'deletedAt',
-      ...Object.values(VERSION_COLUMNS),
-    ]
-    return wanted.filter((column) => this.tombstoneColumns.has(column))
-  }
 
   private toRowClaim(
     table: TableIo,
@@ -752,10 +737,4 @@ function defaultOf(column: RowsColumn): string | null {
 function defaultExpression(table: TableIo, column: string): string {
   const text = table.defaults.get(column)
   return text === null || text === undefined ? 'NULL' : `(${text})`
-}
-
-function readLamport(db: Database.Database): number {
-  const row = db.prepare(`SELECT lamport FROM _sns_clock`).get() as
-    { lamport: number } | undefined
-  return row === undefined ? 0 : Number(row.lamport)
 }

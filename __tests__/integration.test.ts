@@ -416,6 +416,25 @@ describe('Integration Tests', () => {
         'Validation failed'
       )
     })
+
+    it('宣言された主キーが primaryKey の列でない表がある場合にエラーをスローする', () => {
+      const clientDir = path.join(testDir, 'other-pk')
+      fs.mkdirSync(clientDir, { recursive: true })
+      const dbPath = path.join(clientDir, 'local.sqlite')
+      const db = new Database(dbPath)
+      db.exec(`
+        CREATE TABLE items (
+          id TEXT NOT NULL,
+          uuid TEXT PRIMARY KEY NOT NULL,
+          updatedAt TEXT NOT NULL
+        )
+      `)
+      db.close()
+
+      expect(() => setupSync(makeConfig(dbPath, 'other-pk'))).toThrow(
+        "Primary key column 'id' is not the declared PRIMARY KEY"
+      )
+    })
   })
 
   describe('複数テーブルsync', () => {

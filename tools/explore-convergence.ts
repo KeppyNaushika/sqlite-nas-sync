@@ -233,7 +233,7 @@ async function main(): Promise<number> {
     )
     if (!ok) {
       out(
-        '削減手の前提が崩れているので探索しない（--no-por / --no-symmetry で外せば探索はできる）\n'
+        '削減手の前提が崩れているので探索しない（--no-por で外せば探索はできる）\n'
       )
       fs.rmSync(config.workRoot, { recursive: true, force: true })
       return 2
@@ -268,7 +268,7 @@ async function main(): Promise<number> {
    *   0行だった、届いた行と UNIQUE がぶつかって挿入が失敗した、など）。設計上も結果が変わってよい形を
    *   含む（history.ts）
    *
-   * **どちらも違反にしない**（docs/rows-table-design.md §8.1 第11版）。案A では `_sns_ts` の
+   * **どちらも違反にしない**（docs/rows-table-design.md §8.1）。案A では `_sns_ts` の
    * 引き上げ（§1.2.1）があるので、「同じ操作の集まり ⇒ 同じ見え方」（強）は**成り立たない**:
    * 他端末の版を取り込んだあとに、より古い時刻でその行を書くと、引き上げのぶんだけ強い版になる
    * （取り込んでいなければ弱い版のまま）。したがってこの検査は**件数の記録**として扱い、
@@ -391,17 +391,13 @@ async function main(): Promise<number> {
     }
   }
   // 根は何も書いていない空の世界。操作の列は空、見え方も空。鍵の作り方はワーカーの子と揃える
-  // （tools/explore-worker.ts の chooseCanonical。揃えないと、何も書かない列が根と別の節に見える）
+  // （tools/explore-worker.ts の historyKeys。揃えないと、何も書かない列が根と別の節に見える）
+  const emptyHistory = Array.from({ length: config.clients }, () => [])
   const rootHistoryKey = config.scheduleCheck
-    ? historyKey(
-        Array.from({ length: config.clients }, () => []),
-        Array.from({ length: config.clients }, (_, index) => index),
-        config.scheduleKey
-      )
+    ? historyKey(emptyHistory, config.scheduleKey)
     : ''
   const root: FrontierNode = {
     path: [],
-    frameKey: firstReady.rootFrameKey,
     history: Array.from({ length: config.clients }, () => []),
     stateKey: firstReady.rootKey,
     mask: (1 << config.clients) - 1,
@@ -410,21 +406,17 @@ async function main(): Promise<number> {
   const rootEntry: SeenEntry = {
     key: root.key,
     stateKey: root.stateKey,
-    mask: firstReady.rootMask,
+    mask: root.mask,
   }
   visit(rootEntry)
   stateSet.add(root.stateKey)
   views.set(root.stateKey, { kind: 'view', view: '[]' })
   historyIndex.set(rootHistoryKey, { view: '[]', path: [] })
   if (config.scheduleCheck) {
-    statusIndex.set(
-      historyKey(
-        Array.from({ length: config.clients }, () => []),
-        Array.from({ length: config.clients }, (_, index) => index),
-        'ops+status'
-      ),
-      { view: '[]', path: [] }
-    )
+    statusIndex.set(historyKey(emptyHistory, 'ops+status'), {
+      view: '[]',
+      path: [],
+    })
   }
   for (const worker of workers) {
     send(worker, {
@@ -568,12 +560,12 @@ async function main(): Promise<number> {
     // 仕事の単位。節の少ない層（根の層は1節）で節をまるごと1つのワーカーへ渡すと、
     // 他のワーカーが遊ぶ。そのときは1つの節の遷移を範囲に分けて配る
     //
-    // 節は「世界の上で同じ状態」（frameKey）ごとに組にする。組の中の節は操作の列だけが違い、
+    // 節は同じ状態（stateKey）ごとに組にする。組の中の節は操作の列だけが違い、
     // 遷移を1回実行すれば全員の子が作れる（tools/explore-worker.ts の expand）
     const groups = new Map<string, FrontierNode[]>()
     for (const node of frontier) {
-      const group = groups.get(node.frameKey)
-      if (group === undefined) groups.set(node.frameKey, [node])
+      const group = groups.get(node.stateKey)
+      if (group === undefined) groups.set(node.stateKey, [node])
       else group.push(node)
     }
     const units: ExpandUnit[] = []
@@ -630,7 +622,7 @@ async function main(): Promise<number> {
               const entry: SeenEntry = {
                 key: child.key,
                 stateKey: child.stateKey,
-                mask: child.canonicalMask,
+                mask: child.mask,
               }
               if (config.dedup) {
                 if (!visit(entry)) {
@@ -655,7 +647,6 @@ async function main(): Promise<number> {
               }
               next.push({
                 path: child.path,
-                frameKey: child.frameKey,
                 history: child.history,
                 stateKey: child.stateKey,
                 mask: child.mask,
@@ -721,7 +712,7 @@ async function main(): Promise<number> {
   }
 
   /**
-   * 挟み方の食い違いの代表例（違反ではない。§8.1 第11版）。強いほうを優先し、
+   * 挟み方の食い違いの代表例（違反ではない。§8.1）。強いほうを優先し、
    * 無ければ弱いほうを1つだけ書き下す。
    */
   const scheduleExample: Conflict | null =
@@ -781,7 +772,7 @@ async function main(): Promise<number> {
     `  当てた遷移: ${String(t.transitions)}`,
     ...(config.scheduleCheck
       ? [
-          `  挟み方の検査（違反ではなく件数の記録。設計書 §8.1 第11版）: ` +
+          `  挟み方の検査（違反ではなく件数の記録。設計書 §8.1）: ` +
             `発行した操作の列 ${String(historyIndex.size)} 通りについて見え方を突き合わせた` +
             `（強い食い違い ${String(strongConflicts)} 組・弱い食い違い ${String(weakConflicts)} 組。history.ts の「比べない履歴」に当たるので突き合わせなかった節 ${String(skippedIncomparable)}）`,
         ]

@@ -1,30 +1,45 @@
 /**
  * 「検査器が発行した操作の列」→「版の集合」→ 参照実装 `rows-d1` の見え方。
  *
- * 判定4（設計書 §8.1）の本来の入力は、**性質2 で集めた版**（実装の `_sns_rows_*` から
- * 読み取ったもの）である。しかし案A が入るまでその表は存在しないので、段階0 では
- * **発行した操作の列から版を組み立てて**参照実装に渡す。組み立ての規則は設計書 §1.2.1
- * （`_sns_ts` の引き上げ）・§2.2（アプリの接続で起きた変化はすべて事実）そのままである。
+ * 判定4（設計書 §8.1）の本来の入力は、**判定2 で集めた版**（実装の `_sns_rows_*` から
+ * 読み取ったもの）である。ここでは実装の表を読まず、**発行した操作の列から版を組み立てて**
+ * 参照実装に渡す（実装の表から読むと、実装の誤りがそのまま参照実装の入力に流れ込む）。
+ * 組み立ての規則は docs/principles.md の原則2 と付則1、設計書 §1.2.1（`_sns_ts` の引き上げ）・
+ * §2 の R0（アプリの接続で起きた変化はすべて事実）そのままである。
+ *
+ * ## 削除の版の時刻（原則2）
+ *
+ * 削除の版の `_sns_ts` は「削除を実行した時刻」と「その端末の手元の Max」の大きい方である。
+ * 実行した時刻は検査器の時計 C（tools/explore/world.ts の「時計」）で、操作の列には載らない。
+ * 分かっているのは次のことだけなので、{@link execMomentOrders} で**ありうる並びを全部**試す。
+ *
+ * - どの実行時刻も、範囲の過去の行の時刻（2026-01-01…）より後で、未来の行の時刻
+ *   （2099-01-01…）より前
+ * - 同じ端末の削除は、発行した順に実行時刻が弱くならない
+ * - 別の端末の削除どうしは、同じ瞬間（同着）のことも、どちらが先のこともある
  *
  * ## 決められない列は `null` を返す（＝その状態では突き合わせない）
  *
  * 発行した操作の列だけからは、**同期がどこで挟まったか**が分からない。同期の位置で
- * 事実そのものが変わる形が3つある。
+ * 事実そのものが変わる形がある。
  *
  * 1. **`_sns_ts` の引き上げ**（§1.2.1）: 他の端末から届いた版が手元の `Max` に入っていれば、
  *    そのあとの書き込み・削除の `_sns_ts` はそこまで引き上がる
- * 2. **cascade で消える子**（§2.2）: 親を消したとき一緒に消えるのは「その時点でその端末に
+ * 2. **cascade で消える子**（§2 の R0）: 親を消したとき一緒に消えるのは「その時点でその端末に
  *    在った子」なので、届いていたかどうかで削除の版の集合が変わる
  * 3. **時刻列を変えない UPDATE**: 版に載る時刻列の値は、そのとき行に入っていた値である
  * 4. **`L`（lamport）の引き上げ**（§4.3・不変条件 C）: 取り込みは `_sns_clock.lamport` を
  *    受け取った版の最大まで引き上げるので、取り込んだあとの書き込みは大きい `L` を名乗る
  *    （{@link tiedAcrossInstances}）
- * 5. **読み替えのあとの削除**（§1.6・§3.3 の `TRUE_ID`）: アプリは表示上の id で消すので、
- *    かぶりに負けて読み替えられた行があると、同じ `DELETE` 文が違う真の id の版を作る
+ * 5. **読み替えのあとの削除**（§1.3〜1.7 の表示値・§3.3 の `TRUE_ID`）: アプリは表示上の id で
+ *    消すので、かぶりに負けて読み替えられた行があると、同じ `DELETE` 文が違う真の id の版を作る
  *    （{@link hasRemap}）
+ * 6. **統合した行の削除**（原則3）: 統合した行を消すと、その時点でその端末で隠れていた側の
+ *    主キーにも削除の版が書かれる。何が隠れていたかは取り込みの位置で変わる
+ *    （{@link mayMergeOnDelete}）
  *
- * 1 については、**ありうる引き上げ方を全部試し、どれでも同じ見え方になるときだけ**答える
- * （場合の数が多すぎるときは `null`）。2・3・4・5 については、その形なら `null` にする。
+ * 1 と削除の実行時刻については、**ありうる付け方を全部試し、どれでも同じ見え方になるときだけ**
+ * 答える（場合の数が多すぎるときは `null`）。2〜6 については、その形なら `null` にする。
  * `null` を返すと検査器はその状態を飛ばすので、**見落としはしても誤検出はしない**側に倒れる。
  *
  * ## `iid` について
@@ -32,12 +47,14 @@
  * 本物の `instanceId` は 128 ビットの乱数なので、操作の列からは決められない。そこで
  * 端末の並び順を**両方の向き**（`iid-a` ＜ `iid-b` と、その逆）で試し、どちらでも同じ
  * 見え方になるときだけ答える。同着（`_sns_ts` も `L` も等しい）が `iid` の字面で決まる形は、
- * 向きで答えが変わるので `null` になる —— その形の勝敗は設計上も端末の乱数で決まる（§9.6）。
+ * 向きで答えが変わるので `null` になる —— その形の勝敗は、仕様でも「どのクライアントで比べても
+ * 同じ答えになる」ことしか決まっていない（docs/principles.md の付則1）。
  *
  * @module tools/explore/oracles/from-history
  */
 import { History, IssuedOp, Oracle } from '../history'
-import { NEW_OP_TABLES, PLAIN_TABLES, Op } from '../ops'
+import Database from 'better-sqlite3'
+import { NEW_OP_TABLES, Op } from '../ops'
 import { DDL } from '../world'
 import {
   Derived,
@@ -59,11 +76,13 @@ type Event = {
   id: string
   kind: 'row' | 'delete'
   content?: Record<string, SqlValue>
-  /**
-   * 行の版のときの、アプリの表の時刻列の新しい値。**格納クラスのまま持つ**
-   * （数値の時刻を文字列にすると、設計書 §1.2.3 の群1 が群2 へ移る）
-   */
+  /** 行の版のときの、アプリの表の時刻列の新しい値 */
   writtenAt?: SqlValue
+  /**
+   * 削除の版のときの、削除を実行した瞬間の番号（端末の中で発行した順に振る）。
+   * 1つの `DELETE` 文が cascade で消した子は、親と同じ瞬間を持つ
+   */
+  moment?: number
 }
 
 /** 親の表（子の表から見た親と、子の外部キーの列）。 */
@@ -95,8 +114,6 @@ function tablesOf(op: Op): string[] {
       return ['accounts']
     case 'updateKeepTime':
     case 'deleteRecreate':
-    case 'upsertPlain':
-    case 'deletePlain':
       return [op.table]
     default:
       return []
@@ -128,7 +145,7 @@ function statusOf(entry: IssuedOp, label: string): string | null {
 
 /**
  * 端末ごとの「自分が書いた行」の写し。cascade で消える子を決めるのに使う
- * （**その端末に在った子**しか消えない。§2.2）。
+ * （**その端末に在った子**しか消えない。§2 の R0）。
  */
 type LocalRows = Map<string, Map<string, Record<string, SqlValue>>>
 
@@ -164,6 +181,7 @@ type Step =
 /** 発行した操作の列を、端末ごとの書き込みの列（`L` つき）へ開く。決められなければ `null`。 */
 function eventsOf(history: History): Event[] | null {
   const events: Event[] = []
+  let moments = 0
   const local: LocalRows[] = history.map(() => new Map())
   // 他の端末が書いた子（cascade の巻き添えが決められるかの判定に使う）
   const childrenByParent = new Map<string, Set<number>>()
@@ -233,7 +251,7 @@ function eventsOf(history: History): Event[] | null {
           continue
         }
         // cascade の巻き添え: 他の端末がその親の子を書いていると、届いていたかどうかで
-        // 削除の版の集合が変わる（§2.2）ので、決められないことにする
+        // 削除の版の集合が変わる（§2 の R0）ので、決められないことにする
         const others = childrenByParent.get(`${step.table}:${step.id}`)
         if (
           others !== undefined &&
@@ -241,6 +259,8 @@ function eventsOf(history: History): Event[] | null {
         ) {
           return null
         }
+        const moment = moments
+        moments += 1
         for (const victim of cascadeFrom(local[client], step)) {
           lamport += 1
           events.push({
@@ -249,6 +269,7 @@ function eventsOf(history: History): Event[] | null {
             table: victim.table,
             id: victim.id,
             kind: 'delete',
+            moment,
           })
           local[client].get(victim.table)?.delete(victim.id)
         }
@@ -385,25 +406,6 @@ function stepsOf(entry: IssuedOp): Step[] {
     case 'deleteUser':
       if (rowOk) steps.push({ kind: 'delete', table: 'users', id: op.id })
       break
-    case 'upsertPlain':
-      if (rowOk) {
-        steps.push({
-          kind: 'write',
-          table: op.table,
-          id: op.id,
-          content: {
-            id: op.id,
-            [PLAIN_TABLES[op.table].column]: op.name,
-            // **数値のまま持つ**（文字列にすると設計書 §1.2.3 の群1 が群2 へ移り、
-            // 参照実装が本物と違う順序で比べることになる）
-            updatedAt: op.at,
-          },
-        })
-      }
-      break
-    case 'deletePlain':
-      if (rowOk) steps.push({ kind: 'delete', table: op.table, id: op.id })
-      break
     case 'deleteDecision':
       if (rowOk) steps.push({ kind: 'delete', table: 'decisions', id: op.id })
       break
@@ -422,7 +424,7 @@ function stepsOf(entry: IssuedOp): Step[] {
       }
       break
     case 'deleteRecreate': {
-      // 消してから、同じ id で入れ直す（この順に事実になる。§2.4 (4)）
+      // 消してから、同じ id で入れ直す（この順に事実になる。§2 の R0）
       if (rowOk) steps.push({ kind: 'delete', table: op.table, id: op.id })
       if (statusOf(entry, 'recreate') === 'ok') {
         const shape = NEW_OP_TABLES[op.table]
@@ -444,11 +446,66 @@ function stepsOf(entry: IssuedOp): Step[] {
 }
 
 /**
- * ありうる `_sns_ts` の付け方（設計書 §1.2.1）を全部作る。
+ * 削除を実行した瞬間の、ありうる並びを全部作る（モジュール冒頭の「削除の版の時刻」）。
+ *
+ * 返す配列の1つは「瞬間の番号 → 順位」で、順位が同じ瞬間は同着を表す。
+ * 同じ端末の瞬間は、発行した順に順位が下がらないものだけを残す。
+ *
+ * @returns 並びの候補。瞬間が多すぎれば `null`
+ */
+function execMomentOrders(events: Event[]): number[][] | null {
+  const clientOf = new Map<number, number>()
+  for (const event of events) {
+    if (event.moment !== undefined) clientOf.set(event.moment, event.client)
+  }
+  const count = clientOf.size
+  // 4つ以上だと並びが75通りを超え、引き上げの組み合わせと掛け合わせて手に負えない
+  if (count > 3) return null
+  const orders: number[][] = []
+  const walk = (ranks: number[]): void => {
+    if (ranks.length === count) {
+      // 使った順位に隙間が無いこと（同じ並びを二度数えない）
+      const used = new Set(ranks)
+      for (let rank = 0; rank < used.size; rank += 1) {
+        if (!used.has(rank)) return
+      }
+      // 同じ端末の瞬間は、発行した順に弱くならない（瞬間の番号は端末の中で発行した順）
+      for (let later = 0; later < count; later += 1) {
+        for (let earlier = 0; earlier < later; earlier += 1) {
+          if (
+            clientOf.get(earlier) === clientOf.get(later) &&
+            ranks[later] < ranks[earlier]
+          ) {
+            return
+          }
+        }
+      }
+      orders.push(ranks)
+      return
+    }
+    for (let rank = 0; rank < count; rank += 1) walk([...ranks, rank])
+  }
+  walk([])
+  return orders
+}
+
+/**
+ * 順位 `rank` の実行時刻として仮に置く値。範囲の過去の行の時刻（2026-01-01…）より後で、
+ * 未来の行の時刻（2099-01-01…）より前にある ISO 8601 の文字列（付則1 の値の種類の順序で
+ * 行の時刻と同じ種類）。値そのものは見え方に出ない（削除の版は表に置かれない）。
+ */
+function execTime(rank: number): string {
+  return new Date(Date.UTC(2050, 0, 1) + rank).toISOString()
+}
+
+/**
+ * ありうる `_sns_ts` の付け方（設計書 §1.2.1・原則2）を全部作る。
  *
  * ある書き込みの `_sns_ts` は「アプリが書いた時刻列の値」と「その端末の手元の `Max`」の
- * 大きい方である。手元の `Max` には他の端末から届いた版が入りうるので、候補は
- * 「そのキーに現れる時刻のうち、自分の値以上のもの」になる。**ありうる組み合わせを全部**
+ * 大きい方である。削除の版は「削除を実行した時刻」と「手元の `Max`」の大きい方である。
+ * 手元の `Max` には他の端末から届いた版が入りうるので、候補は「そのキーに現れる時刻
+ * （書いた時刻と、そのキーの削除の実行時刻）のうち、自分の値以上のもの」になる。
+ * 実行時刻の並び（{@link execMomentOrders}）と引き上げ方の**ありうる組み合わせを全部**
  * 作り、どれでも同じ見え方になるときだけ答える。
  *
  * @returns 版の集合の候補。場合の数が多すぎれば `null`
@@ -457,50 +514,53 @@ function assignmentsOf(
   events: Event[],
   values: ValueOracle
 ): Version[][] | null {
-  // キーごとに現れる時刻（引き上げ先の候補）
-  const timesByKey = new Map<string, SqlValue[]>()
-  for (const event of events) {
-    if (event.writtenAt === undefined) continue
-    const key = `${event.table}:${event.id}`
-    const list = timesByKey.get(key) ?? []
-    if (
-      !list.some(
-        (value) => values.compareTs(value, event.writtenAt as SqlValue) === 0
-      )
-    ) {
-      list.push(event.writtenAt)
-    }
-    timesByKey.set(key, list)
-  }
-
-  // 各書き込みの候補
-  const choices: SqlValue[][] = events.map((event) => {
-    const key = `${event.table}:${event.id}`
-    const times = timesByKey.get(key) ?? []
-    if (event.kind === 'delete') {
-      // 削除の版は「手元の Max の _sns_ts」。そのキーに現れるどの時刻にもなりうる
-      return times.length === 0 ? [null] : times
-    }
-    const own = event.writtenAt as SqlValue
-    return times.filter((value) => values.compareTs(value, own) >= 0)
-  })
-
-  const total = choices.reduce(
-    (product, list) => product * Math.max(1, list.length),
-    1
-  )
-  if (total > 64) return null
-
+  const orders = execMomentOrders(events)
+  if (orders === null) return null
   const assignments: Version[][] = []
-  const walk = (index: number, chosen: SqlValue[]): void => {
-    if (index === events.length) {
-      const versions = buildVersions(events, chosen, values)
-      if (versions !== null) assignments.push(versions)
-      return
+  for (const order of orders) {
+    const execOf = (event: Event): SqlValue =>
+      execTime(order[event.moment as number])
+
+    // キーごとに現れる時刻（引き上げ先の候補）
+    const timesByKey = new Map<string, SqlValue[]>()
+    const addTime = (key: string, value: SqlValue): void => {
+      const list = timesByKey.get(key) ?? []
+      if (!list.some((known) => values.compareTs(known, value) === 0)) {
+        list.push(value)
+      }
+      timesByKey.set(key, list)
     }
-    for (const value of choices[index]) walk(index + 1, [...chosen, value])
+    for (const event of events) {
+      const key = `${event.table}:${event.id}`
+      if (event.kind === 'delete') addTime(key, execOf(event))
+      else addTime(key, event.writtenAt as SqlValue)
+    }
+
+    // 各書き込みの候補（自分の値と、それ以上の、そのキーに現れる時刻）
+    const choices: SqlValue[][] = events.map((event) => {
+      const times = timesByKey.get(`${event.table}:${event.id}`) ?? []
+      const own =
+        event.kind === 'delete' ? execOf(event) : (event.writtenAt as SqlValue)
+      return times.filter((value) => values.compareTs(value, own) >= 0)
+    })
+
+    const total = choices.reduce(
+      (product, list) => product * Math.max(1, list.length),
+      1
+    )
+    if (total > 64) return null
+
+    const walk = (index: number, chosen: SqlValue[]): void => {
+      if (index === events.length) {
+        const versions = buildVersions(events, chosen, values)
+        if (versions !== null) assignments.push(versions)
+        return
+      }
+      for (const value of choices[index]) walk(index + 1, [...chosen, value])
+    }
+    walk(0, [])
+    if (assignments.length > 256) return null
   }
-  walk(0, [])
   return assignments.length === 0 ? null : assignments
 }
 
@@ -560,13 +620,14 @@ function buildVersions(
  * **違う端末の版が、同着の `_sns_ts` で並ぶ**形である。その形は突き合わせない。
  *
  * **キーごとではなく表ごとに見る。** 同着の `L` が効くのは同じキーの `Max` を決めるときだけでなく、
- * **かぶりの勝者を決めるとき**（§1.5。同じ表の違うキーの版どうしを比べる）もあるからである。
+ * **かぶりの勝者を決めるとき**（§1.3〜1.7 のかぶり。同じ表の違うキーの版どうしを比べる）もあるからである。
  *
  * これを入れる前は、次の2つの列で誤検出した（実測。案A の実装はどちらも設計どおりだった）:
  *
  * - a が同期の最中に `tag_profiles` の g1 を作り（親の `tags` も作る）、b が同期の最中に
  *   その g1 を消す。b は消す前に a の版を取り込んでいるので `L` が引き上がり、**削除が勝つ**。
  *   端末ごとの書き込み順だけで `L` を振ると、削除の `L` は 1 のままで a の版（`L` は 2）に負ける
+ *   （原則2 を入れる前の例。いまは削除の版が実行した時刻を持つので、この形は `_sns_ts` で決まる）
  * - a が `tags` の g1 を t2(T0) → t1(T1) と書き、b が同期の最中に g2 を t1(T1) で作る。名前 t1 が
  *   かぶり、どちらの `_sns_ts` も T1 なので `L` で決まる。b は取り込みで `L` が引き上がっているので
  *   **g2 が勝つ**。端末ごとの書き込み順だけだと、g1（`L` は 2）が g2（`L` は 1）に勝つ
@@ -585,6 +646,14 @@ function tiedAcrossInstances(
     for (const a of list) {
       for (const b of list) {
         if (a.instance === b.instance) continue
+        // 削除の版が比べられるのは同じキーの版とだけ（`Max` を決めるとき）。かぶりの勝者を
+        // 決めるのは行の版どうしなので、違うキーの削除の版との同着は答えを変えない
+        if (
+          (a.kind === 'delete' || b.kind === 'delete') &&
+          values.idKey(a.id) !== values.idKey(b.id)
+        ) {
+          continue
+        }
         if (values.compareTs(a.ts, b.ts) === 0) return true
       }
     }
@@ -595,7 +664,7 @@ function tiedAcrossInstances(
 /**
  * **読み替え（`Res_p(k) ≠ k`）が起きているか。**
  *
- * かぶりに負けた行は、勝った行の主キーで表示される（設計書 §1.6）。アプリはその**表示上の id** で
+ * かぶりに負けた行は、勝った行の主キーで表示される（設計書 §1.3〜1.7 の表示値）。アプリはその**表示上の id** で
  * 消すので、同じ `DELETE` 文が、いつ同期を挟んだかによって**違う真の id の版**を作る
  * （トリガーは `_sns_shown` を引いて真の id を記録する。§3.3 の `TRUE_ID`）。
  * 発行した操作の列からは、削除がどの真の id に当たったかを決められない。
@@ -614,6 +683,79 @@ function hasRemap(derived: Derived): boolean {
     }
   }
   return false
+}
+
+/**
+ * 表ごとの UNIQUE の列の組（主キーを除く）。DDL から一時 DB を作って `PRAGMA` で読む
+ * （字句解析すると、宣言の書き方の違いで取りこぼす）。
+ */
+const uniqueColumnSets = new Map<string, string[][]>()
+
+function uniqueColumnsOf(table: string): string[][] {
+  const cached = uniqueColumnSets.get(table)
+  if (cached !== undefined) return cached
+  const db = new Database(':memory:')
+  try {
+    // 親の表が無くても `CREATE TABLE` は通る（外部キーは宣言だけ）
+    db.exec(DDL[table])
+    const indexes = db.pragma(`index_list("${table}")`) as {
+      name: string
+      unique: number
+      origin: string
+    }[]
+    const sets = indexes
+      .filter((index) => index.unique === 1 && index.origin !== 'pk')
+      .map((index) =>
+        (db.pragma(`index_info("${index.name}")`) as { name: string }[]).map(
+          (column) => column.name
+        )
+      )
+    uniqueColumnSets.set(table, sets)
+    return sets
+  } finally {
+    db.close()
+  }
+}
+
+/**
+ * 表の中で、違う id の2行が UNIQUE で衝突しうるか（統合が起きうるか。原則3）。
+ * 列に現れる行の版の中身だけから決める。1:1 の子の表（主キーが親の主キーを指す）は、
+ * 親が統合されると子も表示上の主キーで衝突するので、親の答えを引き継ぐ。
+ */
+function mayMerge(events: Event[], table: string): boolean {
+  const parent = PARENT_OF[table]
+  if (parent !== undefined && parent.column === 'id') {
+    if (mayMerge(events, parent.parent)) return true
+  }
+  const rows = events.filter(
+    (event) => event.table === table && event.kind === 'row'
+  )
+  for (const columns of uniqueColumnsOf(table)) {
+    const owners = new Map<string, Set<string>>()
+    for (const row of rows) {
+      const values = columns.map((column) => row.content?.[column] ?? null)
+      if (values.some((value) => value === null)) continue
+      const key = JSON.stringify(values)
+      const ids = owners.get(key) ?? new Set<string>()
+      ids.add(row.id)
+      owners.set(key, ids)
+      if (ids.size > 1) return true
+    }
+  }
+  return false
+}
+
+/**
+ * **統合で隠れた行を巻き込みうる削除があるか**（原則3）。
+ *
+ * 統合した行を消すと、その時点でその端末で隠れていた側の主キーにも削除の版が書かれる。
+ * 何が隠れていたかは、他の端末の版をいつ取り込んだかで変わるので、発行した操作の列からは
+ * 決められない。統合が起きうる表に削除があれば突き合わせない。
+ */
+function mayMergeOnDelete(events: Event[]): boolean {
+  return events.some(
+    (event) => event.kind === 'delete' && mayMerge(events, event.table)
+  )
 }
 
 /** 表示上の id を指す削除（`deleteRecreate` を含む）が列にあるか。 */
@@ -636,6 +778,7 @@ export const rowsD1Oracle: Oracle = {
     if (schema.tables.length === 0) return null
     const events = eventsOf(history)
     if (events === null) return null
+    if (mayMergeOnDelete(events)) return null
     const deletes = hasDelete(history)
     const values = new ValueOracle()
     const views = new Set<string>()

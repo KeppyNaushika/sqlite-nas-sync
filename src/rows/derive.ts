@@ -47,10 +47,11 @@ export interface RowsSchema {
 /**
  * 候補（＝ `Max` が行の版だった id）の行き先。設計書 §1.4〜§1.6。
  *
- * `discarded` だけは他と質が違う —— 版そのものを捨てる（原則4）。
- * 他の3つはアプリの表での置き場所の話で、版は `_sns_rows_<表>` に残る。
+ * `parentDeleted` は置かない行のうち、親行が削除されているもの（原則4・付則3）。
+ * どの行き先でも版は `_sns_rows_<表>` に残る。行き先は版の集合だけで決まるので、
+ * 親行が書き直されて削除の版に勝てば、同じ版がそのまま置く行に戻る。
  */
-export type Placement = 'placed' | 'hidden' | 'unplaceable' | 'discarded'
+type Placement = 'placed' | 'hidden' | 'unplaceable' | 'parentDeleted'
 
 /** 1つの候補について分かったこと。 */
 export interface CandidateResult {
@@ -65,11 +66,9 @@ export interface CandidateResult {
   /** 隠れた行・置かない行になった理由（SQLite が返したメッセージなど） */
   reason?: string
   /**
-   * 置かない行になった筋。`parent` は §1.4 の「親が置かれていない」、
-   * `constraint` は行に閉じた制約（NOT NULL / CHECK / 型）で SQLite が拒んだもの
+   * 原因の親（原則4）。`placement` が `parentDeleted` のときだけ入る。
+   * 連鎖（孫）では大元の削除を指す
    */
-  reasonKind?: 'parent' | 'constraint'
-  /** 捨てる原因になった親（原則4）。`placement` が `discarded` のときだけ入る */
   cause?: { table: string; key: string }
 }
 
@@ -77,11 +76,6 @@ export interface CandidateResult {
 interface DerivedRows {
   /** 表 → 真の id の正規形 → 候補の結果 */
   candidates: Map<string, Map<string, CandidateResult>>
-  /**
-   * 表 → 真の id の正規形 → `Res`（表示上の主キーの値の組。`⊥` は null。設計書 §1.6）。
-   * 死んでいる id は載らない（載っていないのは `⊥` と同じに扱う）
-   */
-  res: Map<string, Map<string, SqlValue[] | null>>
   /** 表 → 置く行（`SELECT *` と同じ列の並びの、アプリの表の行） */
   rows: Map<string, Record<string, SqlValue>[]>
   /** 死んでいる id（`Max` が削除の版）の正規形 */
@@ -134,9 +128,8 @@ const COLLISION_CODES = new Set([
 interface ForeignKey {
   /** 子側の列 */
   columns: string[]
+  /** 親の表。参照する列は親の主キーである（付則4） */
   parentTable: string
-  /** 親側の列（`REFERENCES t(id)` の `id`。省略されていれば空＝親の主キー） */
-  parentColumns: string[]
   onDelete: string
 }
 
@@ -212,11 +205,17 @@ function deriveWith(
   }
 
   const candidates = new Map<string, Map<string, CandidateResult>>()
+  /**
+   * 表 → 真の id の正規形 → `Res`（表示上の主キーの値の組。`⊥` は null。設計書 §1.6）。
+   * 子の外部キーを読み替えるのに使う。
+   * 死んでいる id は載らない（載っていないのは `⊥` と同じに扱う）
+   */
   const res = new Map<string, Map<string, SqlValue[] | null>>()
   const rows = new Map<string, Record<string, SqlValue>[]>()
   const dead = new Map<string, Set<string>>()
   /**
-   * 消えている id（原則4）。表 → 真の id の正規形 → 大元の削除（`<表>:<id>`）。
+   * 削除されている id と、親が削除されているので置かない id（原則4・付則3）。
+   * 表 → 真の id の正規形 → 大元の削除（`<表>:<id>`）。
    * 親が先に並んでいるので（`model.order`）、子を見るときには親のぶんが揃っている。
    */
   const gone = new Map<string, Map<string, string>>()
@@ -254,27 +253,19 @@ function deriveWith(
 
     for (const version of living) {
       const key = values.idKey(version.id)
-      const shown = displayValues(
-        values,
-        model,
-        table,
-        version,
-        res,
-        candidates,
-        gone
-      )
-      if (shown.kind === 'discard') {
-        // 親が削除されている。版ごと捨てる（原則4）。捨てた中身は呼び出し元が報告する
+      const shown = displayValues(values, model, table, version, res, gone)
+      if (shown.kind === 'parentDeleted') {
+        // 親が削除されている間は置かない（原則4・付則3）。版は残す
         tableCandidates.set(key, {
           table: name,
           key,
-          placement: 'discarded',
+          placement: 'parentDeleted',
           display: { ...(version.content ?? {}) },
           reason: `親が削除されている（${shown.cause.table}:${shown.cause.key}）`,
-          reasonKind: 'parent',
           cause: shown.cause,
         })
         tableRes.set(key, null)
+        // この行を親とする孫も、同じ大元の削除で置かない（連鎖）
         tableGone.set(key, `${shown.cause.table}:${shown.cause.key}`)
         continue
       }
@@ -284,8 +275,8 @@ function deriveWith(
           key,
           placement: 'unplaceable',
           display: { ...(version.content ?? {}) },
-          reason: '親が置かれていない（設計書 §1.4）',
-          reasonKind: 'parent',
+          reason:
+            '外部キーが指す親の行がユーザーテーブルに入っていない（親の行がまだ届いていないか、親の行自体が制約で入らない）',
         })
         tableRes.set(key, null)
         continue
@@ -303,7 +294,6 @@ function deriveWith(
           placement: 'unplaceable',
           display,
           reason: '主キーが NULL',
-          reasonKind: 'constraint',
         })
         tableRes.set(key, null)
         continue
@@ -316,7 +306,6 @@ function deriveWith(
           placement: 'unplaceable',
           display,
           reason: outcome.reason,
-          reasonKind: 'constraint',
         })
         tableRes.set(key, null)
         continue
@@ -373,7 +362,7 @@ function deriveWith(
     gone.set(name, tableGone)
   }
 
-  return { candidates, res, rows, dead }
+  return { candidates, rows, dead }
 }
 
 /**
@@ -426,10 +415,10 @@ function findWinner(
 type DisplayOutcome =
   /** 置ける（表示値が決まった） */
   | { kind: 'values'; display: Record<string, SqlValue> }
-  /** 置かない行。版は `_sns_rows_<表>` に残る */
+  /** 置かない行 */
   | { kind: 'unplaceable' }
-  /** 版ごと捨てる（原則4）。`cause` は削除されている親 */
-  | { kind: 'discard'; cause: { table: string; key: string } }
+  /** 親が削除されているので置かない行（原則4）。`cause` は大元の削除 */
+  | { kind: 'parentDeleted'; cause: { table: string; key: string } }
 
 /**
  * 表示値（設計書 §1.4、原則4）。
@@ -438,14 +427,11 @@ type DisplayOutcome =
  * 宣言された `ON DELETE` に従う。主キーが親を指している（1:1 の）表では、主キーも
  * 読み替える —— `Res_p = ⊥` ならその行は置かない行になる。
  *
- * **親が「置かれていない」のか「削除されている」のかを分ける**（原則4）。
- * 削除されているなら、その子の版は捨てる —— 宣言が `ON DELETE CASCADE` である以上、
- * あとから届いた子も、その時刻によらず消える。置かない行にして版を残すと、
- * その行はアプリの表に入らないまま `_sns_rows_<表>` に永遠に残る。
+ * 置かない行のうち、**親が削除されているもの**を `parentDeleted` として分ける（付則3）。
+ * 版は捨てない。親行が書き直されて削除の版に勝てば、次の作り直しで同じ版が置く行に戻る。
+ * 分けるのは利用者へ知らせるためで、アプリの表の中身はどちらでも同じである。
  *
- * 分けられるのは**親の主キーを指している外部キーだけ**である。主キー以外の
- * `UNIQUE` 列を指しているときは、その値を持っていた親がどれだったかが決まらず、
- * 「どの削除が原因か」を答えられない。その場合は従来どおり置かない行にする。
+ * 外部キーは親の主キーを参照している（付則4。`setupSync` の前提 P14 が確かめる）。
  */
 function displayValues(
   values: ValueOrdering,
@@ -453,7 +439,6 @@ function displayValues(
   table: TableMeta,
   version: RowVersion,
   res: Map<string, Map<string, SqlValue[] | null>>,
-  candidates: Map<string, Map<string, CandidateResult>>,
   gone: Map<string, Map<string, string>>
 ): DisplayOutcome {
   const display: Record<string, SqlValue> = {}
@@ -465,14 +450,7 @@ function displayValues(
     const trueValues = key.columns.map((column) => display[column] ?? null)
     // 複合外部キーで1列でも NULL なら、SQLite は検査しない（そのまま置く）
     if (trueValues.some((value) => value === null)) continue
-    const resolved = resolveParent(
-      values,
-      model,
-      key,
-      trueValues,
-      res,
-      candidates
-    )
+    const resolved = resolveParent(values, key, trueValues, res)
     if (resolved !== null) {
       key.columns.forEach((column, index) => {
         display[column] = resolved[index]
@@ -483,10 +461,12 @@ function displayValues(
     const isPrimary =
       key.columns.length === table.primaryKey.length &&
       key.columns.every((column) => table.primaryKey.includes(column))
-    // 親が削除されているなら、置かない行ではなく捨てる行（原則4）
-    const cause = goneParent(values, model, key, trueValues, gone)
+    // 親が削除されているなら、置かない行のうち `parentDeleted`（原則4）
+    const cause = goneParent(values, key, trueValues, gone)
     const out = (): DisplayOutcome =>
-      cause === null ? { kind: 'unplaceable' } : { kind: 'discard', cause }
+      cause === null
+        ? { kind: 'unplaceable' }
+        : { kind: 'parentDeleted', cause }
     // `ON DELETE` の綴りを読むのは `rows/on-delete.ts` の1か所だけ（写しを増やさない）
     switch (missingParentAction(key.onDelete)) {
       case 'setNull': {
@@ -504,9 +484,7 @@ function displayValues(
         if (defaults.some((value) => value === undefined)) return out()
         const asValues = defaults as SqlValue[]
         // 既定値の指す親が置かれていなければ、置かない行
-        if (
-          resolveParent(values, model, key, asValues, res, candidates) === null
-        ) {
+        if (resolveParent(values, key, asValues, res) === null) {
           return out()
         }
         key.columns.forEach((column, index) => {
@@ -523,28 +501,20 @@ function displayValues(
 }
 
 /**
- * 消えている親（原則4）。削除の版が勝っているか、親自身が捨てられたか。
+ * 削除されている親（原則4・付則3）。親の `Max` が削除の版か、親自身が
+ * 同じ理由で置かれていないか。どちらでもなければ `null`。
  *
  * `gone` は表 → 真の id の正規形 → **原因の表示**（`<表>:<id>` の形）で、
- * 親が捨てられた行だったときは、その親を捨てさせた大元の削除を指す。
- * 連鎖の根を答えるのは、利用者が「どの削除でこの行が消えたか」を1つ知れば
+ * 親自身が親の削除で置かれていないときは、その大元の削除を指す。
+ * 連鎖の根を答えるのは、利用者が「どの削除でこの行が入らないか」を1つ知れば
  * 足りるからである。
- *
- * 主キー以外の `UNIQUE` 列を指す外部キーでは `null`（どの親だったか決まらない）。
  */
 function goneParent(
   values: ValueOrdering,
-  model: SchemaModel,
   key: ForeignKey,
   trueValues: SqlValue[],
   gone: Map<string, Map<string, string>>
 ): { table: string; key: string } | null {
-  const parent = model.tables.get(key.parentTable) as TableMeta
-  const parentColumns = model.parentColumnsOf(key)
-  const isParentPrimaryKey =
-    parentColumns.length === parent.primaryKey.length &&
-    parentColumns.every((column) => parent.primaryKey.includes(column))
-  if (!isParentPrimaryKey) return null
   const parentKey = values.idKey(trueValues[0])
   const root = gone.get(key.parentTable)?.get(parentKey)
   if (root === undefined) return null
@@ -577,50 +547,19 @@ function literalDefault(
 }
 
 /**
- * 親の行を探す（設計書 §1.4 の表の1〜4行目）。見つからなければ `null`。
+ * 親の行の表示上の主キー（設計書 §1.4）。親が置かれていなければ `null`。
  *
- * - 親の主キーを指しているなら `Res_p`
- * - 主キー以外の UNIQUE 列を指しているなら、その値の組を持つ**置く行**、
- *   無ければ**隠れた行**の勝者の値
+ * 外部キーは親の主キーを参照している（付則4）ので、親の `Res_p` を引けば足りる。
+ * 主キーは1列（前提 P11）なので、外部キーの列も1つである。
  */
 function resolveParent(
   values: ValueOrdering,
-  model: SchemaModel,
   key: ForeignKey,
   trueValues: SqlValue[],
-  res: Map<string, Map<string, SqlValue[] | null>>,
-  candidates: Map<string, Map<string, CandidateResult>>
+  res: Map<string, Map<string, SqlValue[] | null>>
 ): SqlValue[] | null {
-  const parent = model.tables.get(key.parentTable) as TableMeta
-  const parentColumns = model.parentColumnsOf(key)
-  const isParentPrimaryKey =
-    parentColumns.length === parent.primaryKey.length &&
-    parentColumns.every((column) => parent.primaryKey.includes(column))
-
-  if (isParentPrimaryKey) {
-    const resolved = res.get(key.parentTable)?.get(values.idKey(trueValues[0]))
-    return resolved === undefined || resolved === null ? null : resolved
-  }
-
-  const placed = model.findPlaced(parent, parentColumns, trueValues)
-  if (placed !== null) {
-    return parentColumns.map((column) => placed[column] ?? null)
-  }
-  // 置く行が無ければ、隠れた行の勝者の値を使う。ここだけは照合順序を当てずに
-  // 真の id の正規形で比べる（判定用の DB に隠れた行は入っていないため）
-  for (const entry of candidates.get(key.parentTable)?.values() ?? []) {
-    if (entry.placement !== 'hidden' || entry.winner === undefined) continue
-    const same = parentColumns.every(
-      (column, index) =>
-        values.idKey(entry.display[column] ?? null) ===
-        values.idKey(trueValues[index])
-    )
-    if (!same) continue
-    const winner = candidates.get(key.parentTable)?.get(entry.winner)
-    if (winner === undefined) continue
-    return parentColumns.map((column) => winner.display[column] ?? null)
-  }
-  return null
+  const resolved = res.get(key.parentTable)?.get(values.idKey(trueValues[0]))
+  return resolved === undefined || resolved === null ? null : resolved
 }
 
 /* ------------------------------------------------------------------ *
@@ -723,19 +662,9 @@ class SchemaModel {
       return {
         columns: sorted.map((row) => row.from),
         parentTable: sorted[0].table,
-        // `to` が全部 NULL なら親の主キーを指している
-        parentColumns: sorted.every((row) => row.to === null)
-          ? []
-          : sorted.map((row) => row.to as string),
         onDelete: sorted[0].on_delete.toUpperCase(),
       }
     })
-  }
-
-  /** 親側の列（省略されていれば親の主キー）。 */
-  parentColumnsOf(key: ForeignKey): string[] {
-    if (key.parentColumns.length > 0) return key.parentColumns
-    return this.tables.get(key.parentTable)?.primaryKey ?? []
   }
 
   /**
@@ -842,21 +771,6 @@ class SchemaModel {
     return rows.map((row) => identityOf(table, row))
   }
 
-  /** 判定用の DB を引いて、値の組を持つ置く行を探す（照合順序が効く）。 */
-  findPlaced(
-    table: TableMeta,
-    columns: string[],
-    values: SqlValue[]
-  ): Record<string, SqlValue> | null {
-    const where = columns
-      .map((column) => `${escapeIdentifier(column)} IS ?`)
-      .join(' AND ')
-    const row = this.judge
-      .prepare(`SELECT * FROM ${escapeIdentifier(table.name)} WHERE ${where}`)
-      .get(...(values as never[]))
-    return (row as Record<string, SqlValue> | undefined) ?? null
-  }
-
   close(): void {
     this.judge.close()
     this.probe.close()
@@ -910,7 +824,9 @@ function topologicalOrder(tables: Map<string, TableMeta>): string[] {
     const mark = state.get(name)
     if (mark === 'done') return
     if (mark === 'visiting') {
-      throw new Error(`同期する表の外部キーが循環している（前提 P2）: ${name}`)
+      throw new Error(
+        `同期する表の外部キーが循環している: ${name}。同期する表どうしの外部キーは循環させられない`
+      )
     }
     state.set(name, 'visiting')
     for (const key of tables.get(name)?.foreignKeys ?? []) {

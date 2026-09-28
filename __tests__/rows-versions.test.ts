@@ -7,13 +7,14 @@
  *    群3 に入れないこと（完了条件3）
  * 2. **順序が全前順序であること**（完了条件2・判定11）。同着があるので**半順序では
  *    ない** —— 反対称は成り立たない。確かめるのは反射・完全性・推移・同着の推移
- * 3. 引き上げ（`NEWTS`）が、3つの値の**最大**になっていること
+ * 3. トリガーが使う引き上げの SQL（`maxTsSql`。§1.2.1 の `NEWTS`）が、3つの値の**最大**になっていること
  *
  * 値は「アプリの時刻列」「`_sns_rows_*._sns_ts`」「`_tombstone._sns_ts`」の
  * **3つの置き場所から取り直す**。同じ字面でも、列の照合順序と型親和性が違えば
  * 読み出される値の種類が変わる（`TEXT COLLATE NOCASE` の列に入れた数値は文字列になる）。
  */
 import Database from 'better-sqlite3'
+import { maxTsSql } from '../src/rows/triggers'
 import { SqlValue, TIME_GROUP, ValueOrdering } from '../src/rows/versions'
 
 /** 試験に使う「生の値」。境目にあるものを並べる。 */
@@ -243,20 +244,22 @@ describe('src/rows/versions —— 順序が全前順序であること（完了
     }
   })
 
-  it('引き上げは3つの値の最大になる（分岐の順に依らない）', () => {
-    // 推移が破れていると、素直な3項の最大は**引数の順で答えが変わる**。
-    // ここでは「どの順に渡しても、返った値が3つとも以上であること」を見る
+  it('トリガーの引き上げ（maxTsSql）は3つの値の最大になる（項の順に依らない）', () => {
+    // トリガーは `_sns_ts` を `maxTsSql` の SQL で決める。
+    // その SQL の答えが、JS の順序（compareTs）で見て3つとも以上であることを見る
+    const db = new Database(':memory:')
+    db.defaultSafeIntegers(true)
+    const statement = db.prepare(`SELECT ${maxTsSql(['?', '?', '?'])} AS v`)
+    const raiseTs = (x: SqlValue, y: SqlValue, z: SqlValue): SqlValue =>
+      (statement.get(x as never, y as never, z as never) as { v: SqlValue }).v
     for (let a = 0; a < size; a += 1) {
       for (let b = 0; b < size; b += 1) {
         for (let c = 0; c < size; c += 1) {
           if ((a + b * 7 + c * 13) % 17 !== 0) continue // 総当たりは重いので間引く
-          const raised = values.raiseTs(
-            taken[a].value,
-            taken[b].value,
-            taken[c].value
-          )
+          const raised = raiseTs(taken[a].value, taken[b].value, taken[c].value)
           for (const at of [a, b, c]) {
             if (values.compareTs(raised, taken[at].value) < 0) {
+              db.close()
               throw new Error(
                 `引き上げが最大になっていない: ${label(a)} / ${label(b)} / ${label(c)} → ${String(raised)}`
               )
@@ -265,6 +268,7 @@ describe('src/rows/versions —— 順序が全前順序であること（完了
         }
       }
     }
+    db.close()
   })
 })
 
@@ -293,11 +297,11 @@ describe('src/rows/versions —— 版の順序（設計書 §1.2.5）', () => {
     ).toBeLessThan(0)
   })
 
-  it('すべて等しければ 行の版 ＜ 削除の版', () => {
+  it('3つ組が同じなら種類によらず同着（付則1 と SQL の strongerSql と同じ）', () => {
     const t0 = '2026-01-01T00:00:00.000Z'
     expect(
       values.compareVersions(version(t0, 1, 'a'), version(t0, 1, 'a', 'delete'))
-    ).toBeLessThan(0)
+    ).toBe(0)
   })
 
   it('真の id の正規形は CAST(x AS TEXT) と同じ', () => {

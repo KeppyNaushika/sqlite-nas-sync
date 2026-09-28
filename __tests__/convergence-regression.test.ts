@@ -2,10 +2,10 @@
  * `convergence-properties.test.ts` が採った反例を、決定的な形へ書き下したもの。
  *
  * 性質テストは反例を毎回同じ形では出さないので、いちど採れた操作列は
- * ここへ手で並べて固定する。主張は性質テストと同じ1つだけ ——
- * **往復すれば全端末の中身は一致する。一致しないなら膠着として報告されている。**
- * 途中の帳簿（`_id_merge` / `_tombstone` / `_changelog`）の形は実装の都合なので
- * 固定しない（そこを固定すると、直し方を変えるたびに落ちる）。
+ * ここへ手で並べて固定する。
+ * 主張は性質テストと同じで、**往復すれば全クライアントの中身は完全に一致する**ことである。
+ * 内部テーブルの形は実装の都合なので固定しない。
+ * そこを固定すると、直し方を変えるたびに落ちる。
  *
  * ## ここに置いてある操作列では、収束は破れていない
  *
@@ -22,9 +22,9 @@
  *
  * 見かけの失敗の**大部分**はディスクの枯渇だったが、**全部ではない**。隔離環境で
  * 96本（19,200ケース）走らせた実測では 92本通過 / 4本失敗（約4.2%）で、
- * 残った4本は本物の破れである（`tag_profiles:g2` / `tag_notes:n1` /
- * `tag_profiles:g3` / `tag_notes:n3` が食い違ったまま、膠着として報告もされない）。
- * **これは子テーブルの族として実在し、別途修理されている。**「ディスクのせい」で
+ * 残った4本は本物の破れだった（`tag_profiles:g2` / `tag_notes:n1` /
+ * `tag_profiles:g3` / `tag_notes:n3` が食い違ったまま残った）。
+ * **これは子テーブルの族として実在し、別途修理された。**「ディスクのせい」で
  * 全部を説明してはいけない —— そう数えたために本物の失敗4件を取り逃がした前例がある。
  *
  * 性質テストが落ちたとき、`fast-check` は `Counterexample:` の行を印字する。
@@ -33,7 +33,7 @@
  * **`Counterexample: [[[[],[],[]]]]`（＝操作列が空）** のような、収束の破れとしては
  * ありえない形を報告する。読むべきは `Caused by:` の行だが、**`Caused by:` の有無は
  * ディスク由来の目印ではない**。本物のアサーション失敗も
- * `Caused by: AssertionError: ... が食い違ったまま` として同じ形で包まれる。
+ * `Caused by: AssertionError: クライアントどうしで中身が食い違っている` として同じ形で包まれる。
  * 見分けるのは中身で、**`ENOSPC` / `SQLITE_IOERR` / `disk I/O error` が出ているか**
  * だけがディスク由来の印である（この取り違えが、上の4件をディスクのせいと
  * 数え間違えた原因だった）。実測した誤診の内訳:
@@ -104,25 +104,20 @@ async function syncAll(): Promise<void> {
 }
 
 /**
- * 比較のために、同期対象の中身だけを取り出す。
+ * 比較のために、同期するユーザーテーブルの中身だけを取り出す。
+ * 内部テーブルはクライアントごとに違ってよい。
  *
- * 時刻列は**時刻として**正規化して持つ。同じ瞬間でも書式は端末ごとに違い
- * （ISO-T と旧版のスペース形式）、LWWは同着の行を書き換えないので字面は揃わない
- * まま残る。これは中身の食い違いではないので、ここでは差と数えない
- * （性質テストの `snapshot` と同じ扱い）。
+ * 時刻列は書いたままの字面で比べる。
+ * 同じ瞬間を別の書式で書いた2つの変更も、付則1 の順序で1つのバージョンに決まり、全クライアントにそのバージョンの字面が入る。
+ * 字面が揃わなければ、それは本当の食い違いである。
  */
 function snapshot(db: Database.Database): Map<string, Record<string, unknown>> {
-  const toJulian = db.prepare(`SELECT julianday(?) AS j`)
   const rows = new Map<string, Record<string, unknown>>()
   for (const table of WATCHED_TABLES) {
     for (const row of db
       .prepare(`SELECT * FROM ${table} ORDER BY id`)
       .all() as Record<string, unknown>[]) {
-      const normalized = { ...row }
-      normalized.updatedAt =
-        (toJulian.get(String(normalized.updatedAt)) as { j: number | null })
-          .j ?? String(normalized.updatedAt)
-      rows.set(`${table}:${String(row.id)}`, normalized)
+      rows.set(`${table}:${String(row.id)}`, { ...row })
     }
   }
   return rows
@@ -149,11 +144,12 @@ function allDifferingKeys(): string[] {
 }
 
 /**
- * 状態が動かなくなるまで回したうえで、残った食い違いが**膠着として報告されている**
- * ことを確かめる（性質テストが主張しているものと同じ）。
+ * 状態が動かなくなるまで回したうえで、全クライアントの中身が完全に一致することを確かめる。
+ * 性質テストが主張しているものと同じである。
  *
- * 押し出しが pull より先なので片道1回では相手の変更は届かず、3端末では
- * 「AがBの判断を取り込み、それをCが受け取る」まで数えるので余分に回す必要がある。
+ * 1回の `performSync` は自分の写しを上げてから相手の写しを読むので、1周では届かない変更がある。
+ * クライアントが3つあると、A が B の変更を取り込み、それを C が受け取るまで数周かかるので、余分に回す。
+ * 同じ時刻で中身が違う行も、付則1 により `_sns_instance` で1つに決まるので、食い違いは1件も許さない。
  */
 async function expectConverged(): Promise<void> {
   for (let round = 0; round < 6; round += 1) {
@@ -161,24 +157,22 @@ async function expectConverged(): Promise<void> {
     await syncAll()
   }
 
-  for (const key of allDifferingKeys()) {
-    const [table, id] = key.split(':')
-    expect(
-      warnings.some(
-        (warning) =>
-          warning.startsWith('Stalemate on ') &&
-          warning.includes(`${table}:${id}`)
-      ),
-      `${key} が食い違ったまま、膠着として報告もされていない\n` +
-        clients
-          .map(
-            (target) =>
-              `${target.id}: ${JSON.stringify(snapshot(target.db).get(key))}`
-          )
-          .join('\n') +
-        `\nwarnings: ${JSON.stringify(warnings)}`
-    ).toBe(true)
-  }
+  const differing = allDifferingKeys()
+  expect(
+    differing,
+    `クライアントどうしで中身が食い違っている\n` +
+      differing
+        .map((key) =>
+          clients
+            .map(
+              (target) =>
+                `${key} ${target.id}: ${JSON.stringify(snapshot(target.db).get(key))}`
+            )
+            .join('\n')
+        )
+        .join('\n') +
+      `\nwarnings: ${JSON.stringify(warnings)}`
+  ).toEqual([])
 }
 
 beforeEach(() => {
@@ -269,8 +263,8 @@ describe('性質テストが採った操作列（決定的な形）', () => {
     // - `users:u3` と `accounts:a2` は `b` が作った行。誰も消していないので全端末に在る
     //   （`a` の `users:u1` の削除は空振りで、`u3` とは関係が無い）
     // - `tags:g2` は `c` が作った行。`a` の削除は空振りで墓標が立たないため
-    //   突き合わせる相手が居ず、そのまま全端末へ届く。**書式（スペース）も
-    //   `c` が書いたまま残る**（LWWは同着の行を書き換えない）
+    //   突き合わせる相手が居ず、そのまま全端末へ届く。
+    //   受け取った側はバージョンを書き換えずに格納するので、**書式（スペース）も `c` が書いたまま残る**
     for (const target of clients) {
       expect(
         target.db.prepare(`SELECT id FROM users ORDER BY id`).all()
@@ -291,7 +285,7 @@ describe('性質テストが採った操作列（決定的な形）', () => {
    *
    * 上では削除が空振りで墓標が立たず、時刻の比べ方が結果に現れなかった。ここでは
    * **先に行を作ってから消す**ことで墓標を実際に立て、さらに行どうしの突き合わせも
-   * 作って、`julianday()` による正規化が効いていることを中身で確かめる。
+   * 作って、ライブラリが `_sns_ts` を時刻として比べていることを中身で確かめる。
    */
   it('旧版のスペース書式が混ざっても、勝ち負けが時刻として決まる', async () => {
     const a = client('client-a')
@@ -306,7 +300,7 @@ describe('性質テストが採った操作列（決定的な形）', () => {
     // **削除を実行した時刻**で比べる。`a` が消したのはこの試験を走らせた
     // 「いま」なので、2026年の書き込みより後であり、`g7` は消えたままになる。
     //
-    // 書式混在（`julianday()` による正規化）の検証は (B) が持っている。
+    // 書式混在の検証は (B) が持っている。
     // ここでは日付が離れてしまい、字面でも時刻でも同じ答えになる。
     a.db
       .prepare(
@@ -326,7 +320,7 @@ describe('性質テストが採った操作列（決定的な形）', () => {
     // 時刻として見れば `c`（00:00:01）が `b`（00:00:00）より後なので `c` が勝つ。
     // ところが字面で比べると同日では ' '(0x20) < 'T'(0x54) となり、スペース書式の
     // `c` が常に小さく扱われて `b` が勝ってしまう。**どちらが勝ったかは `name` に
-    // 出る**ので、`julianday()` の正規化が外れたらこのテストは `n9b` を見て落ちる
+    // 出る**ので、ライブラリが字面で比べるようになったらこのテストは `n9b` を見て落ちる
     // （日付が違う組み合わせでは字面と時刻の答えが一致してしまい、検証にならない。
     // だから 1 秒差の同日にしてある）。
     b.db

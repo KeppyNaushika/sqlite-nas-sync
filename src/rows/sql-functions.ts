@@ -215,12 +215,13 @@ export function assertDeterministicSql(
   for (const call of functionCalls(sql)) {
     if (NON_DETERMINISTIC_FUNCTIONS.has(call.name)) {
       throw new Error(
-        `決定的でない関数 ${call.name}() が ${where} に現れている（前提 P8）: ${sql}`
+        `決定的でない関数 ${call.name}() が ${where} に現れている。同期する表の定義には、評価のたびに結果が変わる関数を使えない: ${sql}`
       )
     }
     if (customFunctions.has(call.name)) {
       throw new Error(
-        `独自に登録された関数 ${call.name}() が ${where} に現れている（前提 P8）: ${sql}`
+        `独自に登録された関数 ${call.name}() が ${where} に現れている。` +
+          `独自の関数はクライアントごとに結果が同じとは限らないので、同期する表の定義には使えない: ${sql}`
       )
     }
     if (!TIME_FUNCTIONS.has(call.name)) continue
@@ -228,7 +229,7 @@ export function assertDeterministicSql(
     // WHERE では SQLite 自身が断るので、ここで捕まえるのは主に**索引の式**である
     if (call.empty) {
       throw new Error(
-        `引数の無い日付の関数 ${call.name}() が ${where} に現れている（前提 P8）: ${sql}`
+        `引数の無い日付の関数 ${call.name}() が ${where} に現れている。同期する表の定義には、評価のたびに結果が変わる関数を使えない: ${sql}`
       )
     }
     const modifier = call.literals.find((literal) =>
@@ -236,7 +237,7 @@ export function assertDeterministicSql(
     )
     if (modifier !== undefined) {
       throw new Error(
-        `評価のたびに変わる日付の関数 ${call.name}('${modifier}') が ${where} に現れている（前提 P8）: ${sql}`
+        `評価のたびに変わる日付の関数 ${call.name}('${modifier}') が ${where} に現れている。同期する表の定義には、評価のたびに結果が変わる関数を使えない: ${sql}`
       )
     }
   }
