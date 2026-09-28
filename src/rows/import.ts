@@ -92,6 +92,14 @@ interface RowsImportResult {
    * （設計書 §4.4 の `conflictsResolved`）
    */
   conflicts: number
+  /**
+   * `Max` を変えずに、相手の版を `_sns_rows_<t>` か `_tombstone` へ格納したキーの数。
+   *
+   * 手元の行の版より弱い削除の版が、手元の削除の版より強かったときに起きる。
+   * `_changelog` に通知を書かないので、上げるかどうかを決める印（`sync/idle` の `localPushFingerprint`）には表れない。
+   * それでも他の端末が読む帳簿は変わっているので、同期はこれを見て写しを上げ直す
+   */
+  storedQuietly: number
 }
 
 /**
@@ -186,6 +194,7 @@ export function importFromPeer(
     skippedTables: [],
     skipped: 0,
     conflicts: 0,
+    storedQuietly: 0,
   }
   const format = readSnsFormat(peerDb)
   if (format !== ROWS_FORMAT) {
@@ -212,6 +221,7 @@ export function importFromPeer(
       skippedTables: io.skippedTables,
       skipped: 0,
       conflicts: 0,
+      storedQuietly: 0,
     }
     // 1つのトランザクション。途中で落ちたら、その相手ぶんだけ丸ごと戻る。
     // `BEGIN IMMEDIATE`（`.immediate()`）にするのは、書き込みのロックを最初に
@@ -229,6 +239,7 @@ export function importFromPeer(
         if (!outcome.changed) {
           // 相手は主張したが、手元の版の方が強かった（§4.4 の `skipped`）
           result.skipped += 1
+          if (outcome.stored) result.storedQuietly += 1
           continue
         }
         // 手元にも版があったのに入れ替わったなら、突き合わせて相手が勝った
@@ -272,6 +283,8 @@ const TOMBSTONE_WRITE_COLUMNS: readonly string[] = [
 /** キー1つを取り込んだ結果。 */
 interface KeyOutcome {
   changed: boolean
+  /** 手元の `_sns_rows_<t>` か `_tombstone` を書いた */
+  stored: boolean
   /** 手元にも版があった（＝突き合わせが起きた） */
   contested: boolean
   operation: 'UPDATE' | 'DELETE'
@@ -302,17 +315,23 @@ function importOneKey(
   const after = io.strongest(nextRow, nextDelete)
   if (after === null) return null
 
+  let stored = false
   if (nextDelete !== null && nextDelete !== localDelete) {
     io.writeTombstone(table, key, nextDelete)
+    stored = true
   }
   const rowWins =
     nextRow !== null && io.strongest(nextRow, nextDelete) === nextRow
   if (nextRow !== null && rowWins) {
     // 行の版が勝っている。手元に無い、または相手の版が強いときだけ書く
-    if (nextRow !== localRow) io.writeRow(table, nextRow)
+    if (nextRow !== localRow) {
+      io.writeRow(table, nextRow)
+      stored = true
+    }
   } else if (localRow !== null) {
     // 負けた側の行を、同じトランザクションで消す（設計書 §4.3）
     io.deleteRow(table, key)
+    stored = true
   }
 
   // `before` / `after` は版の強い方（`Max`）で、見え方の計算（`derive`）も
@@ -322,6 +341,7 @@ function importOneKey(
   if (changed) io.writeChangelog(table, key, operation)
   return {
     changed,
+    stored,
     contested: before !== null,
     operation,
     lamport: Math.max(
