@@ -117,11 +117,9 @@ export function listRemoteClients(
     const match = file.match(/^client-(.+)\.sqlite$/)
     if (!match) continue
 
+    // 書き込み途中の `client-<id>.sqlite.tmp` は、上の正規表現（末尾が `.sqlite`）で弾かれる
     const clientId = match[1]
     if (clientId === currentClientId) continue
-
-    // .tmp ファイルは除外
-    if (file.endsWith('.tmp')) continue
 
     clients.push({
       clientId,
@@ -206,8 +204,8 @@ function isProcessAlive(pid: number): boolean {
  * PIDは再利用されるので、死んだPIDの残骸を「生きている」と誤判定して
  * 残すことはある。溜まり続けはしない（次の起動でまた見る）ので許容する。
  *
- * @param tmpDir - 掃除するディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync`。
- * @param maxAgeMs - PIDが読めない残骸を消す年齢のしきい値。既定24時間。
+ * @param tmpDir - 掃除するディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync`。本番の呼び出し（`setupRowsLedgers`）は渡さない。試験のための差し込み口。
+ * @param maxAgeMs - PIDが読めない残骸を消す年齢のしきい値。既定24時間。本番の呼び出しは渡さない。試験のための差し込み口。
  * @returns 消した一時コピーの数（本体の数。副ファイルは数えない）
  */
 export function sweepStaleRemoteCopies(
@@ -283,7 +281,7 @@ export interface RemoteDbHandle {
  * 呼び忘れると一時ファイルが残り続けるため、必ず `try/finally` で囲むこと。
  *
  * @param filePath - NAS上のオリジナルDBファイルパス
- * @param tmpDir - 一時ファイルを置くディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync` を使う。
+ * @param tmpDir - 一時ファイルを置くディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync` を使う。本番の同期は渡さない。試験のための差し込み口。
  * @returns ハンドル。コピー失敗・オープン失敗・整合性NG時は `null`。
  */
 export function openRemoteDbViaLocalCopy(

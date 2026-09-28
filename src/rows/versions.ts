@@ -1,13 +1,15 @@
 /**
- * 行の版の順序（設計書 `docs/rows-table-design.md` §1.2）。
+ * 行の版の順序を JS で比べる道具（設計書 `docs/rows-table-design.md` §1.2）。
  *
- * 案A の中心にある物差しを、ここ1か所に置く。
+ * 同じ順序は SQL にも書いてある。
+ * トリガーと取り込みの upsert は `src/rows/triggers.ts` の SQL（`strongerSql`・`maxTsSql`）で比べ、単調化の引き上げ（§1.2.1 の `NEWTS`）もトリガーの SQL が計算する。
+ * ここは JS の側で、取り込み（`src/rows/import.ts`）と作り直しの計算（`src/rows/derive.ts`）が使う。
+ * 群の字形は {@link ISO_SHAPE_GLOBS} を両方で共有し、順序が SQL と JS で食い違わないようにしてある。
  *
  * | 何 | どこ |
  * | --- | --- |
  * | 時刻の値の種類による順序（NULL ＜ 数値 ＜ ISO でない文字列 ＜ ISO の文字列 ＜ BLOB） | {@link ValueOrdering.compareTs} |
  * | 版の順序 `≺`（`(_sns_ts, L, iid)` の辞書順） | {@link ValueOrdering.compareVersions} |
- * | 順序用の時刻の引き上げ（§1.2.1 の `NEWTS`） | {@link ValueOrdering.raiseTs} |
  * | 真の id の正規形（§1.11） | {@link ValueOrdering.idKey} |
  *
  * **判定は SQLite にさせる。** 値の種類（`typeof`）・`julianday`・`CAST(… AS TEXT)` を
@@ -34,6 +36,8 @@ export type SqlValue = null | number | bigint | string | Buffer
  * | 2 | `text` で ISO 8601 の字形でない | `COLLATE BINARY`（UTF-8 のバイト列） |
  * | 3 | `text` で ISO 8601 の字形 | `julianday(x)` の値 |
  * | 4 | `blob` | `COLLATE BINARY` |
+ *
+ * export しているのは、試験（`__tests__/rows-versions.test.ts`）が群の判定を直に確かめるためである。
  */
 export const TIME_GROUP = {
   /** NULL */
@@ -147,14 +151,13 @@ export class ValueOrdering {
     this.db.defaultSafeIntegers(true)
   }
 
-  /** 値の種類の群（{@link TIME_GROUP}）。設計書 §1.2.3。 */
+  /**
+   * 値の種類の群（{@link TIME_GROUP}）。設計書 §1.2.3。
+   *
+   * ライブラリの中では {@link compareTs} が群を使うだけで、これを呼ぶのは試験（`__tests__/rows-versions.test.ts`）である。
+   */
   timeGroup(value: SqlValue): number {
     return this.describe(value).group
-  }
-
-  /** `julianday(x)`。読めなければ null（見え方の JSON で時刻列に当てる）。 */
-  julian(value: SqlValue): number | null {
-    return this.describe(value).julian
   }
 
   /**
@@ -185,29 +188,14 @@ export class ValueOrdering {
   }
 
   /**
-   * 順序用の時刻の引き上げ（設計書 §1.2.1・§3.3 の `NEWTS`）。
+   * 版の順序 `≺`（設計書 §1.2.4〜1.2.5、付則1）。
    *
-   * ```
-   * _sns_ts := 大きい方( アプリが書いた新しい値 , 手元の _sns_rows_* の _sns_ts , 手元の _tombstone の _sns_ts )
-   * ```
-   *
-   * 手元に無いものは NULL（群0 なので最小）を渡す。3つの素直な最大であって、
-   * `MAX()` ではない —— SQLite の `MAX()` は値の種類の順序を §1.2.3 のとおりには扱わない。
-   */
-  raiseTs(
-    newTs: SqlValue,
-    rowsTs: SqlValue = null,
-    tombstoneTs: SqlValue = null
-  ): SqlValue {
-    const strongest = this.compareTs(rowsTs, newTs) > 0 ? rowsTs : newTs
-    return this.compareTs(tombstoneTs, strongest) > 0 ? tombstoneTs : strongest
-  }
-
-  /**
-   * 版の順序 `≺`（設計書 §1.2.5）。
-   *
-   * `( _sns_ts, L, iid )` の辞書順。すべて等しければ 種類（行の版 ＜ 削除の版）。
-   * 負なら `a` が弱い。
+   * `( _sns_ts, L, iid )` の辞書順。負なら `a` が弱い。
+   * 3つ組が同じなら 0（同着）を返し、行の版か削除の版かでは比べない。
+   * SQL の `strongerSql`（`src/rows/triggers.ts`）も種類を見ないので、両方が同じ順序になる。
+   * 同じ主キーで3つ組の同じ行の版と削除の版は、ライブラリの書き込みでは作られない。
+   * トリガーは1回の発火で lamport を1つ進め、1つの主キーには版を1つしか書かない。
+   * 移行は、アプリの表に同じ id がある旧方式の墓標を写さない。
    *
    * `iid` の比較は `COLLATE BINARY`（UTF-8 のバイト列）で行う。JS の `<` は
    * UTF-16 の符号単位の順で、SQLite の既定の照合順序とは並びが違う。
@@ -220,10 +208,7 @@ export class ValueOrdering {
       Buffer.from(a.instance, 'utf8'),
       Buffer.from(b.instance, 'utf8')
     )
-    if (byInstance !== 0) return byInstance
-    const rank = (version: RowVersion): number =>
-      version.kind === 'row' ? 0 : 1
-    return compareNumbers(rank(a), rank(b))
+    return byInstance
   }
 
   /**

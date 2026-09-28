@@ -1,40 +1,29 @@
 /**
- * **その id が死んだことを知っているのが1台だけ**のときの族。
+ * **フルマージへ切り替わったクライアントが、あとから統合に関わる主キーへ書く**形の収束試験。
  *
- * 差分同期は相手の `_changelog` を `lastSeenId` より後ろだけ読む。だから「この id は
- * 死んだ」を告げるエントリが相手の読み位置より**手前**にあると（＝相手は一度それを
- * 読み終えている、あるいは掃除で消えている）、その相手には二度と流れない。
+ * 旧方式で見つかった反例の形を、案A でも全クライアントが一致することの回帰試験として残してある。
  *
- * そこへ相手のアプリが**同じ id へ書く**と、
+ * 旧方式の差分同期は、相手の `_changelog` を `lastSeenId` より後ろだけ読んでいた。
+ * ある id が畳まれて消えたことを告げるエントリが相手の読み位置より手前にあると、その相手には二度と流れなかった。
+ * そこへ相手のアプリケーションが同じ id へ書くと、他のクライアントは墓標の方が新しいとして採らず、書いたクライアントだけがその行を持ち続けた。
+ * 旧方式はこれを、行が無い側が削除を配り直すことで直していた。
  *
- * - こちらは `isShadowedByTombstone` どおり採らず（墓標の方が新しい）、
- * - 相手はその死を知らないので、書いた行を持ち続け、
- * - `sync/self-check.ts` は**自分の帳簿に載っている死**しか見ないので気づけない
+ * 案A では、統合は削除ではなく、負けた行を隠すだけである。
+ * 書き込みの勝ち負けは、主キーごとのバージョンを LWW で比べて決まる。
+ * 取り込んだあとに書いた変更は、取り込んだ変更より後の変更として勝つ。
  *
- * ——**書いた端末だけがその行を持ち続けます**（膠着としても報告されません）。
+ * 筋書きは `convergence-properties.test.ts` が見つけた反例そのままである。
+ * seed 1318613340 にあたる。
  *
- * 直し方は `advertiseLocalRow`（「こちらの版が新しいので採らなかった」を名乗り直す）
- * と同じ形で、**行が無い側**の名乗り直し（`sync/entries.ts` の
- * `advertiseLocalDeath`）である。書くのは DELETE 1行だけで、意味（ただの削除か
- * 畳みか）は `_tombstone` の行が運ぶので、受け取った側はふだんの削除とまったく同じ
- * 経路で決着させる。
- *
- * **同着では名乗らない**のが要点で、そこは `fold-crossing-deletion.test.ts` が
- * 固定している別の族（畳む向きが食い違い、墓標の取り消しで決着する形）と重なる ——
- * 同着の死を配ると、決着では**生き残るはずの行**を全端末から消してしまう。
- *
- * ここに置いてあるのは `convergence-properties.test.ts`（3端末・無作為な操作列）が
- * 見つけた反例そのまま（seed 1318613340）である。
- *
- * **このファイルは自分の作業ディレクトリを持つ**（`sync-fixtures` の注意書きのとおり、
- * ファイルごとに分けないと、片方の後片付けがもう片方の走行中のDBを消す）。
+ * **このファイルは自分の作業ディレクトリを持つ。**
+ * `sync-fixtures` の注意書きのとおり、ファイルごとに分けないと、片方の後片付けがもう片方の走行中の DB を消す。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import Database from 'better-sqlite3'
 import { performSync } from '../src/sync'
 import { createSyncFixture, TABLES } from './helpers/sync-fixtures'
 
-const fixture = createSyncFixture('test-data-dead-id-readvertised')
+const fixture = createSyncFixture('test-data-write-after-full-merge')
 
 beforeEach(fixture.prepare)
 afterEach(fixture.cleanup)
@@ -57,13 +46,13 @@ function makeClients(): Client[] {
   return clients
 }
 
-/** ローカルのユニーク違反は「その端末では起きなかった」ことにする（性質テストと同じ）。 */
+/** ローカルの制約違反は、そのクライアントでは何も起きなかったことにする。性質テストと同じ扱いである。 */
 function tolerateConstraint(error: unknown): void {
   const code = String((error as { code?: string }).code ?? '')
   if (!code.startsWith('SQLITE_CONSTRAINT')) throw error
 }
 
-/** 子を書く前に親を用意する。用意できなければ子も作らない（性質テストと同じ）。 */
+/** 子行を書く前に親行を用意する。用意できなければ子行も作らない。性質テストと同じ扱いである。 */
 function ensureTag(
   db: Database.Database,
   id: string,
@@ -133,8 +122,9 @@ function upsertTagProfile(
 }
 
 /**
- * この端末の changelog の頭を削り、**まだ誰も読んでいない位置まで**巻き込む
- * （＝相手をフルマージ経路へ落とす）。性質テストの `pruneChangelog` と同じ。
+ * このクライアントの `_changelog` の先頭を、まだどの相手も読んでいない位置まで消す。
+ * 相手はこのクライアントからの取り込みで隙間を見つけ、フルマージに切り替える。
+ * 性質テストの `pruneChangelog` と同じ操作である。
  */
 function pruneChangelog(client: Client): void {
   let floor = Number.POSITIVE_INFINITY
@@ -148,7 +138,7 @@ function pruneChangelog(client: Client): void {
   client.db.prepare(`DELETE FROM _changelog WHERE id <= ?`).run(floor + 1)
 }
 
-/** 比べるのは同期対象の中身だけ（帳簿や changelog は端末ごとに違ってよい）。 */
+/** 比べるのは同期するユーザーテーブルの中身だけである。内部テーブルはクライアントごとに違ってよい。 */
 function snapshot(db: Database.Database): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = []
   for (const table of ['tags', 'tag_notes', 'tag_profiles']) {
@@ -164,20 +154,21 @@ function snapshot(db: Database.Database): Record<string, unknown>[] {
 const T0 = '2026-01-01T00:00:00.000Z'
 const T2 = '2026-01-01T00:00:02.000Z'
 
-describe('死を知っているのが1台だけのとき', () => {
-  it('死んだ id へ書かれた行は、死を知っている端末が名乗り直して消える', async () => {
-    // 規則: **採らなかった理由がこちらでの死なら、その死を名乗り直す**
+describe('フルマージへ切り替わったクライアントがあとから書く', () => {
+  it('統合と削除を取り込んだあとに書いた行は、全クライアントに残る', async () => {
+    // 反例そのままの筋書きである。
+    // 性質テスト seed 1318613340 にあたる。
     //
-    // 反例そのまま（性質テスト seed 1318613340）。要点だけ書くと:
+    // 旧方式で起きたこと。
+    // A と B は `tags:g2` を `g1` へ畳み、`g2` を消えた id として扱った。
+    // C は `_changelog` の隙間でフルマージへ切り替わり、この畳みのエントリを読む位置を通り過ぎた。
+    // そのあと C のアプリケーションが `tags:g2` を 00:00 で書くと、A と B は畳みの墓標で採らず、C だけが `tags:g2` を持ち続けた。
     //
-    // 1. A/B は `tags:g2` を `g1` へ畳む（`g2` は全端末で永久に死ぬ）
-    // 2. C は changelog に隙間を作られてフルマージへ落ちており、この畳みの
-    //    エントリを読む位置を通り過ぎる
-    // 3. そのあと C のアプリが `tags:g2`（00:00）を書く
-    //
-    // A/B は墓標（畳み。時刻は `g2` の版より新しい）で採らず、畳みの DELETE エントリは
-    // C の読み位置より手前なので二度と流れない ——**C だけが `tags:g2` を持ち続けた**
-    // （膠着としても報告されない）。
+    // 案A で起きること。
+    // 2ラウンド目に C が g3 を消すと、g3 と統合されていた g1 も原則3 どおり削除され、子行もカスケードで削除される。
+    // A が書いた g1 と B が書いた n1 は、C の削除と並行で時刻が古いので、原則2 どおり削除が勝つ。
+    // 3ラウンド目の C の書き込みは、それまでに取り込んだ変更より後の変更なので、LWW の1で勝つ。
+    // 最後に全クライアントに残るのは、C が書いた `tags:g2` の名前 t1 の行だけである。
     const clients = makeClients()
     const [a, b, c] = clients
     const warnings: string[] = []
@@ -195,21 +186,21 @@ describe('死を知っているのが1台だけのとき', () => {
       upsertTagNote(c.db, 'n1', 'g1', 't1', T0)
       await syncAll()
 
-      // 2ラウンド目。`pruneChangelog` が相手をフルマージへ落とす
+      // 2ラウンド目。`pruneChangelog` で相手をフルマージへ切り替えさせる。
       upsertTag(a.db, 'g1', 't2', T0)
       pruneChangelog(a)
       upsertTagNote(b.db, 'n1', 'g2', 't2', T0)
       c.db.prepare(`DELETE FROM tags WHERE id = 'g3'`).run()
       await syncAll()
 
-      // 3ラウンド目。C は `g2` が畳まれて死んだことを知らないまま、その id へ書く
+      // 3ラウンド目。C が g2 に名前 t1 を書く。
       upsertTag(c.db, 'g2', 't1', T0)
       await syncAll()
 
-      // 状態が動かなくなるまで回す（押し出しが pull より先なので片道では届かない）
+      // 状態が動かなくなるまで回す。
+      // 1回の `performSync` は自分の写しを上げてから相手の写しを読むので、1周では届かない変更がある。
       for (let round = 0; round < 6; round += 1) await syncAll()
 
-      // 例外で取り込みが巻き戻る形だけは許されない（その相手からの同期が止まる）
       expect(
         warnings.filter((warning) => warning.startsWith('Sync failed'))
       ).toEqual([])
@@ -222,12 +213,16 @@ describe('死を知っているのが1台だけのとき', () => {
         .join('\n')
       expect(
         snapshots[1],
-        `端末どうしで中身が食い違っている\n${describeAll}`
+        `クライアントどうしで中身が食い違っている\n${describeAll}`
       ).toEqual(snapshots[0])
       expect(
         snapshots[2],
-        `端末どうしで中身が食い違っている\n${describeAll}`
+        `クライアントどうしで中身が食い違っている\n${describeAll}`
       ).toEqual(snapshots[0])
+
+      expect(snapshots[0]).toEqual([
+        { table: 'tags', id: 'g2', name: 't1', updatedAt: T0 },
+      ])
     } finally {
       for (const client of clients) client.db.close()
     }

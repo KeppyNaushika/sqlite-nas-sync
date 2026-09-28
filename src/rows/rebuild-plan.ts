@@ -68,27 +68,18 @@ interface RebuildPlanHidden {
   winnerId: string | null
 }
 
-/** 置かない行（`_sns_unplaceable`）。 */
+/**
+ * 置かない行（`_sns_unplaceable`）。
+ *
+ * 親が削除されているので置かない行（原則4）では、`causeTable` と `causeId` に
+ * 大元の削除が入る。それ以外の置かない行では両方 `null`。
+ */
 interface RebuildPlanUnplaceable {
   table: string
   trueId: string
   reason: string | null
-}
-
-/**
- * 版ごと捨てる行（原則4）。親が削除されているので、`_sns_rows_<表>` から落とす。
- *
- * **中身を持ち歩く**のは、落としたあとには誰も読めなくなるからである。
- * ライブラリは退避しない。必要ならアプリケーションが `SyncResult` から拾う。
- */
-export interface RebuildPlanDiscarded {
-  table: string
-  trueId: string
-  /** 大元の削除（`<表>:<id>`） */
-  causeTable: string
-  causeId: string
-  /** 落とす行の中身（`_sns_rows_<表>` に入っていた値） */
-  content: Record<string, SqlValue>
+  causeTable: string | null
+  causeId: string | null
 }
 
 /** {@link computeRebuildPlan} の結果。**構造化複製でそのまま渡せる形**。 */
@@ -99,10 +90,6 @@ export interface RebuildPlan {
   shown: RebuildPlanShown[]
   hidden: RebuildPlanHidden[]
   unplaceable: RebuildPlanUnplaceable[]
-  /** 版ごと捨てる行（原則4） */
-  discarded: RebuildPlanDiscarded[]
-  /** 計算の対象にしなかった表と、その理由 */
-  skipped: { table: string; reason: string }[]
 }
 
 /** {@link computeRebuildPlan} の設定。 */
@@ -111,7 +98,8 @@ export interface RebuildPlanOptions {
   tables: string[]
   /**
    * 適用する表。省略すると `_sns_dirty` の表とその子孫（設計書 §3.7）。
-   * 祖先は**計算はするが適用しない**
+   * 祖先は**計算はするが適用しない**。
+   * 渡すのは `rebuildDiffCount`（網羅検査器の判定8）だけである
    */
   targets?: string[]
   /** 作り直しの対象から外す表（外部キーの検査に落ちた表。設計書 §6.2） */
@@ -134,15 +122,10 @@ export function computeRebuildPlan(
   try {
     // (A-1) token を、一時 DB の用意も含めてどのデータより先に読む
     const token = readRebuildToken(db, options.tables)
-    const skipped: { table: string; reason: string }[] = []
-    const known: string[] = []
-    for (const table of options.tables) {
-      if (tableExists(db, table) && tableExists(db, rowsTableName(table))) {
-        known.push(table)
-        continue
-      }
-      skipped.push({ table, reason: `表か ${rowsTableName(table)} が無い` })
-    }
+    // 表か `_sns_rows_<表>` が無い表は計算しない（同期の段階0 が仕組みを取り付け直す）
+    const known = options.tables.filter(
+      (table) => tableExists(db, table) && tableExists(db, rowsTableName(table))
+    )
     const schema = readSchema(db, known)
     const metas = new Map(known.map((table) => [table, readMeta(db, table)]))
     const versions = readVersions(db, known, metas)
@@ -156,7 +139,6 @@ export function computeRebuildPlan(
       const shown: RebuildPlanShown[] = []
       const hidden: RebuildPlanHidden[] = []
       const unplaceable: RebuildPlanUnplaceable[] = []
-      const discarded: RebuildPlanDiscarded[] = []
       for (const table of order) {
         if (!targets.has(table)) continue
         const meta = metas.get(table) as TableMeta
@@ -170,18 +152,10 @@ export function computeRebuildPlan(
         for (const candidate of (
           derived.candidates.get(table) ?? new Map<string, CandidateResult>()
         ).values()) {
-          collectOutputs(
-            values,
-            meta,
-            candidate,
-            shown,
-            hidden,
-            unplaceable,
-            discarded
-          )
+          collectOutputs(values, meta, candidate, shown, hidden, unplaceable)
         }
       }
-      return { token, apply, shown, hidden, unplaceable, discarded, skipped }
+      return { token, apply, shown, hidden, unplaceable }
     } finally {
       values.close()
     }
@@ -246,7 +220,7 @@ export function reviveRebuildPlan(plan: RebuildPlan): RebuildPlan {
  * ------------------------------------------------------------------ */
 
 /** 表1つ分の、計算と適用に要る姿。 */
-export interface TableMeta {
+interface TableMeta {
   name: string
   primaryKey: string
   /** 書ける列（生成列を除く） */
@@ -293,9 +267,9 @@ function readSchema(
 /**
  * 版を読む（`_sns_rows_<t>` と `_tombstone`）。
  *
- * **版の3つ組が欠けている行は読み飛ばす。** 旧版から移ってきたまま
- * `_sns_lamport` が NULL の行は順序が付かず、比べると全部が同着になる
- * （3つ組を埋めるのは段階4 の移行の受け持ちである）。
+ * **版の3つ組が欠けている行は読み飛ばす。**
+ * `_sns_rows_<t>` の `_sns_lamport` と `_sns_instance` は NOT NULL で、`_tombstone` の版の列は取り付けのとき（`src/rows/schema.ts` の `ensureTombstoneVersionColumns`）に埋めるので、ふつうは欠けない。
+ * 外で書き換えられた DB で、順序の付かない版を比べて全部を同着にしないための守りである。
  */
 function readVersions(
   db: Database.Database,
@@ -417,7 +391,9 @@ export function dependencyOrder(
     const mark = state.get(name)
     if (mark === 'done') return
     if (mark === 'visiting') {
-      throw new Error(`同期する表の外部キーが循環している（前提 P2）: ${name}`)
+      throw new Error(
+        `同期する表の外部キーが循環している: ${name}。同期する表どうしの外部キーは循環させられない`
+      )
     }
     state.set(name, 'visiting')
     for (const key of foreignKeysOf(db, name)) {
@@ -434,7 +410,6 @@ export function dependencyOrder(
 
 /** 外部キー1本（`PRAGMA foreign_key_list` の1組）。 */
 interface ForeignKeyMeta {
-  id: number
   columns: string[]
   parentTable: string
   /** 親側の列（省略されていれば親の主キー） */
@@ -464,7 +439,6 @@ export function foreignKeysOf(
   return [...grouped.values()].map((entries) => {
     const sorted = [...entries].sort((a, b) => a.seq - b.seq)
     return {
-      id: sorted[0].id,
       columns: sorted.map((row) => row.from),
       parentTable: sorted[0].table,
       parentColumns: sorted.every((row) => row.to === null)
@@ -491,8 +465,7 @@ function collectOutputs(
   candidate: CandidateResult,
   shown: RebuildPlanShown[],
   hidden: RebuildPlanHidden[],
-  unplaceable: RebuildPlanUnplaceable[],
-  discarded: RebuildPlanDiscarded[]
+  unplaceable: RebuildPlanUnplaceable[]
 ): void {
   if (candidate.placement === 'placed') {
     const displayed = values.idKey(candidate.display[meta.primaryKey] ?? null)
@@ -513,20 +486,13 @@ function collectOutputs(
     })
     return
   }
-  if (candidate.placement === 'discarded') {
-    discarded.push({
-      table: meta.name,
-      trueId: candidate.key,
-      causeTable: candidate.cause?.table ?? meta.name,
-      causeId: candidate.cause?.key ?? candidate.key,
-      content: { ...candidate.display },
-    })
-    return
-  }
+  // 置かない行と、親が削除されているので置かない行（原則4）。どちらも版は残る
   unplaceable.push({
     table: meta.name,
     trueId: candidate.key,
     reason: candidate.reason ?? null,
+    causeTable: candidate.cause?.table ?? null,
+    causeId: candidate.cause?.key ?? null,
   })
 }
 

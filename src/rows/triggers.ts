@@ -27,6 +27,9 @@
  * 4. **`_tombstone.recordId` との比較は必ず正規形**（`CAST(… AS TEXT)`。§1.11 の必須7）
  * 5. **書かなかった列は3分岐**（§3.4.3 の必須2）。`_sns_rows_<表>` に行が無い窓が
  *    あるので、`(SELECT …)` だけにすると NOT NULL の列が NULL になって行が消える
+ * 6. **時刻列は ISO 8601 の文字列だけ**（前提 P15。原則2 のため）。INSERT と UPDATE の
+ *    3本は、本体の先頭で `NEW.<時刻列>` を確かめ、違えば `RAISE(ABORT)` で
+ *    アプリの書き込みを失敗させる
  *
  * @module rows/triggers
  * @internal
@@ -71,6 +74,19 @@ function timeGroupSql(value: string): string {
 
 /** ISO 8601 の字形の文字列の群（{@link timeGroupSql} の 3）。 */
 const ISO_TEXT_GROUP = 3
+
+/**
+ * 値が ISO 8601 の文字列（群3）かどうかを答える SQL の式。真なら 1、偽なら 0 で、
+ * NULL にはならない。
+ *
+ * 同期する表の時刻列に許すのはこの値だけである（前提 P15。原則2 のため）。導入時の確かめ
+ * （`src/setup/rows-preflight.ts`）とトリガーの両方がこの式を使う。判定を別に
+ * 書き写すと、片方だけ直したときに「導入時には通るのに書き込みで落ちる」値が生まれる。
+ * @internal
+ */
+export function isIsoTimeSql(value: string): string {
+  return `(${timeGroupSql(value)} = ${ISO_TEXT_GROUP})`
+}
 
 /**
  * `TSGT(a, b)` —— 順序用の時刻として `a` が `b` より強いか（設計書 §3.3）。
@@ -167,6 +183,9 @@ function readParts(db: Database.Database, table: RowsTableSpec): TableParts {
   const all = db.pragma(
     `table_xinfo(${escapeIdentifier(table.name)})`
   ) as RowsColumn[]
+  // 名前は宣言どおりの綴りで持つ（SQL ではどちらの綴りでも同じ列だが、
+  // トリガーの失敗の文面に出るので、利用者が表に書いた綴りに揃える）
+  const timestamp = all.find((column) => isSameIdentifier(column.name, wanted))
   return {
     name: table.name,
     literal: quoteLiteral(table.name),
@@ -174,9 +193,7 @@ function readParts(db: Database.Database, table: RowsTableSpec): TableParts {
     rows: escapeIdentifier(rowsTableName(table.name)),
     columns,
     primaryKey: primaryKeyColumn(db, table.name),
-    timestampColumn: all.some((column) => isSameIdentifier(column.name, wanted))
-      ? wanted
-      : null,
+    timestampColumn: timestamp === undefined ? null : timestamp.name,
   }
 }
 
@@ -196,7 +213,7 @@ const CLOCK_LAMPORT = `(SELECT "lamport" FROM "_sns_clock")`
 const CLOCK_INSTANCE = `(SELECT "instanceId" FROM "_sns_clock")`
 
 /**
- * `TICK(t)`（設計書 §3.3・訂正6）。**本体の先頭に置く。**
+ * `TICK(t)`（設計書 §3.3・訂正6）。**本体の先頭**（時刻列の確かめの直後）に置く。
  *
  * `_sns_clock` の `instanceId` を `(SELECT instanceId FROM _sns_clock)` から
  * 取っているのは、**行が無いときに行を作らせないため**である。作ってしまうと
@@ -213,6 +230,27 @@ function tickSql(parts: TableParts): string {
     `INSERT INTO "_sns_tick" ("tableName", "tick") VALUES (${parts.literal}, 1)
        ON CONFLICT ("tableName") DO UPDATE SET "tick" = "tick" + 1;`,
   ].join('\n      ')
+}
+
+/**
+ * 時刻列に ISO 8601 の文字列以外を書かせない（前提 P15。原則2 のため）。**本体の先頭に置く。**
+ *
+ * 削除の版は削除を実行した時刻（ISO 8601 の文字列）で比べる。時刻列に数値や
+ * ISO でない文字列が入ると、その行の版と削除の版が同じ物差しで比べられなくなる。
+ * AFTER トリガーの `RAISE(ABORT)` は、その文が行った変更（アプリの表への書き込みを
+ * 含む）を取り消して文を失敗させる。同じトランザクションのそれ以前の文は残る。
+ *
+ * 時刻列が無い表では何もしない。番人（`GUARD`）はトリガーの `WHEN` にあるので、
+ * 作り直しの適用中はこの確かめも動かない。
+ */
+function timestampCheckSql(parts: TableParts): string {
+  if (parts.timestampColumn === null) return ''
+  const value = `NEW.${escapeIdentifier(parts.timestampColumn)}`
+  const message =
+    `同期する表 ${parts.name} の時刻列 ${parts.timestampColumn} に` +
+    ` ISO-8601 の文字列でない値は書けない。` +
+    `ISO-8601 の文字列（例: 2026-01-01T00:00:00.000Z）で書くこと`
+  return `SELECT RAISE(ABORT, ${quoteLiteral(message)}) WHERE NOT ${isIsoTimeSql(value)};`
 }
 
 /**
@@ -293,36 +331,35 @@ function rowTsSql(
 }
 
 /**
- * 削除を実行した時刻のうち、順序に使ってよいぶん（原則2）。
+ * 削除を実行した時刻（原則2）。
  *
  * `DELETE` も1つの変更なので、行の版が `NEW.<時刻列>` を使うのと同じように、
  * 削除の版は**削除を実行した時刻**（`_tombstone.deletedAt` と同じ {@link NOW_SQL}）を
  * 使う。これを使わないと、消した行の `updatedAt` が相手の編集より古いというだけで
  * 削除が負け、消したはずの行が戻る。
  *
- * ただし**アプリの時刻列が ISO 8601 の文字列（群3）のときだけ**に限る。
- * `NOW_SQL` は群3 なので、時刻列が数値（群1）や ISO でない文字列（群2）の表では
- * **常に群の差だけで削除が勝ってしまう**（設計書 §1.2.3 の群の順序）。
- * しかも引き上げによってその行の `_sns_ts` は以後ずっと群3 に固定され、
- * アプリのその後の書き込みが二度と勝てなくなる。比べられないときは
- * 比べない —— 従来どおり `_sns_rows_<表>` と `_tombstone` の強い方で決める。
+ * 時刻列には ISO 8601 の文字列しか入らない（{@link timestampCheckSql} と導入時の
+ * 確かめで止める）ので、`NOW_SQL` はアプリが書く時刻とそのまま比べられる。
+ *
+ * 時刻列が無い表では NULL にする。その表の行の版の時刻はいつも NULL で、
+ * 編集どうしは書き込み順（lamport）だけで比べている。削除にだけ時刻を与えると、
+ * 削除が群の差だけで必ず勝ち、同じ規則で比べたことにならない。
  */
 function deletedAtSql(parts: TableParts): string {
-  if (parts.timestampColumn === null) return 'NULL'
-  const old = `OLD.${escapeIdentifier(parts.timestampColumn)}`
-  return `(CASE WHEN ${timeGroupSql(old)} = ${ISO_TEXT_GROUP} THEN ${NOW_SQL} END)`
+  return parts.timestampColumn === null ? 'NULL' : NOW_SQL
 }
 
 /**
  * 削除の版の `_sns_ts`（設計書 §3.4.4 の必須3・訂正3、原則2）。
  *
- * {@link deletedAtSql}・`_sns_rows_<表>`・`_tombstone` の**最大**。
- * どれも無ければ `OLD.<時刻列>` に落ちる。
+ * 削除を実行した時刻（{@link deletedAtSql}）を、手元の版の時刻まで引き上げた値にする（単調化）。
+ * `_sns_rows_<表>` か `_tombstone` にその id の版があれば、実行した時刻とその版の `_sns_ts` の最大を取る。
+ * どちらにも版が無いとき（取り込みの COMMIT から作り直しの適用までの窓）は、消す行の `OLD.<時刻列>` をその行の版の時刻とみなし、実行した時刻との最大を取る。
+ * 時刻列が無い表では、どの項も NULL なので NULL になる。
  *
- * **`COALESCE` では書けない。** `COALESCE` は「値が NULL」と「行が無い」を
- * 区別しないので、`_sns_ts` が NULL（群0）の行の版が手元にあるとき、
- * `OLD.<時刻列>` に落ちてしまう。それは引き上げの規則に反し、
- * 取り込んだ強い削除の版をあとから弱い版で上書きする経路になる。
+ * **版の有無を `EXISTS` で分ける。**
+ * `COALESCE` は「値が NULL」と「行が無い」を区別しないので、`_sns_ts` が NULL（群0）の版が手元にあるときにも `OLD.<時刻列>` を見てしまう。
+ * 版があるのにアプリの表の値で引き上げるのは単調化の規則から外れるので、版があるときは版の時刻だけを使う。
  */
 function deleteTsSql(
   parts: TableParts,
@@ -458,10 +495,7 @@ function hiddenBehindSql(parts: TableParts, keyText: string): string {
  * 戻ってくる。`_sns_lamport` は手元の時計なので、取り込んだどの値より
  * 進んでいる（単調化）。
  *
- * 削除を実行した時刻を使う条件は {@link deletedAtSql} と同じで、**隠れている側の
- * 行が持っている時刻の種類**で決める。勝っている側の時刻をそのまま持ち込むと、
- * 値の種類の違う2行が混ざったときに、隠れている側の `_sns_ts` だけが別の群へ
- * 引き上がってしまう。
+ * 削除を実行した時刻は {@link deletedAtSql} と同じものを使う。
  *
  * 隠れている行はアプリの表に無く、その `DELETE` トリガーは発火しない。
  * だからここで**まとめて**書くしかない。
@@ -471,7 +505,7 @@ function mergedTombstoneSql(parts: TableParts, keyText: string): string {
   const heldTs = `(SELECT ${escapeIdentifier(VERSION_COLUMNS.ts)} FROM ${parts.rows}
          WHERE CAST(${pk} AS TEXT) = "h"."trueId")`
   const hiddenTs = maxTsSql([
-    `(CASE WHEN ${timeGroupSql(heldTs)} = ${ISO_TEXT_GROUP} THEN ${NOW_SQL} END)`,
+    deletedAtSql(parts),
     heldTs,
     `(SELECT ${escapeIdentifier(VERSION_COLUMNS.ts)} FROM "_tombstone"
          WHERE "tableName" = ${parts.literal} AND "recordId" = "h"."trueId")`,
@@ -573,6 +607,7 @@ function insertTrigger(parts: TableParts): string {
     AFTER INSERT ON ${parts.quoted} FOR EACH ROW
     WHEN ${GUARD}
     BEGIN
+      ${timestampCheckSql(parts)}
       ${tickSql(parts)}
       ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', trueId, keyText))}
       ${changelogSql(parts, keyText, 'INSERT', null)}
@@ -612,6 +647,7 @@ function updateSameTrigger(parts: TableParts): string {
     AFTER UPDATE ON ${parts.quoted} FOR EACH ROW
     WHEN NEW.${pk} IS OLD.${pk} AND ${GUARD}
     BEGIN
+      ${timestampCheckSql(parts)}
       ${tickSql(parts)}
       ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', trueId, keyText))}
       ${changelogSql(parts, keyText, 'UPDATE', null)}
@@ -668,6 +704,7 @@ function updateMoveTrigger(parts: TableParts): string {
     AFTER UPDATE ON ${parts.quoted} FOR EACH ROW
     WHEN NEW.${pk} IS NOT OLD.${pk} AND ${GUARD}
     BEGIN
+      ${timestampCheckSql(parts)}
       ${tickSql(parts)}
       ${upsertTombstoneSql(parts, oldKeyText, deleteTsSql(parts, oldTrueId, oldKeyText), moved)}
       DELETE FROM ${parts.rows}
@@ -744,7 +781,7 @@ export function rowsTriggerNames(table: string): string[] {
   ]
 }
 
-/** 1つの表に付く4本のトリガーの SQL（検査から中身を見るために公開している）。 */
+/** 1つの表に付く4本のトリガーの SQL（{@link rowsTriggerNames} と同じ順）。 */
 function rowsTriggerSql(db: Database.Database, table: RowsTableSpec): string[] {
   const parts = readParts(db, table)
   return [
@@ -790,7 +827,11 @@ export function createRowsTriggers(
   }
 }
 
-/** 同期する表からトリガーを落とす（移行と、検査の後始末のため）。 */
+/**
+ * 同期する表からトリガーを落とす。
+ *
+ * 移行で列の増減があった表のトリガーを、作り直す前に落とすために使う（`src/rows/migrate.ts`）。
+ */
 export function dropRowsTriggers(
   db: Database.Database,
   tables: RowsTableSpec[]

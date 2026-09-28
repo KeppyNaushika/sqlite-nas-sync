@@ -2,7 +2,7 @@
  * `performSync` の基本動作 —— INSERT / UPDATE / DELETE の伝播、スキーマ版の突き合わせ、
  * リモートが開けないときの続行。
  *
- * 別id・同一ユニークキーの畳みは `sync-unique-fold.test.ts`、
+ * 主キーの違う2行が `UNIQUE` で衝突したときの統合の勝者は `rows-derive.test.ts` にある。
  * changelog に隙間があるときのフルマージは `sync-full-merge.test.ts` にある。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -145,11 +145,13 @@ describe('performSync', () => {
       )
       .run('d-b', 'c1', 'score:8', '2024-06-01T00:00:00Z')
 
-    // B同期: Aのd-aを受信 → ローカルd-bの方が新しい → d-bを保持
+    // B同期: Aのd-aを受信する。
+    // d-a と d-b は cellKey で衝突し、時刻の新しい d-b が勝つので、d-a は隠れる。
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
-    // A同期: Bのd-bを受信 → リモートd-bの方が新しい → d-aを削除しd-bに置換
+    // A同期: Bのd-bを受信し、同じく d-b が勝って d-a は隠れる。
+    // 統合は削除ではないので、d-a の墓標は立たない。
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
-    // B再同期: Aのd-a削除（tombstone/changelog）を受信しても結果は変わらない
+    // B再同期: 結果は変わらない
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
     for (const [label, db] of [
@@ -204,19 +206,16 @@ describe('performSync', () => {
     ).toBe(true)
 
     // 構造化されたskippedRemotesにも記録される。
-    //
-    // **案A（段階5）で変わった点**: `_sync_meta.schemaVersion` は
-    // `<アプリの版>;sns-format=rows1` の形で持ち（設計書 §3.8）、相手を見送るかは
-    // **この文字列ぜんたいの一致**で決める（§4.2）。`skippedRemotes` に載るのも
-    // その形。期待するのは「`v1` と `v2` が食い違っている」ことなので、
-    // 形式の欄が付いただけで意味は変わらない。
+    // `_sync_meta.schemaVersion` は `<アプリの版>;sns-format=rows1` の形で持つが、
+    // 利用者に見せるのはアプリの版だけ（`;sns-format=…` は内部の印）
     expect(result.skippedRemotes).toEqual([
       {
         clientId: 'client-a',
-        remoteVersion: 'v1;sns-format=rows1',
-        localVersion: 'v2;sns-format=rows1',
+        remoteVersion: 'v1',
+        localVersion: 'v2',
       },
     ])
+    expect(result.warnings.some((w) => w.includes('sns-format'))).toBe(false)
 
     dbB.close()
   })

@@ -24,7 +24,7 @@ export default tseslint.config(
   {
     rules: {
       // 利用者のコンソールを勝手に汚さない。出すときは意図を明示して黙らせる
-      // （既存の 2 箇所は「検出結果の通知」で、意図的に残してある）
+      // （既存の 1 箇所 src/validator.ts は「検出結果の通知」で、意図的に残してある）
       'no-console': 'error',
       // 使い切っていない引数は `_` 始まりで明示する（`.map((_, index) => …)` など）
       '@typescript-eslint/no-unused-vars': [

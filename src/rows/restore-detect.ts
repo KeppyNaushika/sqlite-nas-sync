@@ -9,7 +9,7 @@
  * | 検出 | 条件 | いつ見るか |
  * | --- | --- | --- |
  * | 復元・巻き戻り | NAS 上の**自分の写し**の `sns.lastLamport` より手元の `lamport` が小さい、または `sns.generation` が写しより小さい | その同期回の**取り込みより前**（H） |
- * | 仕掛けの欠け | トリガーが無い・`_sns_clock` の行が無い・`_sns_tick` の行が足りない・`_sns_rebuilding` に行が残っている | `setupSync` と同期の段階0 |
+ * | 仕掛けの欠け | トリガーが無い・`_sns_clock` の行が無い・`_sns_tick` の行が足りない・`_sns_rebuilding` に行が残っている | 同期の段階0（`setupSync` は確かめずに毎回取り付け直す） |
  * | 写しの取り合い | NAS 上の自分の写しの `sns.instanceId` が自分のものでない | **その回に自分が写しを書いたあと**だけ |
  *
  * **取り込みより前に見る理由**（H）: 取り込みは `_sns_clock.lamport` を相手の値まで
@@ -85,15 +85,13 @@ export function checkRowsMachinery(
   tables: (RowsTableSpec | string)[]
 ): RowsMachineryReport {
   const issues: RowsMachineryIssue[] = []
-  // 表の名前は境界で畳む（段階3 からの申し送り）
+  // 表の名前は入り口で畳む（`src/rows/table-name.ts`）
   const specs = canonicalTableSpecs(db, tables)
 
   if (!tableExists(db, '_sns_clock') || readClockLamport(db) === null) {
     issues.push({
       kind: 'missing-clock-row',
-      message:
-        `_sns_clock に行が無い。このままではアプリの書き込みが NOT NULL で落ちる` +
-        `（lamport を 0 から数え直さないための形。§3.2）`,
+      message: `_sns_clock に行が無い。このままではアプリケーションの書き込みが NOT NULL の制約で失敗する`,
     })
   }
 
@@ -119,9 +117,7 @@ export function checkRowsMachinery(
         kind: 'missing-trigger',
         table: spec.name,
         name,
-        message:
-          `トリガー ${name} が無い。` +
-          `このままではこの表への書き込みが1つも事実にならない`,
+        message: `トリガー ${name} が無い。このままではこの表の変更が他のクライアントへ届かない`,
       })
     }
     if (!hasTickRow(db, spec.name)) {
@@ -130,7 +126,7 @@ export function checkRowsMachinery(
         table: spec.name,
         message:
           `_sns_tick に ${spec.name} の行が無い。` +
-          `作り直しの token が立たず、計算のあいだの書き込みを取りこぼす`,
+          `このままでは、ユーザーテーブルへの反映を計算している間に書かれた変更を見落とすことがある`,
       })
     }
   }
@@ -154,8 +150,8 @@ export function checkRowsMachinery(
     issues.push({
       kind: 'rebuilding-leftover',
       message:
-        `_sns_rebuilding に行が残っている。前回の作り直しが途中で落ちた可能性がある。` +
-        `残っている間、アプリの書き込みは1つも事実にならない（§3.10 の I）`,
+        `_sns_rebuilding に行が残っている。前回の同期がユーザーテーブルへの反映の途中で止まった可能性がある。` +
+        `残っている間、アプリケーションの変更は他のクライアントへ届かない`,
     })
   }
   return { issues, needsRepair: issues.length > 0, rebuildingLeftover }
@@ -164,8 +160,9 @@ export function checkRowsMachinery(
 /**
  * `_sns_rebuilding` の残りを消す（§3.10 の I）。消したら `true`。
  *
- * **トリガーを作る前に**呼ぶこと。旗が立ったままトリガーを作ると、番人が
- * 効いて何も事実にならないまま、警告も出ずに同期が回る。
+ * **トリガーを作る前に**呼ぶこと。
+ * 旗が立ったままトリガーを作ると、番人が効いてアプリの書き込みが版にならないまま、警告も出ずに同期が回る。
+ * `setupSync` と同期の段階0 は、`migrateToRows` の直前にこれを呼ぶ。
  */
 export function clearRebuildingFlag(db: Database.Database): boolean {
   if (!tableExists(db, '_sns_rebuilding')) return false
@@ -203,10 +200,10 @@ interface RowsRestoreReport {
   restored: boolean
   /** 写しがそもそも無かった（初回起動） */
   copyMissing: boolean
+  /** 手元の `_sns_clock.lamport` */
   localLamport: number | null
-  localGeneration: number | null
+  /** NAS 上の自分のコピーの `sns.lastLamport`（読めなければ `null`） */
   copyLastLamport: number | null
-  copyGeneration: number | null
 }
 
 /**
@@ -226,9 +223,7 @@ export function checkRestoreBeforeImport(
     restored: false,
     copyMissing: false,
     localLamport: readClockLamport(db),
-    localGeneration: readSnsMetaNumber(db, SNS_META_KEYS.generation),
     copyLastLamport: null,
-    copyGeneration: null,
   }
   const filePath = selfCopyPath(location)
   if (!fs.existsSync(filePath)) {
@@ -240,51 +235,50 @@ export function checkRestoreBeforeImport(
     report.issues.push({
       kind: 'copy-unreadable',
       message:
-        `NAS 上の自分の写し ${filePath} が読めない。` +
-        `巻き戻りの判定ができないので、この回は復元の有無を言えない`,
+        `NAS 上の自分のコピー ${filePath} が読めない。` +
+        `この回は、DB がバックアップから戻されたかどうかを判定できない`,
     })
     return report
   }
+  let copyGeneration: number | null
   try {
     report.copyLastLamport = readSnsMetaNumber(
       handle.db,
       SNS_META_KEYS.lastLamport
     )
-    report.copyGeneration = readSnsMetaNumber(
-      handle.db,
-      SNS_META_KEYS.generation
-    )
+    copyGeneration = readSnsMetaNumber(handle.db, SNS_META_KEYS.generation)
   } finally {
     handle.cleanup()
   }
 
-  const local = report.localLamport
+  const lamport = report.localLamport
+  const copyLastLamport = report.copyLastLamport
   if (
-    local !== null &&
-    report.copyLastLamport !== null &&
-    local < report.copyLastLamport
+    lamport !== null &&
+    copyLastLamport !== null &&
+    lamport < copyLastLamport
   ) {
     report.restored = true
     report.issues.push({
       kind: 'lamport-behind-copy',
       message:
-        `手元の lamport (${local}) が、NAS 上の自分の写しに残した値 ` +
-        `(${report.copyLastLamport}) より小さい。DB が復元されたか、` +
-        `外で巻き戻された可能性がある（§3.10）`,
+        `手元の lamport (${lamport}) が、NAS 上の自分のコピーに記録した値 ` +
+        `(${copyLastLamport}) より小さい。` +
+        `DB がバックアップから戻されたか、外で書き換えられた可能性がある`,
     })
   }
-  const generation = report.localGeneration
+  const generation = readSnsMetaNumber(db, SNS_META_KEYS.generation)
   if (
     generation !== null &&
-    report.copyGeneration !== null &&
-    generation < report.copyGeneration
+    copyGeneration !== null &&
+    generation < copyGeneration
   ) {
     report.restored = true
     report.issues.push({
       kind: 'generation-behind-copy',
       message:
-        `手元の sns.generation (${generation}) が、NAS 上の自分の写しの値 ` +
-        `(${report.copyGeneration}) より小さい。DB が復元された可能性がある（§3.10）`,
+        `手元の sns.generation (${generation}) が、NAS 上の自分のコピーの値 ` +
+        `(${copyGeneration}) より小さい。DB がバックアップから戻された可能性がある`,
     })
   }
   return report
@@ -340,9 +334,10 @@ export function checkCopyOwnership(
   if (report.copyInstanceId !== null && report.copyInstanceId !== mine) {
     report.taken = true
     report.message =
-      `NAS 上の自分の写し ${filePath} の sns.instanceId が ` +
+      `NAS 上の自分のコピー ${filePath} の sns.instanceId が ` +
       `${report.copyInstanceId} になっている（自分は ${mine}）。` +
-      `同じクライアント id を名乗る端末が他にある。同期を止めること（§3.10）`
+      `同じ clientId を使うクライアントが他にあるので、この回の同期を止めた。` +
+      `clientId はクライアントごとに別の値にすること`
   }
   return report
 }

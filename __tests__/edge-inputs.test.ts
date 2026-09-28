@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs'
 import * as path from 'path'
+import { Worker } from 'worker_threads'
 import Database from 'better-sqlite3'
 import { cleanupChangelog } from '../src/changelog'
 import { performSync } from '../src/sync'
@@ -77,54 +78,86 @@ describe('同時に走らせる', () => {
     fs.rmSync(testDir, { recursive: true, force: true })
   })
 
-  it('同じDBファイルへの2接続が同時に書いても、待って通る', () => {
-    // NAS越しの同期では、同じローカルDBを別の接続が触っている最中に
-    // 取り込みが走りうる。ロックにぶつかったとき即座に諦めると
-    // `SQLITE_BUSY` が呼び出し元まで飛ぶので、待つ設定が要る。
+  it('別スレッドが書き込み中の DB へ書く接続は、待ち時間があれば解放まで待って通り、待ち時間が 0 なら SQLITE_BUSY で失敗する', async () => {
+    // NAS越しの同期では、同じローカルDBを別の接続が触っている最中に取り込みが走りうる。
+    // better-sqlite3 は同期的に動くので、同じスレッドの中でロックを持ったまま別の接続で待たせることはできない。
+    // そこで、ロックを持つ側を別スレッドに置き、決めた時間だけ持ってから COMMIT させる。
     const dbPath = path.join(testDir, 'shared.sqlite')
-    const writer = new Database(dbPath)
-    writer.exec(`
+    const setup = new Database(dbPath)
+    setup.exec(`
       CREATE TABLE users (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         updatedAt TEXT NOT NULL
       )
     `)
-    setupRowsDb(writer, [{ name: 'users' }])
+    setupRowsDb(setup, [{ name: 'users' }])
+    setup.close()
 
-    const other = new Database(dbPath, { timeout: 5000 })
+    const HOLD_MS = 300
+    const flag = new Int32Array(new SharedArrayBuffer(4))
+    const holder = new Worker(
+      `
+      const { workerData } = require('worker_threads')
+      const Database = require('better-sqlite3')
+      const flag = new Int32Array(workerData.buffer)
+      const db = new Database(workerData.dbPath)
+      db.exec('BEGIN IMMEDIATE')
+      db.prepare("INSERT INTO users (id, name, updatedAt) VALUES ('u1', 'Alice', '2026-01-01T00:00:00Z')").run()
+      Atomics.store(flag, 0, 1)
+      Atomics.notify(flag, 0)
+      Atomics.wait(flag, 0, 1, workerData.holdMs)
+      db.exec('COMMIT')
+      db.close()
+      `,
+      {
+        eval: true,
+        workerData: { dbPath, buffer: flag.buffer, holdMs: HOLD_MS },
+      }
+    )
+    const exited = new Promise<number>((resolve, reject) => {
+      holder.once('exit', resolve)
+      holder.once('error', reject)
+    })
 
-    // 片方が書き込みトランザクションを開いたまま、もう片方が書く
-    writer.exec(`BEGIN IMMEDIATE`)
-    writer
-      .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
-      .run('u1', 'Alice', '2026-01-01T00:00:00Z')
+    try {
+      // 別スレッドがロックを取るまで待つ
+      expect(Atomics.wait(flag, 0, 0, 5000)).not.toBe('timed-out')
 
-    // 待ち時間を持たない接続はすぐ諦める（この形が既定であることの確認）
-    const impatient = new Database(dbPath, { timeout: 0 })
-    expect(() =>
-      impatient
-        .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
-        .run('u2', 'Bob', '2026-01-01T00:00:00Z')
-    ).toThrow(/SQLITE_BUSY|locked/i)
-    impatient.close()
+      // 待ち時間を 0 にした接続は、ロック中はすぐ SQLITE_BUSY で失敗する
+      const impatient = new Database(dbPath, { timeout: 0 })
+      try {
+        expect(() =>
+          impatient
+            .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
+            .run('u2', 'Bob', '2026-01-01T00:00:00Z')
+        ).toThrow(/SQLITE_BUSY|locked/i)
+      } finally {
+        impatient.close()
+      }
 
-    writer.exec(`COMMIT`)
+      // 待ち時間を持つ接続は、別スレッドが COMMIT するまで待ってから通る
+      const patient = new Database(dbPath, { timeout: 5000 })
+      try {
+        const started = Date.now()
+        patient
+          .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
+          .run('u2', 'Bob', '2026-01-01T00:00:00Z')
+        const waited = Date.now() - started
+        expect(waited).toBeGreaterThanOrEqual(HOLD_MS / 2)
 
-    // 解放後は通る
-    expect(() =>
-      other
-        .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
-        .run('u2', 'Bob', '2026-01-01T00:00:00Z')
-    ).not.toThrow()
-
-    const count = other.prepare(`SELECT COUNT(*) AS n FROM users`).get() as {
-      n: number
+        const count = patient
+          .prepare(`SELECT COUNT(*) AS n FROM users`)
+          .get() as { n: number }
+        expect(count.n).toBe(2)
+      } finally {
+        patient.close()
+      }
+    } finally {
+      Atomics.store(flag, 0, 2)
+      Atomics.notify(flag, 0)
+      expect(await exited).toBe(0)
     }
-    expect(count.n).toBe(2)
-
-    other.close()
-    writer.close()
   })
 
   it('2端末の同期を同時に走らせても、どちらも壊れずに終わる', async () => {

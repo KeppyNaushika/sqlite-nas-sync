@@ -54,7 +54,7 @@ describe('openRemoteDbViaLocalCopy の後片付け', () => {
   beforeEach(() => {
     fs.rmSync(dir, { recursive: true, force: true })
     fs.mkdirSync(dir, { recursive: true })
-    // 同期対象のDBは必ずWALモード（setupChangelog がそう設定する）。
+    // 同期するDBは必ずWALモードである。`setupSync` と `setupRowsLedgers` がそう設定する。
     // WALでないDBで試すと副ファイルが生まれず、この不具合を見逃す。
     const db = new Database(srcPath)
     db.pragma('journal_mode = WAL')
@@ -177,8 +177,12 @@ describe('performSync 後の一時領域', () => {
     // Bが一度取り込んで、Aに対するカーソルを進めておく
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
-    // Aのchangelogを消して隙間を作る（保持期間超過の再現）。
-    // Bは「読んだ位置」を覚えているのに相手のログが空 —— これが隙間の形。
+    // Aが書き足してから、Aのchangelogを消して隙間を作る（保持期間超過の再現）。
+    // Bがまだ読んでいない u2 のエントリまで消えている —— これが隙間の形。
+    // 読み終えたぶんだけを消しても隙間ではない
+    dbA
+      .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
+      .run('u2', 'Bob', '2024-01-02T00:00:00Z')
     dbA.exec(`DELETE FROM _changelog`)
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
 

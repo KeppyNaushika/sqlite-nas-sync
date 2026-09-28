@@ -55,7 +55,7 @@ export function readSchemaVersion(db: Database.Database): string | null {
  * 同期対象テーブルのスキーマからハッシュ値を自動生成する。
  *
  * 各テーブルの `PRAGMA table_info` からカラム名・型・notnull・pk を取得し、
- * テーブル名でソートした上でSHA-256ハッシュを生成する。
+ * テーブル名を UTF-8 のバイト順にソートした上でSHA-256ハッシュを生成する。
  * スキーマが変更されると自動的に異なるハッシュが返るため、
  * 手動でバージョンを管理する必要がない。
  *
@@ -69,27 +69,28 @@ export function computeSchemaHash(
 ): string {
   const parts: string[] = []
 
-  // テーブル名でソートして安定した順序にする
-  const sortedTables = [...tables].sort((a, b) => a.name.localeCompare(b.name))
+  // テーブル名でソートして安定した順序にする。
+  // **比較は UTF-8 のバイト順（コードポイント順と同じ）にする。**
+  // `localeCompare` は実行環境のロケールで順序が変わるので、ロケールの違うクライアントどうしでハッシュが割れ、互いを見送り合う。
+  const sortedTables = [...tables].sort((a, b) =>
+    Buffer.compare(Buffer.from(a.name, 'utf8'), Buffer.from(b.name, 'utf8'))
+  )
 
   for (const tableConfig of sortedTables) {
     const tableName = tableConfig.name
 
-    try {
-      const columns = db
-        .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
-        .all() as ColumnInfo[]
+    // 無い表でも `PRAGMA table_info` は例外にならず、空の配列を返す
+    const columns = db
+      .prepare(`PRAGMA table_info(${escapeIdentifier(tableName)})`)
+      .all() as ColumnInfo[]
 
-      // カラムをcid順（定義順）で処理
-      const colDescs = columns
-        .sort((a, b) => a.cid - b.cid)
-        .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.pk}`)
-        .join(',')
+    // カラムをcid順（定義順）で処理
+    const colDescs = columns
+      .sort((a, b) => a.cid - b.cid)
+      .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.pk}`)
+      .join(',')
 
-      parts.push(`${tableName}(${colDescs})`)
-    } catch {
-      // テーブルが存在しない場合はスキップ
-    }
+    parts.push(`${tableName}(${colDescs})`)
   }
 
   const hash = crypto.createHash('sha256').update(parts.join('|')).digest('hex')

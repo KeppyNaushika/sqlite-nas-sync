@@ -10,10 +10,8 @@
  * 綴りの違う2端末で版の鍵が割れる** —— 同じ行の削除の版が
  * `('Notes', 'k1')` と `('notes', 'k1')` の2つに分かれ、互いに効かない。
  *
- * そこで、**入り口で1回だけ `sqlite_master` に尋ねて畳む**。畳んだあとは、
- * 帳簿を引くときに `COLLATE NOCASE` を足す必要がない
- * （`__tests__/invariants.test.ts` の「帳簿を id で引くときは綴り違いに備える」
- * 規則が `src/rows/` を対象外にしているのは、この正規化があるからである）。
+ * そこで、**入り口で1回だけ `sqlite_master` に尋ねて畳む**。
+ * 畳んだあとは、帳簿を引くときに `COLLATE NOCASE` を足す必要がない。
  *
  * @module rows/table-name
  * @internal

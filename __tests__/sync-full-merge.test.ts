@@ -1,8 +1,9 @@
 /**
  * フルマージ —— changelog に隙間があって差分では追いつけないときの経路。
  *
- * 保持期間を超えて同期しなかった端末が復帰する場面で、リモートの全レコードを
- * LWW で突き合わせ、`_tombstone` の削除を適用し、changelog を複製する。
+ * 保持期間を超えて同期しなかったクライアントが復帰する場面で使う。
+ * 相手の `_sns_rows_*` と `_tombstone` の全ての主キーについて、手元のバージョンと LWW で比べて強い方を採る。
+ * 手元で勝つバージョンが変わった主キーだけを、自分の `_changelog` に載せる。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs'
@@ -64,7 +65,7 @@ describe('フルマージ（ギャップ検出時）', () => {
     dbB.close()
   })
 
-  it('フルマージ中にchangelogが汚染されない', async () => {
+  it('フルマージは、勝つバージョンが変わった主キーだけを `_changelog` に載せる', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a')
     const { db: dbB, dbPath: pathB } = createClientDb('client-b')
 
@@ -80,34 +81,43 @@ describe('フルマージ（ギャップ検出時）', () => {
     // Bが同期
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
-    // Aのchangelogを全削除（7日経過シミュレート）
-    dbA.exec(`DELETE FROM _changelog`)
-    // Aが新しいレコードを追加
+    // Aが新しいレコードを2件追加する
     dbA
       .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
       .run('u3', 'Charlie', '2024-01-10T00:00:00Z')
+    dbA
+      .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
+      .run('u4', 'Dave', '2024-01-11T00:00:00Z')
+    // Aの changelog から、B がまだ読んでいない u3 のエントリまでを消して隙間を作る。
+    // 既読ぶんだけを消しても隙間にはならないので、B が次に読むはずだった1件を巻き込む。
+    const { lastSeenId } = dbB
+      .prepare(`SELECT lastSeenId FROM _sync_state WHERE remoteClientId = ?`)
+      .get('client-a') as { lastSeenId: number }
+    dbA.prepare(`DELETE FROM _changelog WHERE id <= ?`).run(lastSeenId + 1)
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
     dbA.close()
 
-    // Bのchangelogエントリ数を記録（フルマージ前）
-    const beforeCount = (
-      dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any
-    ).cnt
+    const beforeMaxId = getMaxChangelogId(dbB)
 
     // Bが復帰して同期（ギャップ → フルマージ）
-    await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
+    const resultB = await performSync(
+      dbB,
+      makeConfig(pathB, 'client-b'),
+      TABLES
+    )
+    expect(resultB.hadChangelogGap).toBe(true)
 
-    // フルマージ後のchangelogエントリ数
-    // トリガーOFFなのでデータマージ分は増えない
-    // changelogマージ分のみ
-    const afterCount = (
-      dbB.prepare(`SELECT COUNT(*) as cnt FROM _changelog`).get() as any
-    ).cnt
-
-    // u1, u2の既存レコードのマージではchangelogが増えないことを確認
-    // （全レコード分のINSERT/UPDATEエントリが生成されていないこと）
-    // Aのchangelogマージ分のみ
-    expect(afterCount).toBeLessThan(beforeCount + 10)
+    // u1 と u2 は B が既に同じバージョンを持っているので、フルマージで突き合わせても載らない。
+    // 載るのは、B に無かった u3 と u4 だけである。
+    const added = dbB
+      .prepare(
+        `SELECT tableName, recordId FROM _changelog WHERE id > ? ORDER BY recordId`
+      )
+      .all(beforeMaxId)
+    expect(added).toEqual([
+      { tableName: 'users', recordId: 'u3' },
+      { tableName: 'users', recordId: 'u4' },
+    ])
 
     dbB.close()
   })
@@ -123,7 +133,11 @@ describe('フルマージ（ギャップ検出時）', () => {
 
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
-    // Aのchangelogを全削除（7日経過シミュレート）
+    // Aが書き足してから、Aのchangelogを全削除（7日経過シミュレート）。
+    // B が読み終えたぶんだけを消しても隙間ではないので、B がまだ読んでいない u2 のエントリも消す
+    dbA
+      .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
+      .run('u2', 'Bob', '2024-01-02T00:00:00Z')
     dbA.exec(`DELETE FROM _changelog`)
     await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
     dbA.close()
@@ -150,11 +164,13 @@ describe('フルマージ（ギャップ検出時）', () => {
     // 延命しなくてもフルマージで事実は届いている（A が入れた u1 が B に在る）
     const u1 = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get() as any
     expect(u1?.name).toBe('Alice')
+    const u2 = dbB.prepare(`SELECT * FROM users WHERE id = 'u2'`).get() as any
+    expect(u2?.name).toBe('Bob')
 
     dbB.close()
   })
 
-  it('フルマージでリモートのchangelogがマージされる', async () => {
+  it('フルマージで取り込んで変わった主キーは、自分の `_changelog` に載って中継される', async () => {
     const { db: dbA, dbPath: pathA } = createClientDb('client-a')
     const { db: dbB, dbPath: pathB } = createClientDb('client-b')
 
@@ -176,7 +192,8 @@ describe('フルマージ（ギャップ検出時）', () => {
     // Bが復帰（フルマージ）
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
-    // Bのchangelogにu2のエントリがある（Aのchangelogからマージされた）
+    // Bのchangelogにu2のエントリがある。
+    // A の `_changelog` を写したのではなく、B が取り込みで u2 のバージョンを変えたので載せた。
     const u2Entries = dbB
       .prepare(`SELECT * FROM _changelog WHERE recordId = 'u2'`)
       .all()
@@ -247,12 +264,10 @@ describe('フルマージ（ギャップ検出時）', () => {
     // Aのchangelogを全削除（7日経過シミュレート）
     dbA.exec(`DELETE FROM _changelog`)
 
-    // Aがu1を再作成（削除より新しいupdatedAt）。
-    //
-    // **削除の時刻は固定値ではない。** DELETEトリガは `_tombstone.deletedAt` に
-    // **現在時刻**を刻むので、ここに過去の固定値（`2024-06-01` など）を書くと
-    // 作り直しの方が古くなり、LWW としては削除が勝つのが正しい答えになる
-    // （＝このテストの意図する形にならない）。**相対と固定を混ぜないこと。**
+    // Aがu1を再作成する。
+    // A は削除のあとに同じクライアントで作り直すので、作り直しは削除より後の変更である。
+    // LWW の1で作り直しが勝ち、`updatedAt` の値によらない。
+    // 作り直しのバージョンの `_sns_ts` は、単調化によって削除の時刻以上になる。
     dbA
       .prepare(`INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`)
       .run('u1', 'Alice Reborn', '2099-01-01T00:00:00Z')
@@ -262,7 +277,7 @@ describe('フルマージ（ギャップ検出時）', () => {
     // Bが復帰（フルマージ）
     await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
 
-    // tombstone.deletedAt < u1.updatedAt なので、u1は保持される
+    // 作り直しは削除より後の変更なので、u1は保持される
     const user = dbB.prepare(`SELECT * FROM users WHERE id = 'u1'`).get() as any
     expect(user).toBeTruthy()
     expect(user.name).toBe('Alice Reborn')
@@ -333,6 +348,33 @@ describe('フルマージ（ギャップ検出時）', () => {
     dbB2.close()
   })
 
+  it('一度も書いていない相手は、初回だけフルマージで読み、2回目からは差分で読む', async () => {
+    // 相手の `_changelog` が空で `prunedThroughId` も 0 なので、初回のフルマージのあとも
+    // カーソルは 0 のまま。「0 まで読んだ」を「まだ読んでいない」と取り違えると、
+    // 読むたびにフルマージを繰り返す
+    const { db: dbA, dbPath: pathA } = createClientDb('client-a')
+    await performSync(dbA, makeConfig(pathA, 'client-a'), TABLES)
+    expect(getMaxChangelogId(dbA)).toBe(0)
+    dbA.close()
+
+    const { db: dbB, dbPath: pathB } = createClientDb('client-b')
+    const first = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
+    expect(first.hadChangelogGap).toBe(true)
+    expect(first.clientsSynced).toBe(1)
+    expect(
+      dbB
+        .prepare(`SELECT lastSeenId FROM _sync_state WHERE remoteClientId = ?`)
+        .get('client-a')
+    ).toEqual({ lastSeenId: 0 })
+
+    const second = await performSync(dbB, makeConfig(pathB, 'client-b'), TABLES)
+    expect(second.hadChangelogGap).toBe(false)
+    expect(second.clientsSynced).toBe(1)
+    // 読みは省いていない（抑制の覚えは `performSync` を呼ぶたびにまっさら）
+    expect(second.transfers.peerReads).toBe(1)
+    dbB.close()
+  })
+
   it('掃除が開けた穴の向こうの変更も、中継した端末から届く', async () => {
     // 本体。A の変更が「B の掃除で消えたエントリ」に入っていても、A が共有から
     // 居なくなった後で C に届くこと。
@@ -363,14 +405,14 @@ describe('フルマージ（ギャップ検出時）', () => {
       TABLES
     )
     expect(resultB.hadChangelogGap).toBe(true)
-    // 取り込んだエントリは**元の changedAt のまま、新しく採番したid**で入る。
-    // ここで id順と時刻順がねじれる。
+    // 取り込みで変わった主キーは、B の `_changelog` に新しく採番した id と現在時刻で載る。
     expect(
       dbB.prepare(`SELECT * FROM users WHERE id = 'u2'`).get()
     ).toBeTruthy()
 
-    // B が掃除する。ねじれた古いエントリを保持期間の外へ押し出しておく
-    // （フルマージで取り込んだぶんが後から古くなる形）。
+    // B が掃除する。
+    // フルマージで載せたエントリの時刻を保持期間の外へずらし、掃除で消させる。
+    // フルマージで取り込んだ変更の記録が、あとから古くなって消える形である。
     dbB
       .prepare(
         `UPDATE _changelog SET changedAt = '2020-01-01T00:00:00.000Z'

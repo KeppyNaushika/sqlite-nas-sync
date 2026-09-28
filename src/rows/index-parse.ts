@@ -58,17 +58,19 @@ export interface UniqueIndexDefinition {
   predicate: string | null
 }
 
-/** `CREATE INDEX` を読んだ結果（照合順序は `PRAGMA` 側で補う）。 */
+/**
+ * `CREATE INDEX` を読んだ結果。
+ *
+ * 索引の名前・表・一意かどうか・向きは `PRAGMA` から取るので、ここには持たない。
+ */
 interface ParsedCreateIndex {
-  name: string
-  table: string
-  unique: boolean
   /** 項の字面（`COLLATE` と `ASC`/`DESC` を落としたもの） */
   expressions: string[]
-  /** 項ごとに明示された `COLLATE`（無ければ null） */
+  /**
+   * 項ごとに明示された `COLLATE`（無ければ null）。
+   * 導入時の確かめ（`src/setup/rows-preflight.ts`）が、独自に登録された照合順序を断るのに使う
+   */
   collations: (string | null)[]
-  /** 項ごとの `DESC` */
-  descendings: boolean[]
   /** 部分索引の述語。無ければ null */
   predicate: string | null
 }
@@ -95,16 +97,15 @@ export function parseCreateIndex(sql: string): ParsedCreateIndex {
       `索引の定義を読めない（CREATE INDEX で始まっていない）: ${sql}`
     )
   }
+  // 索引の名前と表の名前は、位置を進めるために読むだけで使わない
   let at = head[0].length
-  const name = readIdentifier(sql, at)
-  at = name.end
+  at = readIdentifier(sql, at).end
   const on = /^\s*ON\s+/i.exec(sql.slice(at))
   if (on === null) {
     throw new Error(`索引の定義を読めない（ON が無い）: ${sql}`)
   }
   at += on[0].length
-  const table = readIdentifier(sql, at)
-  at = table.end
+  at = readIdentifier(sql, at).end
 
   const open = sql.indexOf('(', at)
   if (open < 0 || sql.slice(at, open).trim() !== '') {
@@ -128,7 +129,6 @@ export function parseCreateIndex(sql: string): ParsedCreateIndex {
 
   const expressions: string[] = []
   const collations: (string | null)[] = []
-  const descendings: boolean[] = []
   for (const raw of splitTopLevel(body, sql)) {
     const term = raw.trim()
     if (term === '') {
@@ -140,7 +140,6 @@ export function parseCreateIndex(sql: string): ParsedCreateIndex {
     }
     expressions.push(parsed.expression)
     collations.push(parsed.collation)
-    descendings.push(parsed.descending)
   }
   if (expressions.length === 0) {
     throw new Error(`索引の定義を読めない（項が1つも無い）: ${sql}`)
@@ -156,15 +155,7 @@ export function parseCreateIndex(sql: string): ParsedCreateIndex {
     assertDeterministicSql(predicate, '部分索引の述語')
   }
 
-  return {
-    name: name.value,
-    table: table.value,
-    unique: head[1] !== undefined,
-    expressions,
-    collations,
-    descendings,
-    predicate,
-  }
+  return { expressions, collations, predicate }
 }
 
 /**
@@ -428,15 +419,11 @@ function splitTopLevel(body: string, sql: string): string[] {
 function stripTermSuffixes(term: string): {
   expression: string
   collation: string | null
-  descending: boolean
 } {
   let expression = term
-  let descending = false
   let collation: string | null = null
-
   const direction = /\s+(ASC|DESC)\s*$/i.exec(expression)
   if (direction !== null && isOutsideQuotes(expression, direction.index)) {
-    descending = direction[1].toUpperCase() === 'DESC'
     expression = expression.slice(0, direction.index)
   }
   const collate =
@@ -447,7 +434,7 @@ function stripTermSuffixes(term: string): {
     collation = collate[1].replace(/^["[]|["\]]$/g, '')
     expression = expression.slice(0, collate.index)
   }
-  return { expression: expression.trim(), collation, descending }
+  return { expression: expression.trim(), collation }
 }
 
 /** `at` の位置が引用符と括弧の外か。 */

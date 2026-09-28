@@ -3,7 +3,7 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import Database from 'better-sqlite3'
-import { computeSchemaHash } from '../src/setup'
+import { computeSchemaHash } from '../src/setup/schema-version'
 import { setupRowsDb } from './helpers/sync-fixtures'
 import {
   readChangelog,
@@ -12,6 +12,7 @@ import {
   cleanupChangelog,
   readChangelogPrunedThroughId,
   describeChangelogPruneWall,
+  fullMergeCursor,
 } from '../src/changelog'
 
 describe('changelog', () => {
@@ -152,15 +153,14 @@ describe('changelog', () => {
     })
 
     /**
-     * 掃除を経由しない消え方は、記録に載らないので依然見抜けない。
+     * 掃除を経由しない消え方は `_changelog_prune` に載らないが、`sqlite_sequence` から見抜ける。
      *
      * `_changelog_prune` に書くのは {@link cleanupChangelog} だけなので、
-     * 利用者やテストが直に打つ `DELETE FROM _changelog`（や、DBファイルの差し替え、
-     * `_changelog_prune` を持たない旧版が開けた穴）は記録に現れない。
-     * この形は `MIN(id)` の規則が頭の欠けを拾えたときにだけ見つかる。
-     * 現状維持の確認として固定しておく。
+     * 利用者やテストが直に打つ `DELETE FROM _changelog` は記録に現れない。
+     * `_changelog` は `AUTOINCREMENT` なので、振った最大の id は消しても下がらない。
+     * 振った id の数と残っている id の数を比べれば、途中の穴も分かる。
      */
-    it('生の DELETE で開いた途中の穴は、記録に載らないので見抜けない', () => {
+    it('生の DELETE で開いた途中の穴も、振った id の数から見抜ける', () => {
       for (const [id, name] of [
         ['u1', 'Alice'],
         ['u2', 'Bob'],
@@ -171,16 +171,54 @@ describe('changelog', () => {
         ).run(id, name, '2024-01-01T00:00:00Z')
       }
 
-      // 既読は1番まで。未読の2番が消えた状態
+      // 既読は1番まで。未読の2番が消えた状態。頭（1番）は残っているので
+      // `MIN(id)` の規則には当たらないが、2〜3番の2件を振ったのに1件しか残っていない
       db.prepare(`DELETE FROM _changelog WHERE id = 2`).run()
-
-      // minId=1、lastSeenId=1 → minId は lastSeenId 以下だが、未読の先頭(2)は
-      // 消えている。掃除の記録も無いので、どちらの規則にも当たらない。
-      expect(hasChangelogGap(db, 1)).toBe(false)
-
-      // 先頭ごと消えていれば `MIN(id)` の規則が拾う
-      db.prepare(`DELETE FROM _changelog WHERE id = 1`).run()
       expect(hasChangelogGap(db, 1)).toBe(true)
+      // 穴より後ろまで読み終えていれば隙間ではない
+      expect(hasChangelogGap(db, 2)).toBe(false)
+      expect(hasChangelogGap(db, 3)).toBe(false)
+    })
+
+    it('生の DELETE で末尾が消えても見抜ける', () => {
+      for (const [id, name] of [
+        ['u1', 'Alice'],
+        ['u2', 'Bob'],
+      ]) {
+        db.prepare(
+          `INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`
+        ).run(id, name, '2024-01-01T00:00:00Z')
+      }
+      // 既読は1番まで。未読の末尾（2番）が消えた。残っている頭は既読の1番なので、
+      // `MIN(id)` の規則にも、掃除の記録にも当たらない
+      db.prepare(`DELETE FROM _changelog WHERE id = 2`).run()
+      expect(hasChangelogGap(db, 1)).toBe(true)
+    })
+
+    /**
+     * 網羅検査が見つけた形。0 まで読んだ相手が書き、その `_changelog` が読まれる前に直に消えた。
+     * `_changelog` は空・`prunedThroughId` は 0 で、一度も書いていない相手と同じに見える。
+     */
+    it('0 まで読んだあとで書いた行の changelog が直に全部消えても、隙間と分かる', () => {
+      expect(hasChangelogGap(db, 0)).toBe(false)
+      db.prepare(
+        `INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`
+      ).run('u1', 'Alice', '2024-01-01T00:00:00Z')
+      db.prepare(`DELETE FROM _changelog`).run()
+      expect(readChangelogPrunedThroughId(db)).toBe(0)
+      expect(hasChangelogGap(db, 0)).toBe(true)
+      // フルマージのあとのカーソルに対しては隙間ではない（繰り返さない）
+      expect(fullMergeCursor(db)).toBe(1)
+      expect(hasChangelogGap(db, fullMergeCursor(db))).toBe(false)
+    })
+
+    it('読み位置が相手の振った id を追い越していれば隙間とし、フルマージのあとは繰り返さない', () => {
+      db.prepare(
+        `INSERT INTO users (id, name, updatedAt) VALUES (?, ?, ?)`
+      ).run('u1', 'Alice', '2024-01-01T00:00:00Z')
+      // 相手の id が振り直された（ファイルの差し替えなど）。読み位置 5 より後ろの id は来ない
+      expect(hasChangelogGap(db, 5)).toBe(true)
+      expect(hasChangelogGap(db, fullMergeCursor(db))).toBe(false)
     })
 
     /**
@@ -216,7 +254,7 @@ describe('changelog', () => {
 
       // 消えたのが既読ぶんだけなら隙間ではない。ここを「空 かつ lastSeenId>0 なら
       // 隙間」と答えると、フルマージ済みの相手を毎回フルマージし直す
-      // （`pullFullMerge` はカーソルを掃除済みの位置まで進める）。
+      // フルマージは、相手の `_changelog` の最大 id と掃除済みの位置の大きい方までカーソルを進める。
       expect(hasChangelogGap(db, 3)).toBe(false)
     })
 
@@ -314,9 +352,11 @@ describe('changelog', () => {
      * 穴の向こうの変更は、相手が共有から居なくなると二度と届かない
      * （`hasChangelogGap` は残っている頭を見るので、頭が残っていれば気づけない）。
      *
-     * ねじれは机上の話ではない: `mergeChangelog` は取り込んだ相手のエントリを
-     * 元の `changedAt` のまま新しく採番したidで書くので、フルマージの直後は
-     * 必ずこの形になる。
+     * 旧方式の `mergeChangelog` は、取り込んだ相手のエントリを元の `changedAt` のまま新しく採番した id で書いていた。
+     * そのため旧方式では、フルマージの直後は必ずこの形になった。
+     * いまの取り込みは `changedAt` に現在時刻を書くので、新しくこの形を作ることはない。
+     * ただし移行は旧方式の `_changelog` をそのまま写すので、移行した DB にはこの形が残りうる。
+     * 時計が戻ったクライアントでも同じ形になる。
      *
      * そこで「保持期間を過ぎていない、いちばん小さいid」より前だけを消す。
      * 下の例では期限内の `keep`(id=1) が壁になり、期限切れの `drop`(id=2) も残る。
@@ -349,8 +389,8 @@ describe('changelog', () => {
     })
 
     it('ねじれた並びでも、掃除は changelog に穴を開けない', () => {
-      // `mergeChangelog` が作る形の再現: 古い `changedAt` を**大きいid**で、
-      // その前に新しい `changedAt` の若いidを置く。
+      // 旧方式の `mergeChangelog` が作っていた形の再現。
+      // 古い `changedAt` を大きい id で、その前に新しい `changedAt` の若い id を置く。
       db.prepare(
         `INSERT INTO _changelog (id, tableName, recordId, operation, changedAt)
          VALUES (10, ?, ?, ?, datetime('now', '-1 hours'))`

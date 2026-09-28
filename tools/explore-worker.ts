@@ -11,7 +11,7 @@
  * @module tools/explore-worker
  */
 import * as path from 'path'
-import { ExploreConfig, TABLE_SETS, symmetryActive } from './explore/config'
+import { ExploreConfig, TABLE_SETS } from './explore/config'
 import {
   Transition,
   clientName,
@@ -32,15 +32,7 @@ import {
   Violation,
   WorkerStats,
 } from './explore/protocol'
-import {
-  canonicalMask,
-  dominates,
-  fullMask,
-  maskAfterOp,
-  permuteMask,
-  porOrder,
-  symmetryGroup,
-} from './explore/reduction'
+import { dominates, fullMask, maskAfterOp } from './explore/reduction'
 import {
   History,
   ORACLES,
@@ -70,7 +62,6 @@ type Context = {
   transitions: Transition[]
   labeler: TimeLabeler
   prober: Prober
-  permutations: number[][]
   dirs: { template: string; work: string; snap: string; probeSnap: string }
   /** 重複排除の手元の写し。親が他のワーカーの分を配ってくる分と、自分が出した分 */
   seen: Map<string, number[]>
@@ -133,7 +124,6 @@ function resolveOracle(name: string | null): Oracle | null {
 async function init(config: ExploreConfig, workDir: string): Promise<void> {
   const lib = loadLibrary(config.libDir)
   const labeler = new TimeLabeler(config)
-  const permutations = symmetryGroup(config.clients, symmetryActive(config))
   const dirs = {
     template: path.join(workDir, 'template'),
     work: path.join(workDir, 'work'),
@@ -141,14 +131,13 @@ async function init(config: ExploreConfig, workDir: string): Promise<void> {
     probeSnap: path.join(workDir, 'probe-snap'),
   }
   buildTemplate(lib, dirs.template, config)
-  const prober = new Prober(lib, config, labeler, permutations)
+  const prober = new Prober(lib, config, labeler)
   context = {
     config,
     lib,
     transitions: enumerateTransitions(config),
     labeler,
     prober,
-    permutations,
     dirs,
     seen: new Map(),
     checked: new Set(),
@@ -161,12 +150,7 @@ async function init(config: ExploreConfig, workDir: string): Promise<void> {
   closeWorld(world)
   // 根（何も書いていない空の世界）の見え方は空。事実の集合が空の列は、どう同期を挟んでもこれになるべき
   context.views.set(root.key, { kind: 'view', view: '[]' })
-  send({
-    type: 'ready',
-    rootKey: root.key,
-    rootFrameKey: root.frameKey,
-    rootMask: canonicalMask(fullMask(config.clients), root.permutations),
-  })
+  send({ type: 'ready', rootKey: root.key })
 }
 
 function emptyHistory(ctx: Context): History {
@@ -184,35 +168,19 @@ function recordIssued(
   history[transition.client].push({ op: transition.op, status: status ?? '' })
 }
 
-/** 重複排除の鍵に使う、正準な並びでの (操作の列の鍵, 集合)。 */
-function chooseCanonical(
+/**
+ * 重複排除の鍵に使う操作の列の鍵と、アプリが受け取った結果つきの鍵（食い違いの強さの判定に使う。
+ * tools/explore-convergence.ts の「強い食い違い・弱い食い違い」）。
+ */
+function historyKeys(
   ctx: Context,
-  permutations: number[][],
-  mask: number,
   history: History
-): { historyKey: string; statusKey: string; mask: number } {
-  let best: { historyKey: string; statusKey: string; mask: number } | null =
-    null
-  for (const permutation of permutations) {
-    const key = ctx.config.scheduleCheck
-      ? historyKey(history, permutation, ctx.config.scheduleKey)
-      : ''
-    // アプリが受け取った結果つきの鍵も、**同じ入れ替えで**作る（食い違いの強さの判定に使う。
-    // tools/explore-convergence.ts の「強い食い違い・弱い食い違い」）
-    const statusKey = ctx.config.scheduleCheck
-      ? historyKey(history, permutation, 'ops+status')
-      : ''
-    const mapped = permuteMask(mask, permutation)
-    if (
-      best === null ||
-      key < best.historyKey ||
-      (key === best.historyKey && mapped > best.mask)
-    ) {
-      best = { historyKey: key, statusKey, mask: mapped }
-    }
+): { historyKey: string; statusKey: string } {
+  if (!ctx.config.scheduleCheck) return { historyKey: '', statusKey: '' }
+  return {
+    historyKey: historyKey(history, ctx.config.scheduleKey),
+    statusKey: historyKey(history, 'ops+status'),
   }
-  if (best === null) throw new Error('入れ替えの候補が空')
-  return best
 }
 
 /** 列を空の世界から再生する。書き込みが作った事実も数え直す。 */
@@ -234,13 +202,14 @@ async function materialize(
 }
 
 const KIND_LABEL: Record<Violation['kind'], string> = {
-  exception: '例外（performSync が投げた）',
+  exception:
+    '例外（performSync が投げた。作り直しの確定ごとの判定8・10・13 と、操作ごとの原則2・3 の確かめの違反もここに入る）',
   'sync-failed':
-    '取り込みの失敗（Sync failed / Full merge failed / Failed to open）',
+    '取り込みの失敗（Sync failed / Failed to open / Rebuild failed / Rebuild deferred）',
   'silent-divergence': '黙った食い違い（収束しても端末ごとに中身が違う）',
   oscillation: '振動（round-robin の同期が状態を行き来して止まらない）',
   'no-fixpoint': '上限まで同期しても状態が動き続けた',
-  // **違反ではない**（設計書 §8.1 第11版）。件数と代表例として出す種類
+  // **違反ではない**（設計書 §8.1）。件数と代表例として出す種類
   'schedule-dependence':
     '同期の挟み方で見え方が変わる（案A では `_sns_ts` の引き上げがあるので、これは設計どおり。§9.25）',
   'oracle-mismatch': '参照実装の見え方と食い違う',
@@ -313,9 +282,10 @@ async function writeReport(
       ...renderSteps(ctx, path, warningsByStep),
     ]
     const clockNote =
-      '  ※ [時刻 Ck] は、その操作のトリガが刻む _changelog.changedAt と _tombstone.deletedAt を' +
-      ' Ck にそろえるという意味。C0 < C1 < … はどれも行の時刻（2026-01-01…）より後で、' +
-      ' 同期と「時計を進める」のたびに1つ進む。同じ Ck の操作は同じ瞬間に起きた。'
+      '  ※ [時刻 Ck] は、その操作のトリガーが刻む _changelog.changedAt・_tombstone.deletedAt と、' +
+      '削除の版の _sns_ts のうち実行した時刻が入ったものを Ck にそろえるという意味。' +
+      'C0 < C1 < … はどれも行の時刻（2026-01-01…）より後で、' +
+      '同期と「時計を進める」のたびに1つ進む。同じ Ck の操作は同じ瞬間に起きた。'
     if (probeStart === null) {
       return {
         report: [
@@ -467,7 +437,7 @@ async function describeSchedules(
   summary: string
 ): Promise<string> {
   const sections: string[] = [
-    // 挟み方の食い違いは**違反ではない**（設計書 §8.1 第11版・§9.25）。
+    // 挟み方の食い違いは**違反ではない**（設計書 §8.1・§9.25）。
     // 「反例」と書かない（読み手が案A の破れと取り違える）
     `観察: ${KIND_LABEL['schedule-dependence']}`,
     `要約: ${summary}`,
@@ -515,8 +485,9 @@ async function describeSchedules(
   }
   sections.push(
     '',
-    '  ※ [時刻 Ck] は、その操作のトリガが刻む _changelog.changedAt と _tombstone.deletedAt を' +
-      ' Ck にそろえるという意味（tools/explore/world.ts の「時計」）。見え方の updatedAt は julianday。'
+    '  ※ [時刻 Ck] は、その操作のトリガーが刻む実行時刻（_changelog.changedAt・_tombstone.deletedAt・' +
+      '削除の版の _sns_ts）を Ck にそろえるという意味（tools/explore/world.ts の「時計」）。' +
+      '見え方の updatedAt は julianday。'
   )
   return sections.join('\n')
 }
@@ -534,8 +505,6 @@ function TABLE_NAMES(ctx: Context): string {
  * **遷移は組ごとに1回だけ実行し**、子の鍵（操作の列・集合）だけを節ごとに計算する
  * （節ごとに実行すると、実測で同じ状態への同じ遷移を5倍実行していた）。
  *
- * 組は正準な鍵ではなく**並びを変えない直列化の鍵**（frameKey）でまとめてある。対称性で鏡写しに
- * なった節どうしは、同じ遷移の添字が鏡写しの端末を指すので、同じ組にしてはいけない。
  */
 async function expand(work: ExpandUnit[]): Promise<void> {
   const ctx = context
@@ -550,7 +519,7 @@ async function expand(work: ExpandUnit[]): Promise<void> {
     const representative = nodes[0]
     const { world } = await materialize(ctx, representative.path)
     const parentState = ctx.prober.canonical(world)
-    if (parentState.frameKey !== representative.frameKey) {
+    if (parentState.key !== representative.stateKey) {
       // 同じ列を再生したのに、見つけたときと違う状態になった。同期の中の刻みが
       // 同じミリ秒に収まったかどうかの揺れで起きうる（docs の「保証しないこと」）。
       // 黙って数えるだけにせず、列を親へ渡して出力に載せる
@@ -558,7 +527,6 @@ async function expand(work: ExpandUnit[]): Promise<void> {
       if (mismatchExamples.length < 3)
         mismatchExamples.push(representative.path)
     }
-    const order = porOrder(parentState.permutations[0])
     snapshotWorld(world, ctx.dirs.snap)
 
     for (let index = from; index < to; index += 1) {
@@ -656,21 +624,13 @@ async function expand(work: ExpandUnit[]): Promise<void> {
           const childMask = !config.por
             ? fullMask(config.clients)
             : transition.kind === 'op'
-              ? maskAfterOp(node.mask, order, transition.client)
+              ? maskAfterOp(node.mask, transition.client)
               : fullMask(config.clients)
           const childPath = [...node.path, index]
           const childHistory = node.history.map((issued) => [...issued])
           recordIssued(childHistory, transition, status)
-          // 鍵は (状態, 発行した操作の列, 集合)。操作の列は端末ごとなので、対称性で端末を
-          // 入れ替えるなら列も同じ入れ替えで並べ直す。自己対称な状態では入れ替えの候補が
-          // 複数あるので、列の鍵が最小になる候補を選び、集合も**同じ候補で**写す
-          // （列と集合を別々の候補で写すと、どの軌道の節とも一致しない鍵ができる）
-          const chosen = chooseCanonical(
-            ctx,
-            state.permutations,
-            childMask,
-            childHistory
-          )
+          // 鍵は (状態, 発行した操作の列, 集合)
+          const chosen = historyKeys(ctx, childHistory)
           const comparable =
             config.scheduleCheck && isComparableHistory(childHistory)
           // 比べてよいかの印も鍵に入れる。操作の列が同じでも、アプリが受け取った結果（親を
@@ -679,7 +639,7 @@ async function expand(work: ExpandUnit[]): Promise<void> {
           const entry = {
             key: `${state.key}|${chosen.historyKey}|${comparable ? 'c' : 'x'}`,
             stateKey: state.key,
-            mask: chosen.mask,
+            mask: childMask,
           }
           if (config.dedup) {
             if (isSeen(ctx.seen, entry)) {
@@ -716,14 +676,12 @@ async function expand(work: ExpandUnit[]): Promise<void> {
           children.push({
             path: childPath,
             history: childHistory,
-            frameKey: state.frameKey,
             mask: childMask,
             key: entry.key,
             stateKey: state.key,
             historyKey: chosen.historyKey,
             statusKey: chosen.statusKey,
             comparable,
-            canonicalMask: entry.mask,
             ...(view === undefined ? {} : { view }),
           })
         }

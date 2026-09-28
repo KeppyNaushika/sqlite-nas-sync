@@ -1,9 +1,9 @@
 /**
- * 1回の同期で「ファイルを丸ごと写した回数」を数える（タスク #12 の前後比較）。
+ * 1回の同期で「ファイルを丸ごと写した回数」を数える（無駄な転送の抑制の前後比較）。
  *
  * {@link module:tools/measure-idle} と違って、**新しい API を一切使わない**。
- * `fs.copyFileSync`（相手・自分の写しを手元へ写す口）と `Database.backup`
- * （NAS へ上げる口）を数えるだけなので、抑制を入れる**前**の版でもそのまま走る。
+ * 手元へ写した写しを開いた回数（写しを開くたびに1回呼ばれる `pragma('query_only = ON')`）と
+ * `Database.backup`（NAS へ上げる口）を数えるだけなので、抑制を入れる**前**の版でもそのまま走る。
  * これで「1回の同期で相手を2回写していた」を実測で比べられる。
  *
  * 使い方: `tsc -p tools/tsconfig.json && node node_modules/.cache/explore/tools/measure-copies.js`

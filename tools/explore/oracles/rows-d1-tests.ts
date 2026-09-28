@@ -1,5 +1,5 @@
 /**
- * 参照実装 `rows-d1` そのものの試験（設計書 docs/rows-table-design.md §8.3）。
+ * 参照実装 `rows-d1`（設計書 docs/rows-table-design.md §8.3）そのものの試験。
  *
  * **参照実装は判定の物差しなので、物差しが狂っていれば検査全部が無意味になる。**
  * そこで、手で作った版の集合に対する期待値を**表**にして並べる。表の行を読めば
@@ -173,7 +173,7 @@ function del(
  * - `置く id=… name=…`: 置く行（表示値つき）
  * - `隠れ→g1`: 隠れた行（勝者の真の id）
  * - `置かない`: 置かない行（版は残る）
- * - `捨てる`: 版ごと捨てる行（原則4。親が削除されている）
+ * - `親削除←tags:g1`: 親が削除されているので置かない行（原則4。版は残る。矢印の先は大元の削除）
  * - `死`: 削除の版が `Max`
  */
 function summarize(derived: Derived, schema: OracleSchema): string[] {
@@ -190,10 +190,10 @@ function summarize(derived: Derived, schema: OracleSchema): string[] {
         lines.push(
           `${table.name}:${key} 隠れ→${result.winner ?? '（勝者なし）'}`
         )
-      } else if (result.placement === 'discarded') {
+      } else if (result.placement === 'parentDeleted') {
         const cause = result.cause
         lines.push(
-          `${table.name}:${key} 捨てる←${cause === undefined ? '？' : `${cause.table}:${cause.key}`}`
+          `${table.name}:${key} 親削除←${cause === undefined ? '？' : `${cause.table}:${cause.key}`}`
         )
       } else {
         lines.push(`${table.name}:${key} 置かない`)
@@ -221,7 +221,7 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: '§1.2.5 単純な LWW —— 強い版の中身が出る',
+    name: '§1.2.4〜1.2.5 単純な LWW —— 強い版の中身が出る',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 1, 'a'),
@@ -230,7 +230,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t2 updatedAt=' + T1],
   },
   {
-    name: '§1.2.5 同着は L で決まる（ts が同じ）',
+    name: '§1.2.4〜1.2.5 同着は L で決まる（ts が同じ）',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 9, 'a'),
@@ -239,7 +239,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t1 updatedAt=' + T0],
   },
   {
-    name: '§1.2.5 L も同着なら iid で決まる',
+    name: '§1.2.4〜1.2.5 L も同着なら iid で決まる',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 4, 'a'),
@@ -314,7 +314,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t2 updatedAt=' + T0],
   },
   {
-    name: '§1.5〜1.6 かぶり —— 弱い方が隠れた行になり、勝者は強い方',
+    name: '§1.3〜1.7 かぶり —— 弱い方が隠れた行になり、勝者は強い方',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -323,7 +323,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t1 updatedAt=' + T1, 'tags:g2 隠れ→g1'],
   },
   {
-    name: '§1.5 照合順序は索引の宣言どおり（NOCASE でかぶる）',
+    name: '§1.3〜1.7 照合順序は索引の宣言どおり（NOCASE でかぶる）',
     schema: NOCASE,
     versions: [
       row('people', 'p1', { id: 'p1', handle: 'Ann', updatedAt: T1 }, 1, 'a'),
@@ -335,7 +335,7 @@ const CASES: Case[] = [
     ],
   },
   {
-    name: '§2.1 削除 —— 削除の版が Max なら、その id は死ぬ',
+    name: '§2 削除 —— 削除の版が Max なら、その id は死ぬ',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 1, 'a'),
@@ -344,7 +344,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 死'],
   },
   {
-    name: '§1.2.5 系 削除より新しい ts の版は候補に戻る',
+    name: '§1.2.4〜1.2.5 系 削除より新しい ts の版は候補に戻る',
     schema: FAMILY,
     versions: [
       del('tags', 'g1', T0, 2, 'a'),
@@ -353,7 +353,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t1 updatedAt=' + T1],
   },
   {
-    name: '§2.4(4) 消してから同じ id で作り直す（補題A。_sns_ts の引き上げ）',
+    name: '§2 R0 消してから同じ id で作り直す（補題A。_sns_ts の引き上げ）',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -364,7 +364,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t2 updatedAt=' + T0],
   },
   {
-    name: '§2.2 cascade で消えた子は、親が生きていても戻らない',
+    name: '§2 R0 cascade で消えた子は、親が生きていても戻らない',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 1, 'a'),
@@ -380,7 +380,7 @@ const CASES: Case[] = [
     expect: ['tags:g1 置く id=g1 name=t1 updatedAt=' + T0, 'tag_notes:n1 死'],
   },
   {
-    name: '§1.4 読み替え —— 隠れた親を指す子は、勝者の主キーへ付け替わる',
+    name: '§1.3〜1.7 読み替え —— 隠れた親を指す子は、勝者の主キーへ付け替わる',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -400,7 +400,7 @@ const CASES: Case[] = [
     ],
   },
   {
-    name: '§1.4 親が置かれていない（CASCADE）子は、置かない行',
+    name: '§1.3〜1.7 親が置かれていない（CASCADE）子は、置かない行',
     schema: FAMILY,
     versions: [
       row(
@@ -414,7 +414,7 @@ const CASES: Case[] = [
     expect: ['tag_notes:n3 置かない'],
   },
   {
-    name: '§1.4 1:1 の表 —— 表示上の主キーも読み替える',
+    name: '§1.3〜1.7 1:1 の表 —— 表示上の主キーも読み替える',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -434,7 +434,7 @@ const CASES: Case[] = [
     ],
   },
   {
-    name: '§1.4〜1.6 1:1 の表で、読み替えた主キーが先客とかぶる',
+    name: '§1.3〜1.7 1:1 の表で、読み替えた主キーが先客とかぶる',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T2 }, 1, 'a'),
@@ -462,7 +462,7 @@ const CASES: Case[] = [
     ],
   },
   {
-    name: '§1.4 置かない行（NOT NULL）—— 列が NULL の候補は表に出ない',
+    name: '§1.3〜1.7 置かない行（NOT NULL）—— 列が NULL の候補は表に出ない',
     schema: GUARDED,
     versions: [
       row(
@@ -476,7 +476,7 @@ const CASES: Case[] = [
     expect: ['items:i1 置かない'],
   },
   {
-    name: '§1.4 置かない行（CHECK）—— CHECK に落ちる候補は表に出ない',
+    name: '§1.3〜1.7 置かない行（CHECK）—— CHECK に落ちる候補は表に出ない',
     schema: GUARDED,
     versions: [
       row(
@@ -490,7 +490,7 @@ const CASES: Case[] = [
     expect: ['items:i2 置かない'],
   },
   {
-    name: '§1.4 ON DELETE SET NULL —— 親が置かれていなければ外部キーは NULL',
+    name: '§1.3〜1.7 ON DELETE SET NULL —— 親が置かれていなければ外部キーは NULL',
     schema: GUARDED,
     versions: [
       row(
@@ -504,11 +504,11 @@ const CASES: Case[] = [
     expect: ['items:i3 置く id=i3 tagId=null label=x updatedAt=' + T0],
   },
   {
-    name: '原則4 親が削除されているなら、あとから届いた子は版ごと捨てる',
+    name: '原則4 親が削除されている間は、あとから届いた子は入らない（版は残る）',
     schema: FAMILY,
     versions: [
       del('tags', 'g1', T0, 1, 'a'),
-      // 親の削除より新しい時刻でも、子は戻らない（宣言が CASCADE である以上消える）
+      // 親の削除より新しい時刻でも、親が削除されている間は入らない（付則3 の CASCADE）
       row(
         'tag_notes',
         'n5',
@@ -516,11 +516,78 @@ const CASES: Case[] = [
         2,
         'b'
       ),
+      // 1:1 の子も同じ
+      row(
+        'tag_profiles',
+        'g1',
+        { id: 'g1', memo: 'm1', updatedAt: T2 },
+        3,
+        'b'
+      ),
     ],
-    expect: ['tags:g1 死', 'tag_notes:n5 捨てる←tags:g1'],
+    expect: [
+      'tags:g1 死',
+      'tag_notes:n5 親削除←tags:g1',
+      'tag_profiles:g1 親削除←tags:g1',
+    ],
   },
   {
-    name: '原則4 捨てた子を親とする孫も捨てる（連鎖。原因は大元の削除）',
+    name: '原則4 親が同じ主キーで書き直され、書き直しが勝てば、子は元の形で入る',
+    schema: FAMILY,
+    versions: [
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 1, 'a'),
+      del('tags', 'g1', T1, 2, 'a'),
+      // 書き直しは削除の版の時刻まで単調化され、L で勝つ
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 3, 'a', T1),
+      row(
+        'tag_notes',
+        'n5',
+        { id: 'n5', tagId: 'g1', body: 'b1', updatedAt: T0 },
+        1,
+        'b'
+      ),
+    ],
+    expect: [
+      'tags:g1 置く id=g1 name=t1 updatedAt=' + T0,
+      'tag_notes:n5 置く id=n5 tagId=g1 body=b1 updatedAt=' + T0,
+    ],
+  },
+  {
+    name: '原則4 書き直しが削除に負ければ、親は削除されたままで子は入らない',
+    schema: FAMILY,
+    versions: [
+      del('tags', 'g1', T2, 2, 'a'),
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'b'),
+      row(
+        'tag_notes',
+        'n5',
+        { id: 'n5', tagId: 'g1', body: 'b1', updatedAt: T1 },
+        2,
+        'b'
+      ),
+    ],
+    expect: ['tags:g1 死', 'tag_notes:n5 親削除←tags:g1'],
+  },
+  {
+    name: '原則4 ON DELETE SET NULL の子は、親が削除されている間は列を NULL にした形で入る',
+    schema: GUARDED,
+    versions: [
+      del('tags', 'g1', T0, 1, 'a'),
+      row(
+        'items',
+        'i4',
+        { id: 'i4', tagId: 'g1', label: 'x', updatedAt: T1 },
+        1,
+        'b'
+      ),
+    ],
+    expect: [
+      'tags:g1 死',
+      'items:i4 置く id=i4 tagId=null label=x updatedAt=' + T1,
+    ],
+  },
+  {
+    name: '原則4 親が削除されている子を親とする孫も入らない（連鎖。原因は大元の削除）',
     schema: CHAIN,
     versions: [
       del('tags', 'g1', T0, 1, 'a'),
@@ -538,7 +605,7 @@ const CASES: Case[] = [
         3,
         'b'
       ),
-      // 届いていないだけの親を指す孫は、従来どおり置かない行のまま
+      // 届いていないだけの親を指す孫は、置かない行
       row(
         'note_marks',
         'k2',
@@ -549,9 +616,36 @@ const CASES: Case[] = [
     ],
     expect: [
       'tags:g1 死',
-      'tag_notes:n6 捨てる←tags:g1',
-      'note_marks:k1 捨てる←tags:g1',
+      'tag_notes:n6 親削除←tags:g1',
+      'note_marks:k1 親削除←tags:g1',
       'note_marks:k2 置かない',
+    ],
+  },
+  {
+    name: '原則4 親が書き直されれば、連鎖で入らなかった孫も入る',
+    schema: CHAIN,
+    versions: [
+      del('tags', 'g1', T0, 1, 'a'),
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 2, 'a'),
+      row(
+        'tag_notes',
+        'n6',
+        { id: 'n6', tagId: 'g1', body: 'b1', updatedAt: T1 },
+        2,
+        'b'
+      ),
+      row(
+        'note_marks',
+        'k1',
+        { id: 'k1', noteId: 'n6', mark: 'x', updatedAt: T1 },
+        3,
+        'b'
+      ),
+    ],
+    expect: [
+      'tags:g1 置く id=g1 name=t1 updatedAt=' + T0,
+      'tag_notes:n6 置く id=n6 tagId=g1 body=b1 updatedAt=' + T1,
+      'note_marks:k1 置く id=k1 noteId=n6 mark=x updatedAt=' + T1,
     ],
   },
 ]
@@ -615,7 +709,7 @@ export function runRowsD1Tests(): string[] {
 }
 
 /**
- * 性質の検査（設計書 §8.3 の「性質（かぶらない・極大・外部キー・NOT NULL・CHECK）」）。
+ * 性質の検査（かぶらない・極大・外部キー・NOT NULL・CHECK）。
  *
  * 期待値の表とは別に、**どの入力でも成り立つべきこと**を、上の表の全事例について見る。
  * 見え方の JSON を本物の SQLite の表へ流し込み、宣言された制約を全部満たすかどうかで判定する

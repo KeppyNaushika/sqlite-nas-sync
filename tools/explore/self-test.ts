@@ -1,12 +1,11 @@
 /**
  * 削減手の前提を、**本物を動かして**確かめる（`--self-test N`）。
  *
- * 順序の畳み込みと対称性の畳み込みは、`src/` の振る舞いについての主張
- * （「別々の端末への操作は可換」「端末の名前を入れ替えても振る舞いは鏡写し」）の上に
+ * 順序の畳み込みは、`src/` の振る舞いについての主張（「別々の端末への操作は可換」）の上に
  * 立っている。主張の根拠はコードを読んだ結果（tools/explore/reduction.ts）なので、
- * **`src/` が変われば崩れうる**（例: 端末名の大小を比べる箇所が増える）。崩れたまま
- * 畳むと、検査器は黙って反例を見逃す。そこで検査の前に、範囲の中の列を N 本選んで
- * 主張どおりになっているかを実際に確かめる。
+ * **`src/` が変われば崩れうる**（例: 操作が相手の DB を読む箇所が増える、トリガーが
+ * 新しい場所へ壁時計を刻む）。崩れたまま畳むと、検査器は黙って反例を見逃す。
+ * そこで検査の前に、範囲の中の列を N 本選んで主張どおりになっているかを実際に確かめる。
  *
  * 確かめること:
  *
@@ -14,10 +13,10 @@
  *    同期の中の2つの刻みが同じミリ秒に収まるかの揺れはライブラリそのものの性質で、
  *    削減手の前提の崩れではない）
  * 2. **可換性** —— 状態 s で、端末の違う2つの操作 x, y を x→y と y→x の順に当てると、
- *    同じ状態になる（対称性を外した鍵で比べる）
- * 3. **対称性**（端末2台のとき）—— 列 P と、P の端末を入れ替えた列 σ(P) を再生すると、
- *    σ(P) の状態は P の状態の鏡写しになり（端末を入れ替えて直列化すると一致する）、
- *    同期が出す「失敗」の警告も鏡写しになる
+ *    同じ状態になる
+ *
+ * 端末の入れ替え（対称性）は確かめない。案A では健全でないので、畳み込みに使っていない
+ * （tools/explore/reduction.ts の「畳まないもの」）。
  *
  * 列の選び方には擬似乱数を使うが、**種は固定**（毎回同じ列を調べる）。これは範囲を
  * 網羅する検査ではなく、削減手の前提が崩れていないかの抜き取り検査である。
@@ -26,7 +25,7 @@
  */
 import * as fs from 'fs'
 import * as path from 'path'
-import { ExploreConfig, symmetryActive } from './config'
+import { ExploreConfig } from './config'
 import { Transition, describeTransition, enumerateTransitions } from './ops'
 import { failureWarning } from './probe'
 import {
@@ -59,11 +58,6 @@ function makeRandom(seed: number): (limit: number) => number {
   }
 }
 
-function mirror(transition: Transition): Transition {
-  if (transition.kind === 'tick') return transition
-  return { ...transition, client: 1 - transition.client }
-}
-
 export async function runSelfTest(
   config: ExploreConfig,
   samples: number,
@@ -86,7 +80,6 @@ export async function runSelfTest(
     .filter((entry) => entry.transition.kind === 'op')
   const others = transitions.filter((transition) => transition.kind !== 'op')
   const random = makeRandom(20260914)
-  const identity = Array.from({ length: config.clients }, (_, i) => i)
   const failures: string[] = []
 
   const describe = (path_: Transition[]): string =>
@@ -95,13 +88,10 @@ export async function runSelfTest(
       .join('\n')
 
   /**
-   * 列を再生し、`permutation` の並びで直列化した状態と、警告のうち判定に効くもの
+   * 列を再生し、正規化して直列化した状態と、警告のうち判定に効くもの
    * （失敗の有無）をまとめた署名を返す。
    */
-  const observe = async (
-    path_: Transition[],
-    permutation: number[]
-  ): Promise<string> => {
+  const observe = async (path_: Transition[]): Promise<string> => {
     const world = createWorld(template, work, config)
     const warnings: string[][] = []
     try {
@@ -112,7 +102,6 @@ export async function runSelfTest(
       const text = serializeState(
         raw,
         labeler.labels(collectTimes(raw)),
-        permutation,
         normalizeOptionsFrom(config)
       )
       const warningSignature = warnings.map(
@@ -137,22 +126,19 @@ export async function runSelfTest(
   const RETRIES = 4
   const canAgree = async (
     a: Transition[],
-    aPermutation: number[],
-    b: Transition[],
-    bPermutation: number[]
+    b: Transition[]
   ): Promise<boolean> => {
     const seenA = new Set<string>()
     const seenB = new Set<string>()
     for (let attempt = 0; attempt < RETRIES; attempt += 1) {
-      seenA.add(await observe(a, aPermutation))
-      seenB.add(await observe(b, bPermutation))
+      seenA.add(await observe(a))
+      seenB.add(await observe(b))
       if ([...seenA].some((signature) => seenB.has(signature))) return true
     }
     return false
   }
 
   let commuted = 0
-  let mirrored = 0
   let jitters = 0
   for (let sample = 0; sample < samples; sample += 1) {
     // 遷移を一様に引くと、ほとんどが操作になって同期を含む列を引かない（同期は端末数ぶん
@@ -166,8 +152,8 @@ export async function runSelfTest(
     )
 
     // 1. 再生の決定性。揺れは崩れではない（同期の中の刻み）ので数えて報告だけする
-    const first = await observe(prefix, identity)
-    const second = await observe(prefix, identity)
+    const first = await observe(prefix)
+    const second = await observe(prefix)
     if (first !== second) jitters += 1
 
     // 2. 可換性（端末の違う2つの操作）
@@ -181,32 +167,10 @@ export async function runSelfTest(
     if (candidates.length > 0) {
       const y = candidates[random(candidates.length)].transition
       commuted += 1
-      if (
-        !(await canAgree(
-          [...prefix, x, y],
-          identity,
-          [...prefix, y, x],
-          identity
-        ))
-      ) {
+      if (!(await canAgree([...prefix, x, y], [...prefix, y, x]))) {
         failures.push(
           `別々の端末への操作が可換でなかった（順序の畳み込みの前提が崩れている）:\n` +
             `${describe(prefix)}\n  のあとに\n    x. ${describeTransition(x)}\n    y. ${describeTransition(y)}`
-        )
-      }
-    }
-
-    // 3. 対称性（畳み込みが効いているときだけ）。P を恒等の並びで直列化したものと、σ(P) を
-    //    入れ替えた並びで直列化したものが一致すれば鏡写し。
-    //
-    //    **案A では対称性を外してある**（config.ts の symmetryActive）ので、ここは回らない。
-    //    回すと必ず崩れる —— 端末ごとに固定した `instanceId` が同着の最後の鍵なので、
-    //    「iid の小さい端末が書いた」状態と「大きい端末が書いた」状態は鏡写しにならない。
-    if (config.clients === 2 && symmetryActive(config)) {
-      mirrored += 1
-      if (!(await canAgree(prefix, identity, prefix.map(mirror), [1, 0]))) {
-        failures.push(
-          `端末を入れ替えた列が鏡写しにならなかった（対称性の前提が崩れている）:\n${describe(prefix)}`
         )
       }
     }
@@ -214,7 +178,7 @@ export async function runSelfTest(
 
   fs.rmSync(workDir, { recursive: true, force: true })
   log(
-    `自己検査: 列 ${String(samples)} 本（可換性 ${String(commuted)} / 対称性 ${String(mirrored)}。` +
+    `自己検査: 列 ${String(samples)} 本（可換性 ${String(commuted)}。` +
       `同じ列を2回再生して揺れた列 ${String(jitters)} 本 —— 同期の中の刻みの揺れで、崩れではない）`
   )
   if (failures.length === 0) {
