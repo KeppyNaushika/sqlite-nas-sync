@@ -1,6 +1,6 @@
 /**
  * 外部での複製・復元・書き換えの検出（`src/rows/restore-detect.ts`）。
- * 設計書 `docs/rows-table-design.md` §3.10 と、§11 の段階4。
+ * 設計書 `docs/rows-table-design.md` §3.10。
  *
  * ここで見るのは2つである。
  *
@@ -227,7 +227,7 @@ describe('写しの取り合い', () => {
     const report = checkCopyOwnership(mine, location())
     expect(report.taken).toBe(true)
     expect(report.copyInstanceId).toBe('iid-other')
-    expect(report.message).toContain('同期を止める')
+    expect(report.message).toContain('同期を止めた')
   })
 
   it('写しがまだ無ければ何も言わない（初回起動）', () => {

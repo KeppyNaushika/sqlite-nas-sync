@@ -1,11 +1,10 @@
 /**
  * 削除 vs 更新の決定論的LWW回帰テスト。
  *
- * 修正前のバグを固定する:
- *  1. 順序依存: pullNormal の changelog DELETE が無条件適用で、クライアント処理順により
- *     「削除 vs より新しい更新」の勝敗が変わっていた。
- *  2. 時刻の精度: `datetime('now')` の秒切り捨てで、同じ秒の中の削除と更新の
- *     前後が失われていた。
+ * 旧方式で見つかった2つのバグを固定する。
+ *
+ *  1. 順序依存。旧方式の `pullNormal` は changelog の DELETE を無条件に当てていたので、クライアントの処理順で「削除 vs より新しい更新」の勝敗が変わった。
+ *  2. 時刻の精度。`datetime('now')` の秒切り捨てで、同じ秒の中の削除と更新の前後が失われた。
  *
  * 書式の違う時刻どうしの比較（ISO-T vs スペース形式）は、案A では
  * `src/rows/versions.ts` の版の順序（群の判定）が受け持つ。そちらの性質は
@@ -19,7 +18,7 @@ import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
 import { setupRowsDb } from './helpers/sync-fixtures'
 
-describe('pullNormal consolidation: 削除 vs 更新がクライアント処理順に依存しない', () => {
+describe('削除 vs 更新の勝敗は、クライアントの同期の順に依存しない', () => {
   let work: string
   let syncDir: string
   beforeEach(() => {

@@ -1,6 +1,6 @@
 /**
  * 案A の取り込み（`src/rows/import.ts`）の試験。設計書
- * `docs/rows-table-design.md` §4.3 と、§11 の段階3 の完了条件。
+ * `docs/rows-table-design.md` §4.3。
  *
  * ここで見るのは4つ:
  *

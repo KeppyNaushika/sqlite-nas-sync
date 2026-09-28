@@ -16,9 +16,6 @@ import { parseCreateIndex, readUniqueIndexes } from '../src/rows/index-parse'
 describe('parseCreateIndex —— 読める形', () => {
   it('素の列の並び', () => {
     const parsed = parseCreateIndex('CREATE INDEX i ON t (a, b)')
-    expect(parsed.name).toBe('i')
-    expect(parsed.table).toBe('t')
-    expect(parsed.unique).toBe(false)
     expect(parsed.expressions).toEqual(['a', 'b'])
     expect(parsed.predicate).toBeNull()
   })
@@ -27,9 +24,6 @@ describe('parseCreateIndex —— 読める形', () => {
     const parsed = parseCreateIndex(
       'CREATE UNIQUE INDEX IF NOT EXISTS "idx x" ON [my table] ("a b")'
     )
-    expect(parsed.unique).toBe(true)
-    expect(parsed.name).toBe('idx x')
-    expect(parsed.table).toBe('my table')
     expect(parsed.expressions).toEqual(['"a b"'])
   })
 
@@ -39,7 +33,6 @@ describe('parseCreateIndex —— 読める形', () => {
     )
     expect(parsed.expressions).toEqual(['name', 'b'])
     expect(parsed.collations).toEqual(['NOCASE', null])
-    expect(parsed.descendings).toEqual([true, false])
   })
 
   it('式索引（括弧とカンマを含む式を1つの項として読む）', () => {

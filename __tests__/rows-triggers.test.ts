@@ -1,6 +1,6 @@
 /**
  * 案A の表とトリガー（`src/rows/schema.ts`・`src/rows/triggers.ts`）の試験。
- * 設計書 `docs/rows-table-design.md` §3.1〜§3.5 と、§11 の段階2 の完了条件。
+ * 設計書 `docs/rows-table-design.md` §3.1〜§3.5。
  *
  * ここで見るのは「アプリの接続でアプリの表に起きた変化が、原因によらず
  * すべて事実になること」（§2.2 の R0）と、その裏側の3つ:
@@ -702,7 +702,7 @@ describe('外部キーの動作', () => {
       db.prepare(`INSERT INTO p VALUES ('p1','2026-01-01')`).run()
       db.prepare(`INSERT INTO c VALUES ('c1','p1','2026-01-01')`).run()
       // ここが `INSERT OR IGNORE INTO _sns_dirty` だと SQLITE_CONSTRAINT_PRIMARYKEY で
-      // アプリの DELETE ごと失敗する（設計書 §3.4.0 の付録 A.14）
+      // アプリの DELETE ごと失敗する（設計書 §3.4）
       expect(() =>
         db.prepare(`DELETE FROM p WHERE id='p1'`).run()
       ).not.toThrow()
@@ -930,20 +930,187 @@ describe('取り込みの直後（_sns_rows_* に行が無い窓）', () => {
       db.close()
     }
   })
+})
 
-  it('時刻列が数値の表では、削除を実行した時刻を順序に使わない（群の取り違え）', () => {
+/* ================================================================== *
+ * 時刻列は ISO 8601 の文字列だけ（原則2 の前提）
+ * ================================================================== */
+
+describe('時刻列に ISO 8601 の文字列でない値は書けない', () => {
+  /** ISO 8601 の文字列でない値。数値・ISO でない文字列・NULL・BLOB。 */
+  const REJECTED: [string, unknown][] = [
+    ['整数', 1700000000000],
+    ['実数', 2460676.5],
+    ['ISO でない文字列', 'yesterday'],
+    ['字形だけ合う文字列', '2026-13-01'],
+    ['NULL', null],
+    ['BLOB', Buffer.from([1, 2, 3])],
+  ]
+  /** 通る値。`Z`・`+00:00`（Prisma の既定）・スペース区切り・日付だけ。 */
+  const ACCEPTED = [
+    '2026-01-01T00:00:00.000Z',
+    '2025-12-30T23:56:25.448+00:00',
+    '2026-01-01 00:00:01',
+    '2026-06-01',
+  ]
+  const MESSAGE =
+    /同期する表 notes の時刻列 updatedAt に ISO-8601 の文字列でない値は書けない。ISO-8601 の文字列（例: 2026-01-01T00:00:00\.000Z）で書くこと/
+
+  it.each(REJECTED)('INSERT で %s を書くと失敗する', (_label, value) => {
+    const db = open([NOTES], ['notes'])
+    try {
+      expect(() =>
+        db.prepare(`INSERT INTO notes VALUES ('n1','a','b',?)`).run(value)
+      ).toThrow(MESSAGE)
+      // AFTER トリガーの ABORT は、アプリの表への書き込みごと取り消す
+      expect(db.prepare(`SELECT count(*) AS n FROM notes`).get()).toEqual({
+        n: 0,
+      })
+      expect(rowsOf(db, 'notes')).toEqual([])
+      expect(lamportOf(db)).toBe(0)
+    } finally {
+      db.close()
+    }
+  })
+
+  it.each(REJECTED)(
+    'UPDATE で %s を書くと失敗する（主キーが同じ・違う）',
+    (_label, value) => {
+      const db = open([NOTES], ['notes'])
+      try {
+        db.prepare(
+          `INSERT INTO notes VALUES ('n1','a','b','2026-01-01T00:00:00.000Z')`
+        ).run()
+        const lamport = lamportOf(db)
+        expect(() =>
+          db
+            .prepare(`UPDATE notes SET title='A', updatedAt=? WHERE id='n1'`)
+            .run(value)
+        ).toThrow(MESSAGE)
+        expect(() =>
+          db
+            .prepare(`UPDATE notes SET id='n2', updatedAt=? WHERE id='n1'`)
+            .run(value)
+        ).toThrow(MESSAGE)
+        expect(
+          db.prepare(`SELECT id, title, updatedAt FROM notes`).all()
+        ).toEqual([
+          { id: 'n1', title: 'a', updatedAt: '2026-01-01T00:00:00.000Z' },
+        ])
+        expect(lamportOf(db)).toBe(lamport)
+        expect(tombstonesOf(db, 'notes')).toEqual([])
+      } finally {
+        db.close()
+      }
+    }
+  )
+
+  it.each(ACCEPTED)('%s は INSERT でも UPDATE でも通る', (value) => {
+    const db = open([NOTES], ['notes'])
+    try {
+      db.prepare(`INSERT INTO notes VALUES ('n1','a','b',?)`).run(value)
+      db.prepare(`UPDATE notes SET title='A', updatedAt=? WHERE id='n1'`).run(
+        value
+      )
+      db.prepare(`UPDATE notes SET id='n2', updatedAt=? WHERE id='n1'`).run(
+        value
+      )
+      expect(rowsOf(db, 'notes')).toMatchObject([{ id: 'n2', _sns_ts: value }])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('失敗した文より前に同じトランザクションで書いたものは残る（ABORT の意味）', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      db.exec('BEGIN')
+      db.prepare(
+        `INSERT INTO notes VALUES ('n1','a','b','2026-01-01T00:00:00.000Z')`
+      ).run()
+      expect(() =>
+        db
+          .prepare(`INSERT INTO notes VALUES ('n2','c','d',1700000000000)`)
+          .run()
+      ).toThrow(MESSAGE)
+      // トランザクションは開いたまま、続けて書ける
+      expect(db.inTransaction).toBe(true)
+      db.prepare(
+        `INSERT INTO notes VALUES ('n3','e','f','2026-01-02T00:00:00.000Z')`
+      ).run()
+      db.exec('COMMIT')
+      expect(db.prepare(`SELECT id FROM notes ORDER BY id`).all()).toEqual([
+        { id: 'n1' },
+        { id: 'n3' },
+      ])
+      expect(rowsOf(db, 'notes').map((row) => row.id)).toEqual(['n1', 'n3'])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('複数行の INSERT は文ごと取り消される', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO notes VALUES
+               ('n1','a','b','2026-01-01T00:00:00.000Z'),
+               ('n2','c','d',NULL)`
+          )
+          .run()
+      ).toThrow(MESSAGE)
+      expect(db.prepare(`SELECT count(*) AS n FROM notes`).get()).toEqual({
+        n: 0,
+      })
+      expect(rowsOf(db, 'notes')).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('時刻列の名前の大文字小文字が設定と違っても確かめる', () => {
     const db = open(
-      [
-        `CREATE TABLE n (id TEXT PRIMARY KEY NOT NULL, v TEXT, updatedAt INTEGER)`,
-      ],
-      ['n']
+      [`CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, v TEXT, UpdatedAt TEXT)`],
+      [{ name: 't', timestampColumn: 'updatedAt' }]
     )
     try {
-      db.prepare(`INSERT INTO n VALUES ('n1','a',1700000000000)`).run()
-      db.prepare(`DELETE FROM n WHERE id='n1'`).run()
-      // ISO の文字列（群3）を入れると、数値（群1）より常に強くなってしまう。
-      // 比べられないので、削除の版は行の版の時刻のまま
-      expect(tombstonesOf(db, 'n')[0]._sns_ts).toBe(1700000000000)
+      expect(() =>
+        db.prepare(`INSERT INTO t VALUES ('t1','a',1700000000000)`).run()
+      ).toThrow(
+        /同期する表 t の時刻列 UpdatedAt に ISO-8601 の文字列でない値は書けない/
+      )
+    } finally {
+      db.close()
+    }
+  })
+
+  it('時刻列が無い表では確かめない', () => {
+    const db = open(
+      [`CREATE TABLE plain (id TEXT PRIMARY KEY NOT NULL, v INTEGER)`],
+      ['plain']
+    )
+    try {
+      db.prepare(`INSERT INTO plain VALUES ('p1', 1)`).run()
+      db.prepare(`UPDATE plain SET v = 2 WHERE id = 'p1'`).run()
+      db.prepare(`DELETE FROM plain WHERE id = 'p1'`).run()
+      // 行の版の時刻がいつも NULL なので、削除の版も NULL（書き込み順だけで比べる）
+      expect(tombstonesOf(db, 'plain')[0]._sns_ts).toBeNull()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('削除の版は、行の版の時刻が古くても削除を実行した時刻を使う（原則2）', () => {
+    const db = open([NOTES], ['notes'])
+    try {
+      db.prepare(
+        `INSERT INTO notes VALUES ('n1','a','b','2000-01-01T00:00:00.000Z')`
+      ).run()
+      db.prepare(`DELETE FROM notes WHERE id='n1'`).run()
+      const grave = tombstonesOf(db, 'notes')[0]
+      expect(grave._sns_ts).toBe(grave.deletedAt)
     } finally {
       db.close()
     }
@@ -1051,7 +1218,7 @@ describe('checkRowsPreconditions —— 段階2 から見る前提', () => {
       db.exec(`CREATE TABLE t (id TEXT PRIMARY KEY, updatedAt TEXT)`)
       db.prepare(`INSERT INTO t VALUES (NULL,'2026-01-01')`).run()
       expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
-        /前提 P1/
+        /NULL を取れる|主キーが NULL の行がある/
       )
     } finally {
       db.close()
@@ -1065,7 +1232,7 @@ describe('checkRowsPreconditions —— 段階2 から見る前提', () => {
         `CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL, updatedAt TEXT, PRIMARY KEY (a, b))`
       )
       expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
-        /前提 P11/
+        /主キーが複合/
       )
     } finally {
       db.close()
@@ -1079,7 +1246,7 @@ describe('checkRowsPreconditions —— 段階2 から見る前提', () => {
         `CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, a INTEGER CHECK (a <> abs(random())))`
       )
       expect(() => checkRowsPreconditions(db, [{ name: 't' }])).toThrow(
-        /前提 P8/
+        /決定的でない関数 random\(\)/
       )
     } finally {
       db.close()
@@ -1093,7 +1260,7 @@ describe('checkRowsPreconditions —— 段階2 から見る前提', () => {
         `CREATE TABLE t (a TEXT NOT NULL, b TEXT NOT NULL, updatedAt TEXT, PRIMARY KEY (a, b))`
       )
       expect(() => createRowsTables(db, [{ name: 't' }], INSTANCE)).toThrow(
-        /前提 P11/
+        /主キーが複合/
       )
     } finally {
       db.close()
@@ -1102,7 +1269,7 @@ describe('checkRowsPreconditions —— 段階2 から見る前提', () => {
 })
 
 /* ================================================================== *
- * トリガーの負担（§11 の段階2）
+ * トリガーの負担（設計書 §7）
  * ================================================================== */
 
 describe('トリガーの負担', () => {

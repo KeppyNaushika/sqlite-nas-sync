@@ -15,7 +15,7 @@
  *
  * | 抑制 | 落としてよい条件 | なぜ何も変わらないか |
  * | --- | --- | --- |
- * | 相手を読まない | 相手のファイルの印（{@link fileStamp}）が前に読んだときと同じで、かつ手元の `lastSeenId` もあのときのまま | 前の回の取り込みの直後に、**同じ手元の位置でもう一度読んでも何も起きない**ことを実際に確かめて（{@link RemoteReadMemo.verified}）から覚えている。同じファイル・同じ位置なら答えも同じ |
+ * | 相手を読まない | 相手のファイルの印（{@link fileStamp}）が前に読んだときと同じで、かつ手元の `lastSeenId` もあのときのまま | 前の回に読んだとき、**同じファイルを同じ手元の位置でもう一度読んでも何も起きない**と確かめた相手だけを覚えている（{@link RemoteReadMemo.verified}）。確かめ方は2つで、差分もフルマージも残っていないこと（{@link readWouldBeNoOp}）か、その回の取り込みが何も動かさなかったことである。後者はフルマージで読んだ相手にも当てはまる。同じファイル・同じ位置なら答えも同じ |
  * | 自分を上げない | 手元の印（{@link localPushFingerprint}）が前に上げたときと同じ | 上げ直しても、写しの中身は generation が1つ進む以外に違いが無い。相手が読むのは事実であって generation ではない |
  * | 自分の写しを読まない（復元の判定） | NAS 上の自分の写しの印が、自分が最後に上げたときのままである | その写しは自分が書いたものだと分かっている。`lamport` は手元で単調なので、写しに残した値より小さくなりようが無い |
  * | 取り合いの確認で読まない | 上げた直後の自分の写しの印が、いま自分が書いた一時ファイルの印と同じ | `rename` は inode を持ち越す。印が同じならその実体は**自分が書いたもの**であり、`sns.instanceId` を読むまでもなく自分のものである |
@@ -36,8 +36,8 @@
  * 既定の30秒間隔で10分に1回にあたる。加えて、次の場合は条件抜きで読む・上げる:
  *
  * - **起動直後**（この覚えはプロセスの中にしか無いので、自動的にそうなる）
- * - 前回の読み・書きが失敗した相手（覚えを捨てるので次は読む）
- * - フルマージが要る相手（「もう一度読んでも何も起きない」が確かめられない）
+ * - 前回の読みが失敗した相手（覚えを捨てるので次は読む）
+ * - 前回読んだときに「もう一度読んでも何も起きない」と確かめられなかった相手（覚えないので次も読む）
  * - 版（`schemaVersion`）が変わったとき
  * - NAS 上の自分の写しが消えているとき
  * - 復元・巻き戻りを見つけたとき
@@ -57,6 +57,7 @@ import { readClockLamport } from '../rows/meta'
 /**
  * 印が同じでも必ず読み直す（上げ直す）間隔。
  *
+ * 試験から参照するために export している。
  * 30秒間隔なら10分に1回。**この回だけは印を信じない**ので、印の見逃し
  * （inode の使い回し・更新時刻の粗さ）が残っても、10分で自力で直る。
  */
@@ -86,12 +87,11 @@ export interface PushMemo {
   /**
    * 写しへ入る中身を決めた瞬間の `total_changes()`（この接続が変えた行の総数）。
    *
-   * **これが要る理由**: {@link localPushFingerprint} は「相手が読むもの」しか見ない
-   * ので、**作り直し**がアプリの表や `_sns_shown` / `_sns_hidden` / `_sns_dirty` を
-   * 入れ替えても動かない（作り直しの書き込みは版を作らないので lamport も
-   * `_sns_tick` も進まない）。それを見落とすと、NAS 上の写しだけが古いアプリの表を
-   * 抱えたまま残る。相手はその部分を読まないので実害は無いが、**手元と写しが
-   * 食い違った状態**が積み上がるのは望ましくない（網羅検査の状態も割れる）。
+   * **これが要る理由**: {@link localPushFingerprint} は lamport・`_sns_tick`・`_changelog` などしか見ない。
+   * **作り直し**の書き込みは版を作らないので lamport も `_sns_tick` も進めない。
+   * それでも作り直しはアプリの表や `_sns_shown` / `_sns_hidden` / `_sns_dirty` を入れ替え、親の削除にあわせて `_sns_rows_<表>` から子のバージョンを消す（原則4）。
+   * 最後のものは相手が読む部分なので、上げ直さないと、相手が読む写しと手元とで中身が食い違ったままになる。
+   * この値との突き合わせで、こうした書き込みを拾って上げ直す。
    *
    * 同期の終わりにこの値と突き合わせ、動いていたら覚えを捨てて次の回に上げ直す。
    * 測るのは `backup()` を呼ぶ**直前**である —— 写している最中の書き込みは
@@ -142,17 +142,18 @@ export function createIdleMemory(enabled = true): IdleMemory {
  * 必ず `true` になる。
  */
 function forcedRound(memory: IdleMemory): boolean {
-  return memory.syncCount % FORCE_EVERY === 1 || FORCE_EVERY <= 1
+  return memory.syncCount % FORCE_EVERY === 1
 }
 
 /**
  * 手元の印。**これが前に上げたときと同じなら、上げ直しても写しの中身は変わらない。**
  *
- * 見るのは、案A の仕組みから確実に分かるものだけである:
+ * 見るのは、次の値である。
+ * 作り直しの書き込みはここに現れないので、{@link PushMemo.changesAtCopy} で別に拾う。
  *
  * | 値 | これが拾うもの |
  * | --- | --- |
- * | `_sns_clock.lamport` | アプリの書き込み・取り込み・作り直しが作った**すべての版**。案A では版が1つでも増えれば lamport が進む（§3.2） |
+ * | `_sns_clock.lamport` | アプリの書き込みと取り込みが作った版。版が1つでも増えれば lamport が進む |
  * | `_sns_tick` の合計 | 表ごとの書き込みの数え上げ。lamport と重なるが、片方だけが進む壊れ方を早く見つけるために足しておく |
  * | `_changelog` の最大 id | lamport を進めない通知。相手はこの id で差分の範囲を決めるので、増えたら知らせなければならない |
  * | `_changelog_prune.prunedThroughId` | 掃除した位置。相手の隙間の判定がこれを読む |
@@ -212,7 +213,7 @@ function readTickSummary(db: Database.Database): string {
  * **読んだその場で、開いている相手の写しに対して確かめる。** 落とす根拠は
  * 推測ではなくこの1行である。
  *
- * - フルマージが要る（隙間がある・まだ一度も読んでいない）なら、読めば起きる
+ * - フルマージが要る（隙間がある）なら、読めば起きる
  * - 差分が1件でも残っていれば、読めば起きる
  *
  * どちらでもなければ、`performSync` の取り込みは `entries.length === 0` の枝で
@@ -250,43 +251,36 @@ export function forgetPushIfChanged(
   if (totalChanges(db) !== memory.push.changesAtCopy) memory.push = null
 }
 
-/** {@link canSkipRemoteRead} が返す答え（落とす／読む理由つき）。 */
-interface SkipDecision {
-  skip: boolean
-  /** 読むことにした理由（`skip` が `true` のときは空） */
-  reason?: string
-}
-
 /**
  * この相手を、この回は読まずに済ませてよいか。
  *
  * @param stamp - いまの相手のファイルの印。`null`（素性が分からない）なら読む
- * @param lastSeenId - いまの手元の読み位置
+ * @param lastSeenId - いまの手元の読み位置。まだ一度も読んでいない相手は `null`
  */
 export function canSkipRemoteRead(
   memory: IdleMemory,
   clientId: string,
   stamp: FileStamp | null,
-  lastSeenId: number
-): SkipDecision {
-  if (!memory.enabled) return { skip: false, reason: '抑制が切ってある' }
+  lastSeenId: number | null
+): boolean {
+  if (!memory.enabled) return false // 抑制が切ってある
   if (forcedRound(memory)) {
-    return { skip: false, reason: `${String(FORCE_EVERY)} 回に1度は必ず読む` }
+    return false // FORCE_EVERY 回に1度は必ず読む
   }
   if (stamp === null) {
-    return { skip: false, reason: 'ファイルの素性が読めない' }
+    return false // ファイルの素性が読めない
   }
   const memo = memory.peers.get(clientId)
   if (memo === undefined) {
-    return { skip: false, reason: 'この相手をまだ読んでいない' }
+    return false // この相手をまだ読んでいない
   }
   if (memo.stamp !== stamp) {
-    return { skip: false, reason: '相手のファイルが変わっている' }
+    return false // 相手のファイルが変わっている
   }
   if (memo.lastSeenId !== lastSeenId) {
-    return { skip: false, reason: '手元の読み位置が動いている' }
+    return false // 手元の読み位置が動いている
   }
-  return { skip: true }
+  return true
 }
 
 /** {@link canSkipPush} に渡す、抑制を外す事情。 */
@@ -309,33 +303,27 @@ interface PushContext {
 }
 
 /** この回は、上げずに済ませてよいか。 */
-export function canSkipPush(
-  memory: IdleMemory,
-  context: PushContext
-): SkipDecision {
-  if (!memory.enabled) return { skip: false, reason: '抑制が切ってある' }
+export function canSkipPush(memory: IdleMemory, context: PushContext): boolean {
+  if (!memory.enabled) return false // 抑制が切ってある
   if (forcedRound(memory)) {
-    return { skip: false, reason: `${String(FORCE_EVERY)} 回に1度は必ず上げる` }
+    return false // FORCE_EVERY 回に1度は必ず上げる
   }
   if (memory.push === null) {
-    return {
-      skip: false,
-      reason: 'まだ一度も上げていない（起動直後・前回失敗）',
-    }
+    return false // まだ一度も上げていない（起動直後・前回失敗）
   }
   if (!context.selfCopyExists) {
-    return { skip: false, reason: 'NAS 上の自分の写しが無い' }
+    return false // NAS 上の自分の写しが無い
   }
   if (context.restored) {
-    return { skip: false, reason: '復元・巻き戻りを見つけた' }
+    return false // 復元・巻き戻りを見つけた
   }
   if (context.selfStampChanged) {
-    return { skip: false, reason: '自分の写しを自分以外が書いている' }
+    return false // 自分の写しを自分以外が書いている
   }
   if (memory.push.fingerprint !== context.fingerprint) {
-    return { skip: false, reason: '前に上げてから手元が変わっている' }
+    return false // 前に上げてから手元が変わっている
   }
-  return { skip: true }
+  return true
 }
 
 /**
@@ -349,19 +337,19 @@ export function canSkipPush(
 export function canSkipRestoreCheck(
   memory: IdleMemory,
   currentSelfStamp: FileStamp | null
-): SkipDecision {
-  if (!memory.enabled) return { skip: false, reason: '抑制が切ってある' }
+): boolean {
+  if (!memory.enabled) return false // 抑制が切ってある
   if (forcedRound(memory)) {
-    return { skip: false, reason: `${String(FORCE_EVERY)} 回に1度は必ず読む` }
+    return false // FORCE_EVERY 回に1度は必ず読む
   }
   if (memory.push === null || memory.push.selfStamp === null) {
-    return { skip: false, reason: 'この起動でまだ上げていない' }
+    return false // この起動でまだ上げていない
   }
   if (currentSelfStamp === null) {
-    return { skip: false, reason: '自分の写しの素性が読めない' }
+    return false // 自分の写しの素性が読めない
   }
   if (memory.push.selfStamp !== currentSelfStamp) {
-    return { skip: false, reason: '自分の写しが自分の知らない間に変わっている' }
+    return false // 自分の写しが自分の知らない間に変わっている
   }
-  return { skip: true }
+  return true
 }

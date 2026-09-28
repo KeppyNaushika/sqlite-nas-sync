@@ -3,8 +3,8 @@
  *
  * 1. **取り込みが失敗として飲み込まれないこと** —— `result.warnings` に
  *    `Sync failed for client …` が1件でも出たら違反（その相手からの同期が永久に止まる。
- *    唯一許されない壊れ方）。フルマージ経路の同じ壊れ方 `Full merge failed for client …`、
- *    相手のDBを開けなかった `Failed to open remote database` も同じ扱いにする。
+ *    唯一許されない壊れ方）。相手のDBを開けなかった `Failed to open remote database`、
+ *    作り直しの失敗・先送り（`Rebuild failed` / `Rebuild deferred`）も同じ扱いにする。
  *    `performSync` が例外を投げた場合も違反。
  * 2. **収束すること** —— その状態から全端末を round-robin で同期し、状態が動かなく
  *    なったとき全端末の中身が一致すること。一致しない行が1つでも残れば違反
@@ -21,12 +21,12 @@
  * ## 開始端末
  *
  * **全ての開始端末から**回す。1つに固定すると「端末 b から始めたときだけ収束しない」を
- * 見逃すうえ、端末の入れ替えの対称性で状態を畳めなくなる（reduction.ts）。
+ * 見逃す。
  *
  * ## 使い回し
  *
  * round-robin の途中の状態は、他の状態の検査の途中にもよく現れる（同期で行き着く先は
- * 限られる）。そこで (正準な状態, 正準な並びでの次の端末) → 結果 を覚えておき、
+ * 限られる）。そこで (正規化した状態, 次の端末) → 結果 を覚えておき、
  * 列が覚えた組に当たったらそこで打ち切る。結果は「不動点まで何回か」と
  * 「その不動点が違反か」なので、途中から合流しても答えは同じ。
  *
@@ -60,7 +60,6 @@ export function failureWarning(warnings: string[]): string | null {
     warnings.find(
       (warning) =>
         warning.startsWith('Sync failed for client ') ||
-        warning.startsWith('Full merge failed for client ') ||
         warning.startsWith('Failed to open remote database') ||
         warning.startsWith('Rebuild failed') ||
         warning.startsWith('Rebuild deferred')
@@ -105,9 +104,9 @@ export type ProbeStats = {
 export class Prober {
   private readonly memo = new Map<string, MemoEntry>()
   /**
-   * 判定5・6（設計書 §8.1）の帳簿。**実行のあいだ通して**持つ（版の鍵は端末をまたいで
-   * 突き合わせるものなので、状態ごとに作り直しては意味が無い）。案A の `_sns_rows_*` が
-   * 無いあいだは何も集まらないので、何も言わない
+   * 判定5・6（設計書 §8.1）の帳簿。**1回の検査のあいだ通して**持つ（版の鍵は端末をまたいで
+   * 突き合わせるものなので、状態ごとに作り直しては意味が無い）。検査を始めるたびに
+   * {@link JudgmentLedger.beginRun} で空にする
    */
   private readonly ledger = new JudgmentLedger()
   /** 前回 {@link drainFresh} してから自分で覚えた分（他のワーカーへ配る） */
@@ -119,8 +118,7 @@ export class Prober {
   constructor(
     private readonly lib: Library,
     private readonly config: ExploreConfig,
-    private readonly labeler: TimeLabeler,
-    private readonly permutations: number[][]
+    private readonly labeler: TimeLabeler
   ) {
     this.normalize = normalizeOptionsFrom(config)
   }
@@ -129,21 +127,13 @@ export class Prober {
     return canonicalize(
       readWorld(world, this.config),
       this.labeler,
-      this.permutations,
       this.normalize
     )
   }
 
-  /**
-   * 正準な並びでの (状態, 次の端末) の鍵。自己対称な状態では候補の中で最小の端末番号を採る
-   * （どれも同じ軌道なので、どれを採っても答えは同じ）。
-   */
+  /** (状態, 次の端末) の鍵。 */
   private memoKey(state: CanonicalState, client: number): string {
-    let best = Number.POSITIVE_INFINITY
-    for (const permutation of state.permutations) {
-      best = Math.min(best, permutation[client])
-    }
-    return `${state.key}#${String(best)}`
+    return `${state.key}#${String(client)}`
   }
 
   /** 覚えてある結果だけで答えられるか（開始端末ごと）。 */
@@ -296,8 +286,8 @@ export class Prober {
   /**
    * 同期のたびに当てる判定（設計書 §8.1）。
    *
-   * - **判定7**: アプリの表が UNIQUE・外部キー・NOT NULL・CHECK を満たす（いまの `src/` でも効く）
-   * - **判定5・6**: 版を集めて突き合わせる（案A の `_sns_rows_*` が無いうちは何も集まらない）
+   * - **判定7**: アプリの表が UNIQUE・外部キー・NOT NULL・CHECK を満たす
+   * - **判定5・6**: `_sns_rows_<表>` と `_tombstone` から版を集めて突き合わせる
    *
    * @returns 違反の説明（`null` なら違反なし）
    */
@@ -307,7 +297,8 @@ export class Prober {
       const broken = checkAppTables(client.db, tables)
       if (broken !== null) return `${client.id}: ${broken}`
       const violations = this.ledger.observe(
-        collectVersions(client.db, client.id, tables)
+        collectVersions(client.db, client.id, tables),
+        client.id
       )
       if (violations.length > 0) return `${client.id}: ${violations[0]}`
     }
@@ -342,7 +333,7 @@ export class Prober {
   }
 
   /**
-   * 他のワーカーが覚えた分を取り込む。鍵は正準な並びなので、どのワーカーの世界でも同じ意味。
+   * 他のワーカーが覚えた分を取り込む。鍵は正規化した状態なので、どのワーカーの世界でも同じ意味。
    * 取り込んだ分は配り直さない（配り直すと往復が際限なく続く）。
    */
   importMemo(entries: [string, ProbeVerdict][]): void {

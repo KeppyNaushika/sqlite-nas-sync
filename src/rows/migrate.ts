@@ -13,12 +13,15 @@
  * | `_tombstone` / `_changelog` | **作り直す** | 列が違うので `CREATE TABLE IF NOT EXISTS` では追いつかない。旧 `deletedAt` の NOT NULL で最初の DELETE が落ちる |
  * | 旧「畳み」の事実 | **捨てる**（`_id_merge` は落とし、`mergedInto` / `revokedAt` は写さない） | 案A では重複は両方そのまま残るので、畳みの帳簿が要らない |
  * | `_sns_rows_<t>` へ写す版 | `_sns_ts` ＝ 時刻列の値、`_sns_lamport = 0`、`_sns_instance` ＝ 自分 | NULL にすると2端末の勝敗が**起動ごとに変わる乱数**で決まる |
- * | 残す `_tombstone` の版 | `_sns_ts` は NULL（群0＝最小） | 移行時の削除に大きな時刻を与えない |
+ * | 残す `_tombstone` の版 | `_sns_ts` ＝ 旧 `deletedAt`（ISO 8601 の文字列のときだけ。それ以外と、時刻列の無い表では NULL） | 削除はその削除を実行した時刻で比べる（原則2）。旧 `deletedAt` がその時刻である |
  * | アプリの表に居る id の墓標 | **消す** | 残すと版の鍵が完全に一致し、種類の規則で削除が勝って、最初の作り直しでその行が消える |
  * | `_changelog` | **刈らない** | 旧版の端末が残っている間に刈ると、その端末へ渡すべき事実が消える |
  * | 旧方式の `_heartbeat` | **表とトリガーを落とす**（トリガーが先） | `_changelog` が空でも `_changelog_prune.prunedThroughId` で隙間は判る。残すと無変更の日にも転送が起き続ける |
+ * | 旧方式の `_id_merge` | **落とす**（案A の形の DB でも毎回） | 旧「畳み」の帳簿で、案A では誰も読まない |
  * | 誰も読まない内部の列（{@link UNUSED_COLUMNS}） | **あれば落とす**（`_heartbeat` のトリガーを落としたあと） | `CREATE TABLE IF NOT EXISTS` では既存の DB から消えない。使わない列を利用者の DB に残さない |
- * | `_sns_rebuilding` の残り | 知らせて、トリガーを作る前に消す | 残っているとアプリの書き込みが1つも事実にならない |
+ *
+ * `_sns_rebuilding` の残りは、呼び出し側が `clearRebuildingFlag`（`src/rows/restore-detect.ts`）で先に消す（`setupSync` と同期の段階0）。
+ * 残ったままトリガーを作ると、番人が効いてアプリの書き込みが版にならない。
  *
  * @module rows/migrate
  * @internal
@@ -35,6 +38,7 @@ import {
   writeSnsMeta,
 } from './meta'
 import {
+  DEFAULT_TIMESTAMP_COLUMN,
   RowsColumn,
   RowsTableSpec,
   VERSION_COLUMNS,
@@ -45,11 +49,16 @@ import {
   syncedColumns,
 } from './schema'
 import { canonicalTableSpecs } from './table-name'
-import { createRowsTriggers, dropRowsTriggers, maxTsSql } from './triggers'
+import {
+  createRowsTriggers,
+  dropRowsTriggers,
+  isIsoTimeSql,
+  maxTsSql,
+} from './triggers'
 
 /** {@link migrateToRows} の設定。 */
 interface RowsMigrationOptions {
-  /** 同期する表（綴りは入り口で `sqlite_master` へ畳む。§1.11・段階3 の申し送り） */
+  /** 同期する表（綴りは入り口で `sqlite_master` へ畳む。§1.11） */
   tables: (RowsTableSpec | string)[]
   /**
    * この端末の id。省略すると {@link newInstanceId} で作る
@@ -79,20 +88,22 @@ interface RowsMigrationTableReport {
   rewritten: boolean
 }
 
+/**
+ * 移行の前の DB の形。
+ *
+ * - `legacy`: 以前のバージョンのライブラリの形（`_changelog` か `_tombstone` があり、案A の表が無い）
+ * - `fresh`: 同期の表が何も無い新しい DB
+ * - `refresh`: 既に案A の形だった（`sns-format` の印が消えていた DB を含む）
+ */
+type RowsMigrationSource = 'legacy' | 'fresh' | 'refresh'
+
 /** {@link migrateToRows} の結果。 */
 interface RowsMigrationResult {
-  /** `legacy` なら旧方式から移した。`refresh` なら既に案A だった（列の増減だけ見た） */
-  from: 'legacy' | 'refresh'
+  from: RowsMigrationSource
   /** この移行で使った端末の id */
   instanceId: string
   /** 表ごとの内訳 */
   tables: RowsMigrationTableReport[]
-  /** 残した墓標の数 */
-  keptTombstones: number
-  /** 写した `_changelog` の行数（刈っていないので旧方式の全件） */
-  changelogEntries: number
-  /** `_sns_rebuilding` の残りを消したか（§3.10 の I） */
-  clearedRebuilding: boolean
   /** 利用者へ知らせること */
   warnings: string[]
 }
@@ -125,12 +136,9 @@ export function migrateToRows(
   const specs = canonicalTableSpecs(db, options.tables)
 
   const result: RowsMigrationResult = {
-    from: fromLegacy ? 'legacy' : 'refresh',
+    from: migrationSource(db, fromLegacy),
     instanceId,
     tables: [],
-    keptTombstones: 0,
-    changelogEntries: 0,
-    clearedRebuilding: false,
     warnings: [],
   }
 
@@ -140,41 +148,23 @@ export function migrateToRows(
   db.pragma('recursive_triggers = ON')
 
   const run = db.transaction(() => {
-    // 1. 旗の残り（§3.10 の I）。**トリガーを作る前に**消す
-    result.clearedRebuilding = clearRebuildingRows(db)
-    if (result.clearedRebuilding) {
-      result.warnings.push(
-        `_sns_rebuilding に行が残っていたので消した。` +
-          `前回の作り直しが途中で落ちた可能性がある（残っている間、アプリの書き込みは1つも事実にならない）`
-      )
-    }
-
-    // 2. 旧方式のトリガーを落とす。残すと、旧 DELETE トリガーの
+    // 1. 旧方式のトリガーを落とす。残すと、旧 DELETE トリガーの
     //    `INSERT OR REPLACE INTO _tombstone` が版の3列を NULL で塗り潰す
     if (fromLegacy) {
       dropLegacyTriggers(db, specs)
     }
 
-    // 3. `_tombstone` と `_changelog` を作り直す（§3.9 の F）
+    // 2. `_tombstone` と `_changelog` を作り直す（§3.9 の F）
     if (fromLegacy) {
-      const counts = rebuildLedgers(db, specs, instanceId)
-      result.keptTombstones = counts.keptTombstones
-      result.changelogEntries = counts.changelogEntries
-      for (const [table, dropped] of counts.droppedByTable) {
-        droppedOf(result, table).droppedTombstones = dropped
+      const dropped = rebuildLedgers(db, specs, instanceId)
+      for (const [table, count] of dropped) {
+        droppedOf(result, table).droppedTombstones = count
       }
-      // 旧「畳み」の帳簿は捨てる（§3.9 の2）。案A では重複はそのまま両方残る
-      db.exec(`DROP TABLE IF EXISTS _id_merge`)
-    } else {
-      result.keptTombstones = countOf(
-        db,
-        `SELECT COUNT(*) AS n FROM _tombstone`
-      )
-      result.changelogEntries = countOf(
-        db,
-        `SELECT COUNT(*) AS n FROM _changelog`
-      )
     }
+
+    // 3. 旧「畳み」の帳簿を捨てる（§3.9 の2）。案A では重複はそのまま両方残る。
+    //    案A の形の DB でも毎回落とすので、以後 `_id_merge` がアプリの表として拾われることは無い
+    db.exec(`DROP TABLE IF EXISTS _id_merge`)
 
     // 3.5. 旧方式の `_heartbeat` を撤去する。`_changelog` が空でも
     //      `_changelog_prune.prunedThroughId` で隙間は正しく判定できるので、
@@ -276,13 +266,24 @@ function writeRowsSchemaVersion(
 }
 
 /* ------------------------------------------------------------------ *
- * 旗・旧トリガー
+ * 移行の前の形・旧トリガー
  * ------------------------------------------------------------------ */
 
-/** `_sns_rebuilding` に行が残っていれば消す。消したら `true`（§3.10 の I）。 */
-function clearRebuildingRows(db: Database.Database): boolean {
-  if (!tableExists(db, '_sns_rebuilding')) return false
-  return db.prepare(`DELETE FROM _sns_rebuilding`).run().changes > 0
+/**
+ * 移行の前の DB の形（{@link RowsMigrationSource}）。**トランザクションより前**に呼ぶ。
+ *
+ * 利用者への知らせの文面を分けるためだけに使い、移行の中身は変えない。
+ * `sns-format` の印が無ければ、どの形でも `_tombstone` と `_changelog` を作り直す。
+ */
+function migrationSource(
+  db: Database.Database,
+  fromLegacy: boolean
+): RowsMigrationSource {
+  if (!fromLegacy || tableExists(db, '_sns_clock')) return 'refresh'
+  if (tableExists(db, '_changelog') || tableExists(db, '_tombstone')) {
+    return 'legacy'
+  }
+  return 'fresh'
 }
 
 /**
@@ -333,9 +334,10 @@ function dropHeartbeat(db: Database.Database): void {
  * | --- | --- |
  * | `_tombstone.mergedInto` | 旧方式の「畳み」の先。案A のトリガーは書かず、移行も写さないので値が入らない |
  * | `_tombstone.revokedAt` | 旧方式の「畳み」の取り消し。同上 |
- * | `_sns_unplaceable.reasonKind` | 読むのは `tableName`・`trueId`・`reason` だけ |
+ * | `_sns_unplaceable.reasonKind` | 読むのは `tableName`・`trueId`・`reason`・`causeTable`・`causeId` だけ |
  * | `_sns_unplaceable.noticedAt` | 「同じ警告を繰り返さない」は行の有無で決まり、時刻を使わない |
  * | `_changelog_prune.prunedAt` | 隙間の判定（`hasChangelogGap`）は `prunedThroughId` しか見ない |
+ * | `_sync_state.lastSyncedAt` | 相手ごとの読み位置は `lastSeenId` だけで決まり、時刻を使わない |
  *
  * どの列も、ライブラリのトリガー・索引・ビューから参照されていない（参照があると
  * `DROP COLUMN` が落ちる）。
@@ -370,23 +372,19 @@ function dropUnusedColumns(db: Database.Database): void {
  * `_tombstone` と `_changelog` の作り直し（§3.9 の F）
  * ------------------------------------------------------------------ */
 
-interface LedgerCounts {
-  keptTombstones: number
-  changelogEntries: number
-  droppedByTable: Map<string, number>
-}
-
 /**
  * `_tombstone` と `_changelog` を、案A の形で作り直す。
  *
  * `_changelog` は **id をそのまま写す**。振り直すと、相手の `_sync_state` が
  * 指している位置と食い違い、旧版の端末が隙間ありに落ちる（§3.9 の G）。
+ *
+ * @returns 表 → アプリの表に同じ id があるので写さなかった墓標の数
  */
 function rebuildLedgers(
   db: Database.Database,
   tables: RowsTableSpec[],
   instanceId: string
-): LedgerCounts {
+): Map<string, number> {
   // **`legacy_alter_table` を立てる。** 素の `ALTER TABLE … RENAME TO` は、
   // その DB の**すべてのトリガーを読み直して**参照を書き換える。旧方式の DB に
   // 残っている `_heartbeat` のトリガーは `_changelog` を指しているので、作り直しの途中
@@ -406,12 +404,8 @@ function rebuildLedgersInner(
   db: Database.Database,
   tables: RowsTableSpec[],
   instanceId: string
-): LedgerCounts {
-  const counts: LedgerCounts = {
-    keptTombstones: 0,
-    changelogEntries: 0,
-    droppedByTable: new Map(),
-  }
+): Map<string, number> {
+  const droppedByTable = new Map<string, number>()
 
   /* ---- `_tombstone` ---- */
   // 版の3列は `ensureTombstoneVersionColumns` と同じ形。`_sns_ts` は**型名なし**
@@ -429,9 +423,13 @@ function rebuildLedgersInner(
   `)
   const hadTombstone = tableExists(db, '_tombstone')
   if (hadTombstone) {
-    const version = `NULL, 0, ${quoteLiteral(instanceId)}`
     for (const table of tables) {
       const pk = primaryKeyColumn(db, table.name)
+      // 時刻列のある表では、削除の版の時刻は削除を実行した時刻（原則2）。
+      // 無い表ではトリガーと同じく NULL（`src/rows/triggers.ts` の `deletedAtSql`）
+      const ts =
+        timestampSql(db, table) === 'NULL' ? 'NULL' : legacyDeletedAtTsSql()
+      const version = `${ts}, 0, ${quoteLiteral(instanceId)}`
       // 綴りは畳んだものへ揃え、`recordId` は正規形（`CAST(… AS TEXT)`）で比べる。
       // アプリの表に同じ id がある墓標は写さない（§3.9 の3）
       const before = countOf(
@@ -458,7 +456,7 @@ function rebuildLedgersInner(
         `SELECT COUNT(*) AS n FROM "_sns_tombstone_new" WHERE "tableName" = ?`,
         table.name
       )
-      counts.droppedByTable.set(table.name, before - kept)
+      droppedByTable.set(table.name, before - kept)
     }
     // 同期しない表の墓標は、そのまま写す（綴りを畳む相手が無い）
     const known = tables.map((table) => foldIdentifier(table.name))
@@ -470,7 +468,7 @@ function rebuildLedgersInner(
           ${escapeIdentifier(VERSION_COLUMNS.lamport)},
           ${escapeIdentifier(VERSION_COLUMNS.instance)})
        SELECT "tableName", CAST("recordId" AS TEXT), "deletedAt",
-              NULL, 0, ?
+              ${legacyDeletedAtTsSql()}, 0, ?
          FROM "_tombstone"
         ${known.length === 0 ? '' : `WHERE lower("tableName") NOT IN (${placeholders})`}
        ON CONFLICT ("tableName", "recordId") DO NOTHING`
@@ -478,7 +476,6 @@ function rebuildLedgersInner(
     db.exec(`DROP TABLE "_tombstone"`)
   }
   db.exec(`ALTER TABLE "_sns_tombstone_new" RENAME TO "_tombstone"`)
-  counts.keptTombstones = countOf(db, `SELECT COUNT(*) AS n FROM "_tombstone"`)
 
   /* ---- `_changelog` ---- */
   db.exec(`
@@ -503,27 +500,39 @@ function rebuildLedgersInner(
   }
   db.exec(`ALTER TABLE "_sns_changelog_new" RENAME TO "_changelog"`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_changelog_id ON _changelog(id)`)
-  counts.changelogEntries = countOf(
-    db,
-    `SELECT COUNT(*) AS n FROM "_changelog"`
-  )
-  return counts
+  return droppedByTable
 }
 
 /* ------------------------------------------------------------------ *
  * `_sns_rows_<t>` の中身
  * ------------------------------------------------------------------ */
 
-/** `TRUE_ID`（§3.3）。移行の時点では `_sns_shown` は空なので主キーそのもの。 */
+/**
+ * `TRUE_ID`（§3.3）。
+ *
+ * 旧方式から移すときは `_sns_shown` が空なので主キーそのものになる。
+ * 案A の DB で列の増減に追従するとき（{@link rewriteRowsWithNewVersions}）は、1:1 の表の表示している id を真の id へ戻す。
+ */
 function trueIdSql(spec: RowsTableSpec, pk: RowsColumn): string {
   const key = `${escapeIdentifier(spec.name)}.${escapeIdentifier(pk.name)}`
   return `COALESCE((SELECT "trueId" FROM "_sns_shown"
        WHERE "tableName" = ${quoteLiteral(spec.name)} AND "shownId" = CAST(${key} AS TEXT)), ${key})`
 }
 
+/**
+ * 旧 `_tombstone` の墓標に与える `_sns_ts`。
+ *
+ * 旧 `deletedAt` はその削除を実行した時刻なので、原則2 のとおりそれで比べる。
+ * ISO 8601 の文字列（群3）でなければ時刻として比べられないので NULL（群0＝最小）
+ * にする。判定はトリガーと同じ式（{@link isIsoTimeSql}）を使う。
+ */
+function legacyDeletedAtTsSql(): string {
+  return `(CASE WHEN ${isIsoTimeSql('"deletedAt"')} THEN "deletedAt" END)`
+}
+
 /** 時刻列の式（その表に無ければ `NULL`）。 */
 function timestampSql(db: Database.Database, spec: RowsTableSpec): string {
-  const wanted = spec.timestampColumn ?? 'updatedAt'
+  const wanted = spec.timestampColumn ?? DEFAULT_TIMESTAMP_COLUMN
   const all = db.pragma(
     `table_xinfo(${escapeIdentifier(spec.name)})`
   ) as RowsColumn[]
@@ -672,13 +681,14 @@ function reconcileColumns(
 
   if (heldPk === undefined) {
     throw new Error(
-      `${rows} に主キーの列が無い。作り直せないので移行を中止する`
+      `${rows} に主キーの列が無い。同期のバージョンを行と対応づけられないので、取り付けを中止する`
     )
   }
   if (foldIdentifier(heldPk.name) !== foldIdentifier(appPk.name)) {
     throw new Error(
       `同期する表 ${spec.name} の主キーの列名が ${heldPk.name} から ${appPk.name} へ変わっている。` +
-        ` ${rows} の主キーの列は落とせず、行の同定もできないので移行を中止する（§3.9）`
+        ` 主キーの列名が変わると同期のバージョンを行と対応づけられないので、取り付けを中止する。` +
+        `主キーの列名を元に戻すこと`
     )
   }
 
@@ -723,12 +733,14 @@ function reconcileColumns(
     } else if (column.notnull === 1 && orphans) {
       throw new Error(
         `同期する表 ${spec.name} に増えた列 ${column.name} が NOT NULL で、既定値が定数でない。` +
-          ` ${rows} にはアプリの表から埋め直せない行があるので移行を中止する（§3.9 の E）`
+          ` ユーザーテーブルに入っていないバージョンの行（UNIQUE の統合で隠れた行など）はこの列を埋められないので、取り付けを中止する。` +
+          `この列に定数の既定値を付けること`
       )
     } else if (column.notnull === 1) {
       result.warnings.push(
         `同期する表 ${spec.name} に増えた列 ${column.name} は NOT NULL だが既定値が定数でない。` +
-          ` いまは全行をアプリの表から書き直せるので通すが、隠れた行があると移行できなくなる`
+          ` いまはユーザーテーブルに入っていないバージョンが無いので続けた。` +
+          `そのようなバージョンがあると列を足すときに取り付けが止まるので、定数の既定値を付けることを勧める`
       )
     }
   }

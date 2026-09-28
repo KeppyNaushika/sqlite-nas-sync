@@ -37,12 +37,11 @@ function busyError(): Error {
 /**
  * 判定20・21 を当てる。
  *
- * @param lib 駆動するライブラリ。案A の口が無ければ**何も言わない**（空を返す）
+ * @param lib 駆動するライブラリ
  * @returns 違反の説明（空なら全部通った）
  */
 export function runRebuildScenarios(lib: Library): string[] {
   const api = lib.rebuild
-  if (api === null) return []
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sns-explore-scenario-'))
   try {
     return [...judgment20(api, dir), ...judgment21(api, dir)]
@@ -53,7 +52,7 @@ export function runRebuildScenarios(lib: Library): string[] {
 
 /** 案A の仕掛けを取り付けた、行が1つある DB を作る。 */
 function freshDatabase(
-  api: NonNullable<Library['rebuild']>,
+  api: Library['rebuild'],
   dir: string,
   name: string
 ): Database.Database {
@@ -84,10 +83,7 @@ function nameOf(db: Database.Database): string | null {
  * `_sns_tick` が進むので、適用は token の不一致で**見送り**になる。見送らずに
  * 当てると、差し込んだ書き込みが黙って消える（アプリが書いた行が戻る）。
  */
-function judgment20(
-  api: NonNullable<Library['rebuild']>,
-  dir: string
-): string[] {
+function judgment20(api: Library['rebuild'], dir: string): string[] {
   const failures: string[] = []
   const db = freshDatabase(api, dir, 'judgment20')
   try {
@@ -145,10 +141,7 @@ function judgment20(
  *
  * 見送りが増えるだけで前へ進まない形（設計書 §3.7.4）を捕まえる。
  */
-function judgment21(
-  api: NonNullable<Library['rebuild']>,
-  dir: string
-): string[] {
+function judgment21(api: Library['rebuild'], dir: string): string[] {
   const failures: string[] = []
   const db = freshDatabase(api, dir, 'judgment21')
   try {

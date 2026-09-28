@@ -1,10 +1,12 @@
 /**
  * sqlite-nas-sync - NAS環境でのSQLite分散同期ライブラリ。
  *
- * 同期する表ごとに**行の版の表**（`_sns_rows_<表>`）を持ち、アプリの書き込みを
- * トリガーがそこへ版として写す。他の端末とやり取りするのはこの版の表と削除の記録
- * （`_tombstone`）だけで、アプリの表そのものは**版から作り直す**。
- * したがって取り込みがアプリの制約（UNIQUE・外部キー・NOT NULL）で失敗しない。
+ * 各クライアントのローカル DB を NAS 上の共有ディレクトリにコピーし、互いのコピーを読んで、ユーザーテーブルへの変更を LWW で統合する。
+ * 同期の仕様は `docs/principles.md` にある。
+ *
+ * アプリケーションがユーザーテーブルに書き込むと、トリガーがそのバージョンを内部テーブル（`_sns_rows_<テーブル>` と `_tombstone`）に記録する。
+ * 他のクライアントとやり取りするのはこの内部テーブルだけで、ユーザーテーブルは内部テーブルのバージョンから作り直す。
+ * そのため、取り込みがユーザーテーブルの制約（`UNIQUE`・外部キー・`NOT NULL`）で失敗することはない。
  *
  * @remarks
  * 主なエントリポイントは {@link setupSync} 関数。
@@ -48,7 +50,7 @@ import {
   DEFAULTS,
 } from './types'
 import { discoverTables, validateDatabase } from './validator'
-import { computeSchemaHash, readSchemaVersion } from './setup'
+import { computeSchemaHash, readSchemaVersion } from './setup/schema-version'
 import { setupRowsLedgers } from './setup/rows-ledgers'
 import { checkRowsPreconditions } from './setup/rows-preflight'
 import { migrateToRows } from './rows/migrate'
@@ -61,21 +63,28 @@ import { createIdleMemory } from './sync/idle'
 /**
  * 同期インスタンスを作成する。
  *
- * 以下の初期化処理を行い、{@link SyncInstance} を返す（案A。設計書 §3.9）:
- * 1. ローカルDBをオープンし、WALモードを有効化
- * 2. {@link discoverTables} で同期対象テーブルを自動検出
- * 3. テーブル構造をバリデーション（PK型、updatedAtカラム等）
- * 4. **前提の確認**（`checkRowsPreconditions`。§1.8 の P1〜P8）
- * 5. **`_sns_rebuilding` の残りを消す**（§3.10 の I。**トリガーを作る前に**）
- * 6. **移行**（`migrateToRows`）—— `_sns_rows_<表>`・`_sns_clock`・4本のトリガー・
- *    `_tombstone` と `_changelog` の作り直し・列の増減への追従
+ * 次の順に準備して、{@link SyncInstance} を返す。
  *
- * `instanceId` は**呼ぶたびに作り直す**（§3.2）。前回の自分と区別が付かないと、
- * NAS 上の写しの取り合い（§3.10）を見抜けない。
+ * 1. ローカル DB を開き、WAL モードにする
+ * 2. {@link discoverTables} で同期するテーブルを検出する
+ * 3. テーブルと DB が前提を満たすかを確かめる。満たさなければ例外を投げる。気になる点は警告として最初の同期の `warnings` に載せる
+ * 4. 同期に使う内部テーブルとトリガーを作る。以前のバージョンのライブラリの形式の DB は移行し、テーブルの列の増減にも追従する
+ *
+ * 呼ぶたびにこのクライアントを識別する乱数を作り直す。
+ * 同じ `clientId` を使う別のクライアントが NAS 上のコピーを書き換えていないかを、これで見分ける。
  *
  * @param config - 同期設定
  * @returns 同期操作を行うインスタンス
- * @throws バリデーション失敗時、または検出された同期対象テーブルが0件の場合
+ * @throws 次のいずれかに当たる場合。
+ * - 同期するテーブルが1つも見つからない
+ * - 同期するテーブルが次のどれかに当たる（`Validation failed` またはそれぞれの文面）
+ *   - `primaryKey` の列が無い、`TEXT` でない、テーブルで宣言された主キーでない
+ *   - 主キーが無い、複合主キーである、`NOT NULL` でも `WITHOUT ROWID` でもない、主キーが NULL の行がある
+ *   - 時刻列に ISO-8601 の文字列でない値がある行がある
+ *   - `CHECK` 制約・部分索引の条件・式索引の式に、決定的でない関数・独自に登録した関数・組み込みでない照合順序がある、または索引の定義を読めない
+ *   - 列名が `_sns_` で始まる
+ * - 同期するテーブルを親とする外部キーが、親の主キー以外の列を参照している（子が同期しないテーブルでも同じ）
+ * - テーブルに増えた列が `NOT NULL` で既定値が定数でなく、ユーザーテーブルから埋め直せない行がある
  *
  * @example
  * ```ts
@@ -141,7 +150,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
   // アプリの書き込みは1つも事実にならないのに、警告も例外も出ない
   if (clearRebuildingFlag(db)) {
     setupWarnings.push(
-      '_sns_rebuilding に行が残っていたので消した（前回の作り直しが途中で落ちた可能性がある）'
+      '_sns_rebuilding に行が残っていたので消した（前回の同期がユーザーテーブルへの反映の途中で止まった可能性がある）'
     )
   }
 
@@ -274,18 +283,6 @@ export function setupSync(config: SyncConfig): SyncInstance {
 // 公開API: テーブル自動検出
 export { discoverTables } from './validator'
 
-// v0.20.0（案A・段階6）で `applyInsert` / `applyUpdate` / `applyDelete` と、
-// その引数・戻り値の型（`ApplyInsertResult` / `ApplyUpdateResult` /
-// `ResurrectionProbe` / `TimestampColumnFor`）の公開をやめた。
-// 案A の取り込みは行の版と削除の版の `Max` を取るだけで、1レコードずつ
-// 「入れる・上書きする・消す」を判断する場所が無い（設計書 §4.3）。
-// 手元での手動マージは、相手の DB を NAS に見立てて `setupSync` を通すこと。
-//
-// 段階7 で `ConflictInfo` 型と `sync:conflict` イベントの公開もやめた。案A には
-// 「1レコードの競合を local_wins / remote_wins で解決する」場面が無く、この
-// イベントは段階5 以降どこからも発火していなかった（購読しても永久に呼ばれない）。
-// 版が入れ替わった数は `SyncResult.conflictsResolved` で分かる。
-
 // 公開型のre-export
 export type {
   TableConfig,
@@ -297,7 +294,7 @@ export type {
   SyncTransfers,
   SkippedRemote,
   RecordFold,
-  DiscardedRecord,
+  ParentDeletedRecord,
   SyncStatus,
   SyncEvent,
   SyncEventCallback,

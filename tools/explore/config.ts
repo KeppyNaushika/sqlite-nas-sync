@@ -15,11 +15,11 @@ import * as path from 'path'
  * のような意味の無い組を作れてしまう）。
  */
 export const TABLE_SETS = {
-  /** UNIQUE が1本の親の表だけ（名前のかぶり＝畳みが起きる最小の形。挟み方の検査の最小の反例はここにある） */
+  /** UNIQUE が1本の親の表だけ（名前のかぶり＝統合が起きる最小の形。挟み方の検査の最小の反例はここにある） */
   tags: ['tags'],
-  /** 親と主キーを共有する1:1の子。親が畳まれると子の id そのものが動く（修理中の族） */
+  /** 親と主キーを共有する1:1の子。親が統合されると子の表示上の id そのものが動く */
   'tags+tag_profiles': ['tags', 'tag_profiles'],
-  /** 親を指す普通の子。親が畳まれると外部キーが付け替わる */
+  /** 親を指す普通の子。親が統合されると外部キーが付け替わる */
   'tags+tag_notes': ['tags', 'tag_notes'],
   /** UNIQUE の無い、単純な LWW */
   users: ['users'],
@@ -27,26 +27,9 @@ export const TABLE_SETS = {
   decisions: ['decisions'],
   /** セカンダリ UNIQUE が2本（1回の書き込みが索引ごとに別の相手へぶつかる） */
   accounts: ['accounts'],
-  /**
-   * **時刻列が INTEGER で、行の時刻が数値**（設計書 §1.2.3 の群1）。
-   *
-   * `_sns_ts` を型名の無い列ではなく TEXT 列にする壊し方（`--mutant sns-ts-as-text`）は、
-   * 時刻列が TEXT の表しか無いと踏めない —— TEXT 親和性を付けても格納クラスが動かないからである。
-   * 数値の時刻がこの表を通ると、版が端末をまたぐたびに群1 から群2 へ移る
-   */
-  epoch_notes: ['epoch_notes'],
-  /**
-   * **時刻列が `COLLATE NOCASE` で宣言され、行の時刻が大文字小文字だけ違う文字列**
-   * （設計書 §1.2.3 の群2）。
-   *
-   * 比較の `COLLATE BINARY` を外す壊し方（`--mutant no-binary-collation`）は、
-   * NOCASE の列と、畳むと同着になる値が無いと踏めない
-   */
-  nocase_notes: ['nocase_notes'],
 } as const
 
 export type TableSetName = keyof typeof TABLE_SETS
-export type TableName = (typeof TABLE_SETS)[TableSetName][number]
 
 /** 検査の範囲と実行の設定。既定値は {@link defaultConfig}。 */
 export type ExploreConfig = {
@@ -65,10 +48,10 @@ export type ExploreConfig = {
   /**
    * **未来の**行の時刻（{@link FUTURE_BASE} からのミリ秒）。既定は空。
    *
-   * 削除が刻む時刻（`_tombstone.deletedAt`・削除の版の `ts`）は実行時の現在時刻なので、
-   * `--times` の値（2026-01-01）からは「削除より新しい書き込み」を作れない。案A では
-   * 削除の版も行の版と同じ順序で比べるので、その形を範囲に入れられるようにする
-   * （docs/rows-table-design.md §8.2「新しい操作」）
+   * 削除が刻む時刻（`_tombstone.deletedAt`・削除の版の `_sns_ts`）は実行時の現在時刻なので、
+   * `--times` の値（2026-01-01）からは「削除より新しい書き込み」を作れない。削除の版も
+   * 行の版と同じ順序で比べる（原則2）ので、その形を範囲に入れられるようにする
+   * （docs/rows-table-design.md §8.2 の操作の一覧）
    */
   futureTimes: number[]
   /** 行の時刻の書式。0 = ISO-T、1 = 旧版のスペース形式 */
@@ -76,8 +59,8 @@ export type ExploreConfig = {
   /** 削除の操作を範囲に入れるか */
   deletes: boolean
   /**
-   * **時刻列を変えない UPDATE** を範囲に入れるか（設計書 docs/rows-table-design.md §8.2
-   * 「新しい操作」）。既定は入れない（1段の分岐が増える）
+   * **時刻列を変えない UPDATE** を範囲に入れるか（設計書 docs/rows-table-design.md §8.2 の
+   * 操作の一覧）。既定は入れない（1段の分岐が増える）
    */
   keepTimeUpdates: boolean
   /** **消してすぐ同じ id で作り直す**操作を範囲に入れるか（同上） */
@@ -101,8 +84,6 @@ export type ExploreConfig = {
   dedup: boolean
   /** 順序の入れ替えを畳む（partial order reduction） */
   por: boolean
-  /** 端末の入れ替えを畳む（2台のときだけ効く。理由は tools/explore/reduction.ts） */
-  symmetry: boolean
   /** 収束の検査の結果を状態ごとに覚えて使い回す（削減手ではなく検査の高速化） */
   probeMemo: boolean
   /**
@@ -175,7 +156,6 @@ export function defaultConfig(): ExploreConfig {
     workers: Math.max(1, os.availableParallelism()),
     dedup: true,
     por: true,
-    symmetry: true,
     probeMemo: true,
     normalizeGeneration: true,
     normalizeLamport: true,
@@ -208,8 +188,7 @@ export function usage(): string {
     '  --ids N             主キーの種類の数（既定 2）',
     '  --keys N            UNIQUE キーの値の種類の数（既定 2）',
     '  --payloads N        本文の種類の数（既定 1）',
-    '  --times a,b         行の時刻。基準（2026-01-01）からのミリ秒（既定 0,1000）。',
-    '                      epoch_notes / nocase_notes では個数だけを採る（値は表ごとに決まっている）',
+    '  --times a,b         行の時刻。基準（2026-01-01）からのミリ秒（既定 0,1000）',
     '  --future-times a,b  未来の行の時刻。2099-01-01 からのミリ秒（既定 なし）。',
     '                      削除が刻む現在時刻より後なので、「削除より新しい書き込み」を作れる',
     '  --formats 0,1       行の時刻の書式。0=ISO-T 1=スペース形式（既定 0。混在は 0,1）',
@@ -232,13 +211,12 @@ export function usage(): string {
     '  --work-root DIR     作業ディレクトリの置き場所',
     '  --progress SEC      進捗を出す間隔（既定 5）',
     '  --min-free-mb N     作業ディレクトリの場所の空きがこれを割ったら止める（既定 3072）',
-    '  --self-test N       探索の前に、削減手の前提（別々の端末への操作の可換性・端末の対称性）を',
+    '  --self-test N       探索の前に、削減手の前提（別々の端末への操作の可換性）を',
     '                      範囲の中の列 N 本で実際に確かめる。崩れていたら探索しない',
     '',
     '削減手の入り切り（効果の測定と、削減手が反例を消していないことの確認に使う）:',
-    '  --no-dedup          重複排除を外す（木として全部たどる。対称性も外れる）',
+    '  --no-dedup          重複排除を外す（木として全部たどる）',
     '  --no-por            順序の入れ替えを畳まない',
-    '  --no-symmetry       端末の入れ替えを畳まない',
     '  --no-probe-memo     収束の検査の結果を使い回さない',
     '  --raw-generation    _sync_meta.generation を絶対値のまま状態に含める（案A の倍率の測定用）',
     '  --no-suppress-idle  変わっていないときの転送の抑制（src/sync/idle.ts）を切って駆動する',
@@ -368,9 +346,6 @@ export function parseArgs(
       case '--no-por':
         config.por = false
         break
-      case '--no-symmetry':
-        config.symmetry = false
-        break
       case '--no-probe-memo':
         config.probeMemo = false
         break
@@ -444,34 +419,7 @@ export function parseArgs(
       '行の時刻（--times か --future-times）と --formats は1つ以上'
     )
   }
-  // 重複排除を外すと、対称性で畳むものが無い（対称性は「同じと見なす」重複排除そのもの）
-  if (!config.dedup) config.symmetry = false
   return config
-}
-
-/**
- * 対称性の畳み込みが実際に効くか。
- *
- * **案A では常に効かない。** 端末の入れ替えが対称なのは「端末名の大小が振る舞いに効かない」
- * ときだけだが、案A は同着の最後の鍵が `instanceId` のバイト列の比較（設計書 §1.2.5）で、
- * 検査器は端末ごとに `iid-client-a` / `iid-client-b` を固定して与える（world.ts の `instanceIdFor`）。
- * すると「自分の iid が相手より小さい端末が書いた」状態と「大きい端末が書いた」状態は、
- * 入れ替えても同じにならない ——**後の同着の決着が逆になる**。`--self-test` はこれを
- * 実際に検出する（素の `src/` で、1回の書き込みだけの列でも鏡写しにならない）。
- *
- * 正準化は「入れ替えの候補の中で直列化がいちばん小さいもの」を鍵にするので、鏡写しでない
- * 状態どうしが畳まれることは無い（＝いまも健全）。ただし畳めるものが無いので、**効かないことを
- * 明示して外す**。逆向き（b の iid が小さい側）を調べるには `instanceIdFor` を逆順にして
- * 走らせ直すこと。
- *
- * 3台でも効かせない（理由は reduction.ts）。
- */
-const SYMMETRY_IS_SOUND = false
-
-export function symmetryActive(config: ExploreConfig): boolean {
-  return (
-    SYMMETRY_IS_SOUND && config.symmetry && config.dedup && config.clients === 2
-  )
 }
 
 /** 人が読める範囲の要約。**反例なしの報告には必ずこれを添える。** */
@@ -519,7 +467,6 @@ export function describeReductions(config: ExploreConfig): string {
   return [
     `重複排除 ${onOff(config.dedup)}`,
     `順序の畳み込み ${onOff(config.por)}`,
-    `対称性 ${symmetryActive(config) ? 'ON' : 'OFF（案A では端末の入れ替えは対称でない。iid が同着の鍵）'}`,
     `検査結果の使い回し ${onOff(config.probeMemo)}`,
     `generation の正規化 ${onOff(config.normalizeGeneration)}`,
     `lamport の正規化 ${onOff(config.normalizeLamport)}`,

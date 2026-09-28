@@ -5,15 +5,12 @@
  * その端末では正当（`better-sqlite3` は `PRAGMA foreign_keys` を既定で有効にするので、
  * 親が居ない状態では子を作れない）。壊れた組み合わせを作るのは**同期**である。
  *
- * 取り込む側は親を tombstone に負けて入れないのに、子だけ素通しで入れると
- * **COMMIT 時に外部キー違反になり、その相手ぶんの取り込みが丸ごと巻き戻る**
- * （`src/sync/pull.ts` の `defer_foreign_keys` は検査を終端へ遅らせるだけで、
- * 終端で矛盾が残れば通常どおり失敗する）。作り直された親が tombstone より古い形では
- * 毎回同じ違反を繰り返し、その相手からの同期が**恒久的に止まる**。
+ * 旧方式は、相手の変更をユーザーテーブルへ直接当てて取り込んでいた。
+ * 親行を墓標に負けて入れないのに子行だけを入れると、COMMIT で外部キー違反になり、その相手の取り込みが丸ごと巻き戻った。
+ * 同じ違反を毎回繰り返す形では、その相手からの同期が止まったままになった。
  *
- * 正しい答えは「親が消えたのだから、その外部キーの `ON DELETE` に従う」。
- * 畳みで読み替えた先が消えていた場合の扱い（`conflict/remap.ts` の規則5）と同じ規則を、
- * 畳みが絡まない普通の削除にも当てる。
+ * 案A では、取り込みは `_sns_rows_*` と `_tombstone` にしか書かないので、外部キーで失敗しない。
+ * 親行が削除されていれば、子行は原則4 どおり、宣言された `ON DELETE` に従う。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { performSync } from '../src/sync'
@@ -93,9 +90,13 @@ describe('同期経路（tag_notes は ON DELETE CASCADE）', () => {
     }
   }, 60000)
 
-  it('tombstone より古い時刻で作り直された親でも、同期が止まらない', async () => {
-    // 恒久的に止まる形。作り直された親は tombstone に負けて**永久に入らない**のに、
-    // それを指す子は届き続けるので、取り込みが毎周巻き戻る。
+  it('削除より古い時刻で作り直した親行と子行は、全クライアントに残る', async () => {
+    // 旧方式で同期が止まったままになった形である。
+    // 旧方式では、作り直した親行が墓標に負けて入らず、それを指す子行が届き続けたので、取り込みが毎周巻き戻った。
+    //
+    // 案A で起きること。
+    // C は削除のあとに同じクライアントで親行を作り直すので、作り直しは削除より後の変更である。
+    // LWW の1で作り直しが勝つので、アプリケーションが書いた時刻が削除の時刻より古くても、親行 g1 と子行 n1 は全クライアントに残る。
     const a = fixture.createClientDb('client-a')
     const c = fixture.createClientDb('client-c')
     const warnings: string[] = []
@@ -127,7 +128,7 @@ describe('同期経路（tag_notes は ON DELETE CASCADE）', () => {
       await round()
       await round()
 
-      // C が親を「削除より古い時刻」で作り直し、子を足す
+      // C が親行を、削除を実行した現在時刻より古い時刻で作り直し、子行を足す。
       c.db
         .prepare(`INSERT INTO tags (id, name, updatedAt) VALUES (?, ?, ?)`)
         .run('g1', 't1', '2026-01-01T00:00:01.000Z')
@@ -140,6 +141,19 @@ describe('同期経路（tag_notes は ON DELETE CASCADE）', () => {
       for (let i = 0; i < 5; i += 1) await round()
 
       expect(syncFailures(warnings)).toEqual([])
+      for (const [label, db] of [
+        ['A', a.db],
+        ['C', c.db],
+      ] as const) {
+        expect(
+          db.prepare(`SELECT id, name FROM tags`).all(),
+          `client-${label} tags`
+        ).toEqual([{ id: 'g1', name: 't1' }])
+        expect(
+          db.prepare(`SELECT id, tagId FROM tag_notes`).all(),
+          `client-${label} tag_notes`
+        ).toEqual([{ id: 'n1', tagId: 'g1' }])
+      }
     } finally {
       a.db.close()
       c.db.close()

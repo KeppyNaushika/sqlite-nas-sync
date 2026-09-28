@@ -1,5 +1,5 @@
 /**
- * 案A の前提（設計書 `docs/rows-table-design.md` §1.8）を、起動時に確かめる。
+ * 同期の前提（設計書 `docs/rows-table-design.md` §1.8）を、起動時に確かめる。
  *
  * ここで断るものは、**通してしまうと後から直せない**種類の破れである。
  *
@@ -9,18 +9,20 @@
  * | 決定的でない関数（P8） | 例外 | 同じ行が端末や時刻によって置ける・置けないに分かれ、補題2と定理1が破れる |
  * | 独自に登録された照合順序・関数（P8） | 例外 | 一時 DB に同じものが無く、判定が別物になる |
  * | 解析できない索引（P8） | 例外 | かぶりの勝者を引けない |
- * | 親のいない子（P5） | 警告 | 案A では親を置けない行が表に出ないので、導入前から壊れていた行が静かに消える |
- * | 時刻列の BLOB（穴7） | 例外 | 値の種類がいちばん強い群なので、入った行の順序が以後ほぼ書き込み順だけで決まる |
- * | 大きく未来の時刻（穴7） | 警告 | 引き上げは下がらないので、その行の順序が以後ほぼ書き込み順だけで決まる |
- * | 時刻列に値の種類が混ざる（§1.2.3） | 警告 | 順序は決まるが、利用者の期待とは違いうる |
+ * | 同期する表を親とする外部キーが親の主キー以外を参照する（P14） | 例外 | 子の親が削除されたのか、まだ届いていないのかを区別できず、原則4 に従えない |
+ * | 親のいない子（P5） | 警告 | 親を置けない行はアプリの表に出ないので、導入前から壊れていた行が静かに消える |
+ * | 時刻列に ISO-8601 の文字列でない値（P15） | 例外 | 削除は実行した時刻で比べるので、数値や NULL などの時刻とは比べられない |
+ * | 大きく未来の時刻 | 警告 | 引き上げは下がらないので、その行の順序が以後ほぼ書き込み順だけで決まる |
  *
  * @module setup/rows-preflight
  * @internal
  */
 import Database from 'better-sqlite3'
-import { escapeIdentifier, foldIdentifier } from './sql'
+import { escapeIdentifier, foldIdentifier, isSameIdentifier } from './sql'
 import { parseCreateIndex } from '../rows/index-parse'
 import { assertDeterministicSql } from '../rows/sql-functions'
+import { isIsoTimeSql } from '../rows/triggers'
+import { DEFAULTS } from '../types'
 
 /** 検査する表1つ分の指定。 */
 interface RowsPreflightTable {
@@ -32,7 +34,7 @@ interface RowsPreflightTable {
   timestampColumn?: string
 }
 
-/** {@link checkRowsPreconditions} の設定。 */
+/** {@link checkRowsPreconditions} の設定。`setupSync` は渡さない。試験のための差し込み口。 */
 interface RowsPreflightOptions {
   /**
    * 「大きく未来」と見なす幅（ミリ秒）。現在時刻からこれ以上先の値は警告になる
@@ -72,6 +74,8 @@ export function checkRowsPreconditions(
     assertIndexesAreReadable(db, table.name, custom)
     warnings.push(...checkTimestampColumn(db, table, options))
   }
+  // 同期する表を親とする外部キーは、子が同期しない表でも見るので、DB の全表を回す
+  assertForeignKeysReferencePrimaryKeys(db, tables)
   // 外部キーだけは**表ごとのループの外**で1回。`foreign_key_check(<表>)` は
   // 「その表が子である違反」しか返さないので、同期する表だけを回すと、
   // 同期しない表から同期する表への違反を取りこぼす
@@ -106,7 +110,10 @@ function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
     .filter((column) => column.pk > 0)
     .sort((a, b) => a.pk - b.pk)
   if (primaryKey.length === 0) {
-    throw new Error(`同期する表 ${table} に主キーが無い（前提 P1）`)
+    throw new Error(
+      `同期する表 ${table} に主キーが無い。` +
+        ` クライアントをまたいで一意な id（UUID / cuid）を持つ1列を、TEXT で NOT NULL の PRIMARY KEY として宣言すること`
+    )
   }
   // 複合主キーは断る（前提 P11）。真の id・`_tombstone.recordId`・`_sns_shown` の
   // すべてが「1つの値」を前提にしているので、通すと版の鍵が定まらない
@@ -114,7 +121,7 @@ function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
     throw new Error(
       `同期する表 ${table} の主キーが複合（${primaryKey
         .map((column) => column.name)
-        .join(', ')}）である（前提 P11）`
+        .join(', ')}）である。複合主キーは扱えないので、主キーを1列にすること`
     )
   }
   const sql = tableSql(db, table)
@@ -126,15 +133,15 @@ function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
     if (!/^TEXT$/i.test(column.type)) {
       throw new Error(
         `同期する表 ${table} の主キー ${column.name} が TEXT で宣言されていない` +
-          `（宣言: ${column.type || '無し'}、前提 P1）。` +
-          ` 端末をまたいで一意な id（UUID / cuid）を TEXT で持つこと` +
-          `（INTEGER PRIMARY KEY の自動採番は、別の端末が同じ値を別の行に割り当てる）`
+          `（宣言: ${column.type || '無し'}）。` +
+          ` クライアントをまたいで一意な id（UUID / cuid）を TEXT で持つこと` +
+          `（INTEGER PRIMARY KEY の自動採番は、別のクライアントが同じ値を別の行に割り当てる）`
       )
     }
     // `WITHOUT ROWID` の主キーは暗黙に NOT NULL
     if (withoutRowid || column.notnull === 1) continue
     throw new Error(
-      `同期する表 ${table} の主キー ${column.name} が NULL を取れる（前提 P1）。` +
+      `同期する表 ${table} の主キー ${column.name} が NULL を取れる。` +
         ` NOT NULL を宣言するか、WITHOUT ROWID にすること`
     )
   }
@@ -150,7 +157,8 @@ function assertPrimaryKeyIsNotNull(db: Database.Database, table: string): void {
     .get()
   if (offending !== undefined) {
     throw new Error(
-      `同期する表 ${table} に、主キーが NULL の行がある（前提 P1）`
+      `同期する表 ${table} に、主キーが NULL の行がある。` +
+        ` 主キーが NULL の行は同期できないので、値を入れるか行を消してから setupSync を呼ぶこと`
     )
   }
 }
@@ -276,7 +284,8 @@ function assertIndexesAreReadable(
         continue
       }
       throw new Error(
-        `組み込みでない照合順序 ${column.coll} が索引 ${entry.name} に使われている（前提 P8）`
+        `組み込みでない照合順序 ${column.coll} が索引 ${entry.name} に使われている。` +
+          ` 同期は一時 DB で同じ索引を作って判定するので、組み込みの照合順序（BINARY・NOCASE・RTRIM）にすること`
       )
     }
   }
@@ -294,66 +303,65 @@ function assertCollationsAreBuiltin(
     const name = foldIdentifier(match[1].replace(/^["[`]|["\]`]$/g, ''))
     if (builtinCollations.has(name)) continue
     throw new Error(
-      `組み込みでない照合順序 ${name} が ${where} に現れている（前提 P8）`
+      `組み込みでない照合順序 ${name} が ${where} に現れている。` +
+        ` 同期は一時 DB で同じ表と索引を作って判定するので、組み込みの照合順序（BINARY・NOCASE・RTRIM）にすること`
     )
   }
 }
 
 /* ------------------------------------------------------------------ *
- * 時刻列（穴7・§1.2.3）
+ * 時刻列（P15）と、大きく未来の時刻
  * ------------------------------------------------------------------ */
 
 /**
- * 時刻列を見る。BLOB があれば例外、大きく未来の値と値の種類の混在は警告。
+ * 時刻列を見る。ISO 8601 の文字列でない値があれば例外、大きく未来の値は警告。
  *
- * BLOB を例外にするのは、それが**いちばん強い群**だからである。1回でも入ると
- * その行の `_sns_ts` は引き上げでその高さに固定され、以後その行の順序は
- * 実質 `(lamport, instanceId)` だけで決まる（設計書 §1.2.1 の穴7）。
+ * 時刻列に許すのは ISO 8601 の文字列（設計書 §1.2.3 の群3）だけである。削除の版は
+ * 削除を実行した時刻（ISO 8601 の文字列）で比べるので、数値・ISO でない文字列・
+ * BLOB・NULL の時刻とは同じ物差しで比べられない。判定はトリガーと同じ式
+ * （{@link isIsoTimeSql}）を使う。導入後の書き込みはトリガーが止める。
+ *
+ * 時刻列の名前は大文字小文字を畳んで探す（SQLite にとって同じ列なので）。
+ * 表に時刻列が無ければ、時刻にまつわる検査は飛ばす。
  */
 function checkTimestampColumn(
   db: Database.Database,
   table: RowsPreflightTable,
   options: RowsPreflightOptions
 ): string[] {
-  const column = table.timestampColumn ?? 'updatedAt'
+  const wanted = table.timestampColumn ?? DEFAULTS.timestampColumn
   const info = db.pragma(`table_xinfo(${escapeIdentifier(table.name)})`) as {
     name: string
   }[]
-  if (!info.some((entry) => entry.name === column)) return []
+  const found = info.find((entry) => isSameIdentifier(entry.name, wanted))
+  if (found === undefined) return []
+  const column = found.name
 
   const quoted = escapeIdentifier(column)
   const name = escapeIdentifier(table.name)
-  const blob = db
-    .prepare(
-      `SELECT 1 AS found FROM ${name} WHERE typeof(${quoted}) = 'blob' LIMIT 1`
-    )
-    .get()
-  if (blob !== undefined) {
+  const notIso = `NOT ${isIsoTimeSql(quoted)}`
+  const { count } = db
+    .prepare(`SELECT count(*) AS count FROM ${name} WHERE ${notIso}`)
+    .get() as { count: number }
+  if (count > 0) {
+    // 代表は値の種類ごとに1つ（数値・文字列・BLOB・NULL のどれが入っているかが
+    // 分かれば、直し方が決まる）。WITHOUT ROWID の表もあるので rowid では選ばない
+    const samples = db
+      .prepare(
+        `SELECT typeof(${quoted}) AS kind, min(${quoted}) AS value
+           FROM ${name} WHERE ${notIso}
+          GROUP BY typeof(${quoted}) ORDER BY kind`
+      )
+      .all() as { kind: string; value: unknown }[]
     throw new Error(
-      `同期する表 ${table.name} の時刻列 ${column} に BLOB がある（穴7）。` +
-        ` BLOB は値の種類のうち最も強く、入った行の順序は以後ほぼ書き込み順だけで決まる`
+      `同期する表 ${table.name} の時刻列 ${column} に、ISO-8601 の文字列でない値が ${count} 件ある` +
+        `（例: ${samples.map((row) => describeValue(row.value)).join(', ')}）。` +
+        `時刻列は ISO-8601 の文字列（例: 2026-01-01T00:00:00.000Z）で書くこと。` +
+        `削除は実行した時刻で比べるので、数値や NULL の時刻とは比べられない`
     )
   }
 
   const warnings: string[] = []
-  const kinds = db
-    .prepare(
-      `SELECT DISTINCT typeof(${quoted}) AS kind FROM ${name}
-        WHERE ${quoted} IS NOT NULL`
-    )
-    .all() as { kind: string }[]
-  const distinct = new Set(kinds.map((row) => row.kind))
-  // 整数と実数は同じ群（群1）なので、混ざっていても順序は素直に決まる
-  if (
-    distinct.has('text') &&
-    (distinct.has('integer') || distinct.has('real'))
-  ) {
-    warnings.push(
-      `同期する表 ${table.name} の時刻列 ${column} に値の種類が混ざっている` +
-        `（${[...distinct].join(' / ')}）。順序は決まるが、数値は文字列より常に弱くなる`
-    )
-  }
-
   const now = options.now?.() ?? Date.now()
   const tolerance = options.futureToleranceMs ?? DEFAULT_FUTURE_TOLERANCE_MS
   // julianday のエポックは 1970-01-01T00:00:00Z が 2440587.5
@@ -367,11 +375,101 @@ function checkTimestampColumn(
   if (future !== undefined) {
     warnings.push(
       `同期する表 ${table.name} の時刻列 ${column} に大きく未来の値がある` +
-        `（${String(future.value)}）。順序用の時刻は下がらないので、` +
-        `その行の順序は以後ほぼ書き込み順だけで決まる（穴7）`
+        `（${String(future.value)}）。` +
+        `同期は、その行へのあとの変更の時刻をこの値より小さくしない（単調化）ので、` +
+        `その行への変更の勝ち負けは、時刻列の値ではなくほぼ書き込んだ順で決まる`
     )
   }
   return warnings
+}
+
+/** 例外の文面に載せる値の見え方。種類が分かるように書く。 */
+function describeValue(value: unknown): string {
+  if (value === null) return 'NULL'
+  if (Buffer.isBuffer(value)) return `BLOB（${value.length} バイト）`
+  if (typeof value === 'string') return `'${value}'`
+  return String(value)
+}
+
+/* ------------------------------------------------------------------ *
+ * P14: 同期する表を親とする外部キーは、親の主キーを参照する
+ * ------------------------------------------------------------------ */
+
+/**
+ * 同期する表を親とする外部キーが、親の主キーを参照していること（前提 P14）。
+ *
+ * 原則4 は「親行が削除されたときは宣言された `ON DELETE` に従う」。親の主キーを
+ * 参照していれば、子の親が削除されたのかを親の削除の版から引ける。主キー以外の
+ * `UNIQUE` 列を参照していると、その値を持つ親が削除されたのか、まだ届いていないのかを
+ * 区別できず、`ON DELETE` に従えない。
+ *
+ * 子が同期しない表でも見る。同期する表の親が他の端末で削除されれば、その子にも
+ * 同じ問題が起きるからである。`foreign_key_list` は子の側からしか引けないので、
+ * DB のすべての表を回す。このライブラリの表（`_` で始まる）と SQLite の内部の表は
+ * 対象外。
+ *
+ * `REFERENCES parent` と列を書かない形は `to` が NULL で返り、親の主キーを指すので通す。
+ * 列名は大文字小文字を畳んで比べる。
+ */
+function assertForeignKeysReferencePrimaryKeys(
+  db: Database.Database,
+  tables: RowsPreflightTable[]
+): void {
+  const synced = new Map(
+    tables.map((table) => [foldIdentifier(table.name), table.name])
+  )
+  const children = db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_'
+        ORDER BY name`
+    )
+    .all() as { name: string }[]
+  for (const { name: child } of children) {
+    if (child.startsWith('_')) continue
+    const list = db.pragma(`foreign_key_list(${escapeIdentifier(child)})`) as {
+      id: number
+      seq: number
+      table: string
+      from: string
+      to: string | null
+    }[]
+    const byId = new Map<number, typeof list>()
+    for (const entry of list) {
+      byId.set(entry.id, [...(byId.get(entry.id) ?? []), entry])
+    }
+    for (const entries of byId.values()) {
+      const parent = synced.get(foldIdentifier(entries[0].table))
+      if (parent === undefined) continue
+      entries.sort((a, b) => a.seq - b.seq)
+      // 列を書かない参照は親の主キーを指す
+      if (entries.every((entry) => entry.to === null)) continue
+      const keyColumns = primaryKeyColumnsOf(db, parent)
+      const to = entries.map((entry) => entry.to ?? '')
+      const matches =
+        to.length === keyColumns.length &&
+        to.every((column, at) => isSameIdentifier(column, keyColumns[at]))
+      if (matches) continue
+      throw new Error(
+        `表 ${child} の外部キー（${entries.map((entry) => entry.from).join(', ')}）が、` +
+          `同期する表 ${parent} の主キーでない列（${to.join(', ')}）を参照している。` +
+          `同期する表を親とする外部キーは、親の主キー（${keyColumns.join(', ')}）を参照すること。` +
+          `主キー以外の列を参照すると、親が削除されたのか、まだ届いていないのかを区別できない`
+      )
+    }
+  }
+}
+
+/** 表の主キーの列の名前（宣言の順）。 */
+function primaryKeyColumnsOf(db: Database.Database, table: string): string[] {
+  const info = db.pragma(`table_xinfo(${escapeIdentifier(table)})`) as {
+    name: string
+    pk: number
+  }[]
+  return info
+    .filter((column) => column.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((column) => column.name)
 }
 
 /* ------------------------------------------------------------------ *
@@ -451,11 +549,11 @@ function checkForeignKeys(
     ...describeMissingParents(
       inTargets,
       (table, count, parents) =>
-        `同期する表 ${table} に、親のいない行が ${count} 件ある（親は ${parents}。前提 P5）。` +
-        `この状態で同期を始めると、その行はアプリの表から外れる（版は残る）`,
+        `同期する表 ${table} に、親のいない行が ${count} 件ある（親は ${parents}）。` +
+        `この状態で同期を始めると、その行はユーザーテーブルから外れる（バージョンは残る）`,
       (count, tableCount) =>
-        `ほか ${tableCount} 表の、同期に関わる行にも親がいない（合計 ${count} 件。前提 P5）。` +
-        `この状態で同期を始めると、それらの行はアプリの表から外れる（版は残る）`
+        `ほか ${tableCount} 表の、同期に関わる行にも親がいない（合計 ${count} 件）。` +
+        `この状態で同期を始めると、それらの行はユーザーテーブルから外れる（バージョンは残る）`
     ),
     ...describeMissingParents(
       elsewhere,

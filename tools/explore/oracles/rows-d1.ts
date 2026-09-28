@@ -2,6 +2,9 @@
  * 参照実装 `rows-d1` —— 設計書 docs/rows-table-design.md §1（意味の定義）と §2（削除）を、
  * そのまま素直に写した「アプリの表の見え方」の計算。
  *
+ * 仕様の正本は docs/principles.md（原則1〜4 と付則）。設計書はそれを実現する手順で、
+ * ここはその手順のうち「版の集合 → 見え方」の部分を、実装とは別に書き下したものである。
+ *
  * ## 何のためにあるか
  *
  * 網羅検査器の判定4（設計書 §8.1）は「本物の実装が作り直したあとのアプリの表」を、
@@ -11,8 +14,8 @@
  * - **速度より読みやすさを優先する。** 設計書の語（Max・候補・表示値・かぶり・勝者・
  *   隠れた行・置かない行・置く行）を関数名にそのまま使い、1つの定義を1か所で計算する
  * - **SQLite に判定させるべきものは SQLite に判定させる。** 照合順序・CHECK・部分索引・
- *   式索引・生成列・値の種類は、JS で真似ると必ずずれる（設計書 §1.4 の穴B、§1.5 の穴3、
- *   §1.2.3 の穴9）。一時の `:memory:` DB へ**強い順に INSERT** して、SQLite が返した
+ *   式索引・生成列・値の種類は、JS で真似ると必ずずれる（設計書 §1.3〜1.7 の置かない行と
+ *   かぶり、§1.2.3 の値の種類）。一時の `:memory:` DB へ**強い順に INSERT** して、SQLite が返した
  *   エラーの種類で「置かない行」「隠れた行」を分ける
  *
  * ## 入力
@@ -25,17 +28,16 @@
  *
  * ## 出力
  *
- * {@link derive} が「置く行・隠れた行・置かない行・**捨てる行**（原則4）・死んだ id・
- * `Res`」を返し、
+ * {@link derive} が「置く行・隠れた行・置かない行・**親が削除されているので置かない行**
+ * （原則4）・死んだ id・`Res`」を返し、
  * {@link viewJson} がアプリの表の見え方を、検査器の {@link module:tools/explore/history} の
  * `viewOf` と同じ形の JSON にする。
  *
  * ## 写していない部分（限界。報告に書くこと）
  *
- * - 主キー以外の UNIQUE 列を指す外部キーで、**隠れた行**の中から値の組を探すときだけは、
- *   照合順序を当てずに JS で比べる（置く行は一時 DB へ問い合わせるので照合順序が効く）。
- *   範囲の表にその形の外部キーは無い
- * - `ON UPDATE`（設計書 §1.4 の穴16）はアプリの接続で起きた結果が事実になるので、
+ * - 外部キーは親の主キーを参照するものだけを扱う（付則4）。主キー以外を参照する
+ *   外部キーを持つスキーマは `setupSync` が断るので、ここでは例外にする
+ * - `ON UPDATE` はアプリの接続で起きた結果が事実になる（設計書 §2 の R0）ので、
  *   ここでは何もしない
  *
  * @module tools/explore/oracles/rows-d1
@@ -76,38 +78,39 @@ export type OracleTable = {
 export type OracleSchema = { tables: OracleTable[] }
 
 /**
- * 候補（＝ `Max` が行の版だった id）の行き先。設計書 §1.4〜§1.6、原則4。
+ * 候補（＝ `Max` が行の版だった id）の行き先。設計書 §1.3〜1.7、原則4。
  *
- * `discarded` だけ質が違う —— **版そのものを捨てる**（原則4）。残りの3つは
- * アプリの表での置き場所の話で、版は `_sns_rows_<表>` に残る。
+ * `parentDeleted` は、親が削除されているのでアプリの表に入らない行（原則4・付則3）。
+ * どの行き先も**版の集合だけ**で決まり、版は捨てない。親が書き直されて削除に勝てば、
+ * 同じ版が置く行になる。
  */
-export type Placement = 'placed' | 'hidden' | 'unplaceable' | 'discarded'
+export type Placement = 'placed' | 'hidden' | 'unplaceable' | 'parentDeleted'
 
 /** 1つの候補について分かったこと。 */
 export type CandidateResult = {
   table: string
-  /** 真の id の正規形（設計書 §1.11） */
+  /** 真の id の正規形（`CAST(… AS TEXT)` と同じ字面） */
   key: string
   placement: Placement
-  /** 表示値（設計書 §1.4）。置かない行では、決まるところまで入れた値 */
+  /** 表示値（設計書 §1.3〜1.7）。置かない行では、決まるところまで入れた値 */
   display: Record<string, SqlValue>
-  /** 隠れた行のときの勝者の真の id の正規形（設計書 §1.5） */
+  /** 隠れた行のときの勝者の真の id の正規形（設計書 §1.3〜1.7 のかぶり） */
   winner?: string
   /** 置かない行になった理由（SQLite が返したメッセージ） */
   reason?: string
   /**
-   * 置かない行になった筋。`parent` は §1.4 の「親が置かれていない」、
+   * 置かない行になった筋。`parent` は §1.3〜1.7 の「親が置かれていないとき」、
    * `constraint` は行に閉じた制約（NOT NULL / CHECK / 型 / 生成列）で SQLite が拒んだもの。
    * 判定13（置かない行の逆向きの検査）は `constraint` だけを見る
    */
   reasonKind?: 'parent' | 'constraint'
-  /** 捨てる原因になった親（原則4）。`placement` が `discarded` のときだけ入る */
+  /** 原因の親（原則4）。`placement` が `parentDeleted` のときだけ入る */
   cause?: GoneCause
 }
 
 /**
- * 「消えている」ことの原因（原則4）。連鎖で捨てられた行では、**大元の削除**を指す
- * （利用者が「どの削除でこの行が消えたか」を1つ知れれば足りる）。
+ * 親が削除されていることの原因（原則4）。連鎖（孫）では**大元の削除**を指す
+ * （利用者が「どの削除でこの行が入らないか」を1つ知れれば足りる）。
  */
 export type GoneCause = { table: string; key: string }
 
@@ -115,21 +118,19 @@ export type GoneCause = { table: string; key: string }
 export type Derived = {
   /** 表 → 真の id の正規形 → 候補の結果 */
   candidates: Map<string, Map<string, CandidateResult>>
-  /** 表 → 真の id の正規形 → `Res`（表示上の主キー。`⊥` は null。設計書 §1.6） */
+  /** 表 → 真の id の正規形 → `Res`（表示上の主キー。`⊥` は null。設計書 §1.3〜1.7 の強い順） */
   res: Map<string, Map<string, SqlValue | null>>
   /** 表 → 置く行（`SELECT *` と同じ列の並びの、アプリの表の行） */
   rows: Map<string, Record<string, SqlValue>[]>
   /** 死んでいる id（`Max` が削除の版）の正規形 */
   dead: Map<string, Set<string>>
-  /** 版ごと捨てる id（原則4）の正規形。表 → 正規形の集合 */
-  discarded: Map<string, Set<string>>
 }
 
 /* ------------------------------------------------------------------ *
- * 値の比較（設計書 §1.2.3・§1.11）—— SQLite に判定させる
+ * 値の比較（設計書 §1.2.3 と真の id の正規形）—— SQLite に判定させる
  * ------------------------------------------------------------------ */
 
-/** 値の種類の群と `julianday`（設計書 §1.2.3 の段1・段2）を SQLite に尋ねる道具。 */
+/** 値の種類の群と `julianday`（設計書 §1.2.3）を SQLite に尋ねる道具。 */
 export class ValueOracle {
   private readonly db = new Database(':memory:')
   /**
@@ -173,7 +174,7 @@ export class ValueOracle {
       case 0:
         return 0 // NULL どうしは同着
       case 1:
-        // 数値としてそのまま比べる（`CAST` は挟まない。設計書 §1.2.3 の軽微19）
+        // 数値としてそのまま比べる（`CAST` は挟まない。設計書 §1.2.3 の「群1 は数値のまま」）
         if (typeof a === 'bigint' && typeof b === 'bigint') {
           return a < b ? -1 : a > b ? 1 : 0
         }
@@ -187,7 +188,7 @@ export class ValueOracle {
   }
 
   /**
-   * 真の id の正規形（設計書 §1.11）。`CAST(x AS TEXT)` と同じ形にしてから
+   * 真の id の正規形。`CAST(x AS TEXT)` と同じ形にしてから
    * UTF-8 のバイト列で比べられるよう、文字列にして返す。
    */
   idKey(value: SqlValue): string {
@@ -223,8 +224,9 @@ function toBytes(value: SqlValue): Buffer {
 }
 
 /**
- * 版の順序 `≺`（設計書 §1.2.5）。`( _sns_ts, L, iid )` の辞書順、すべて等しければ
- * 種類（行の版 ＜ 削除の版）。負なら `a` が弱い。
+ * 版の順序 `≺`（設計書 §1.2.4〜1.2.5、付則1）。`( _sns_ts, L, iid )` の辞書順。負なら `a` が弱い。
+ *
+ * 付則1 のとおり種類では比べず、3つ組が同じなら 0（同着）を返す。
  */
 export function compareVersions(
   values: ValueOracle,
@@ -240,9 +242,7 @@ export function compareVersions(
     Buffer.from(a.instance, 'utf8'),
     Buffer.from(b.instance, 'utf8')
   )
-  if (byInstance !== 0) return byInstance
-  const rank = (version: Version): number => (version.kind === 'row' ? 0 : 1)
-  return compareNumbers(rank(a), rank(b))
+  return byInstance
 }
 
 /* ------------------------------------------------------------------ *
@@ -252,9 +252,8 @@ export function compareVersions(
 type ForeignKey = {
   /** 子側の列 */
   columns: string[]
+  /** 親の表。参照する列は親の主キー（付則4。{@link SchemaModel} の構築で確かめる） */
   parentTable: string
-  /** 親側の列（`REFERENCES t(id)` の `id`。省略されていれば親の主キー） */
-  parentColumns: string[]
   onDelete: string
 }
 
@@ -273,7 +272,7 @@ type TableMeta = {
 }
 
 /**
- * **置かない行にしてよいエラー**（設計書 §1.4 の白紙のリスト）。
+ * **置かない行にしてよいエラー**（設計書 §1.3〜1.7 の置かない行の白紙のリスト）。
  * ここに無いエラーで失敗したら、その行を置かない行にせず作り直しを中止する。
  */
 const UNPLACEABLE_CODES = new Set([
@@ -285,7 +284,7 @@ const UNPLACEABLE_CODES = new Set([
 ])
 
 /**
- * **かぶりを表すエラー**（設計書 §1.5）。`rowid` という名の列は宣言でき、
+ * **かぶりを表すエラー**（設計書 §1.3〜1.7 のかぶり）。`rowid` という名の列は宣言でき、
  * 明示した rowid の重複は `SQLITE_CONSTRAINT_ROWID` になる。
  */
 const COLLISION_CODES = new Set([
@@ -302,7 +301,7 @@ const PRIMARY_KEY_CODES = new Set([
 
 /** 一時 DB（判定用と、かぶりの当たりを見る使い捨て用）とスキーマの読み取り。 */
 class SchemaModel {
-  /** 強い順に候補を入れていく判定用の DB（設計書 §3.7.1） */
+  /** 強い順に候補を入れていく判定用の DB（設計書 §1.3〜1.7 の強い順） */
   readonly judge: Database.Database
   /** 候補2つの「かぶり」を見るための、毎回空にする DB */
   private readonly probe: Database.Database
@@ -316,12 +315,37 @@ class SchemaModel {
     for (const table of schema.tables) {
       this.tables.set(table.name, this.readMeta(table))
     }
+    this.checkReferencesPrimaryKey(schema)
     this.order = topologicalOrder(this.tables)
+  }
+
+  /**
+   * 同期する表を親とする外部キーが、親の主キーを参照していること（付則4）。
+   * そうでないスキーマは `setupSync` が断るので、参照実装では扱わない。
+   */
+  private checkReferencesPrimaryKey(schema: OracleSchema): void {
+    for (const table of schema.tables) {
+      const keys = this.judge.pragma(`foreign_key_list("${table.name}")`) as {
+        id: number
+        table: string
+        to: string | null
+      }[]
+      for (const key of keys) {
+        const parent = this.tables.get(key.table)
+        if (parent === undefined || key.to === null) continue
+        if (parent.primaryKey.length === 1 && parent.primaryKey[0] === key.to) {
+          continue
+        }
+        throw new Error(
+          `参照実装: ${table.name} の外部キーが ${key.table} の主キーでない列 ${key.to} を参照している（付則4）`
+        )
+      }
+    }
   }
 
   private static open(schema: OracleSchema): Database.Database {
     const db = new Database(':memory:')
-    // 外部キーは §1.4 の表示値の規則でこちらが決める（SQLite には検査させない）
+    // 外部キーは §1.3〜1.7 の表示値の規則でこちらが決める（SQLite には検査させない）
     db.pragma('foreign_keys = OFF')
     for (const table of schema.tables) {
       db.exec(table.ddl)
@@ -367,11 +391,8 @@ class SchemaModel {
       return {
         columns: sorted.map((row) => row.from),
         parentTable: sorted[0].table,
-        // `to` が NULL なら親の主キーを指している
-        parentColumns: sorted.map((row) => row.to).every((to) => to === null)
-          ? []
-          : sorted.map((row) => row.to as string),
-        onDelete: sorted[0].on_delete.toUpperCase(),
+        // 綴りの揃え方は src/rows/on-delete.ts の missingParentAction と同じ（前後の空白を落として大文字）
+        onDelete: sorted[0].on_delete.trim().toUpperCase(),
       }
     })
     return {
@@ -386,18 +407,12 @@ class SchemaModel {
     }
   }
 
-  /** 親側の列（省略されていれば親の主キー）。 */
-  parentColumnsOf(key: ForeignKey): string[] {
-    if (key.parentColumns.length > 0) return key.parentColumns
-    const parent = this.tables.get(key.parentTable)
-    return parent === undefined ? [] : parent.primaryKey
-  }
-
   /**
-   * 候補 `row` を判定用の DB へ入れてみる（設計書 §1.4 の「強い順に INSERT する」）。
+   * 候補 `row` を判定用の DB へ入れてみる（設計書 §1.3〜1.7 の「強い順に一時 DB へ入れる」）。
    *
-   * @returns 入ったら `placed`、UNIQUE で落ちたら `unique`、それ以外の制約で落ちたら
-   *   `unplaceable`（置かない行）
+   * @returns 入ったら `placed`、UNIQUE・主キーで落ちたら `unique`、白紙のリスト
+   *   （{@link UNPLACEABLE_CODES}）のエラーで落ちたら `unplaceable`（置かない行）
+   * @throws 白紙のリストに無いエラー（資源の不足など。置かない行と読み替えない）
    */
   insertIntoJudge(
     table: TableMeta,
@@ -418,7 +433,7 @@ class SchemaModel {
       }
       if (!UNPLACEABLE_CODES.has(code)) {
         // 資源の不足（SQLITE_NOMEM / SQLITE_FULL など）を「その行は置けない」と読み替えると、
-        // 表が丸ごと空になる。設計書 §1.4 のとおり、白紙のリストに無いエラーは中止する
+        // 表が丸ごと空になる。設計書 §1.3〜1.7 のとおり、白紙のリストに無いエラーは中止する
         throw error
       }
       return { outcome: 'unplaceable', reason }
@@ -426,7 +441,7 @@ class SchemaModel {
   }
 
   /**
-   * 候補2つが**かぶる**か（設計書 §1.5）。空の DB へ片方を入れ、もう片方を入れて
+   * 候補2つが**かぶる**か（設計書 §1.3〜1.7 のかぶり）。空の DB へ片方を入れ、もう片方を入れて
    * かぶりのエラーになるかどうかで決める。**どのエラーになったか**も返す
    * （主キーの衝突は `SQLITE_CONSTRAINT_PRIMARYKEY` / `SQLITE_CONSTRAINT_ROWID`）。
    *
@@ -458,19 +473,6 @@ class SchemaModel {
     return this.judge
       .prepare(`SELECT * FROM "${table.name}" WHERE rowid = ?`)
       .get(rowid) as Record<string, SqlValue>
-  }
-
-  /** 判定用の DB を引いて、値の組を持つ置く行を探す（照合順序が効く）。 */
-  findPlaced(
-    table: TableMeta,
-    columns: string[],
-    values: SqlValue[]
-  ): Record<string, SqlValue> | null {
-    const where = columns.map((column) => `"${column}" IS ?`).join(' AND ')
-    const row = this.judge
-      .prepare(`SELECT * FROM "${table.name}" WHERE ${where}`)
-      .get(...(values as never[]))
-    return (row as Record<string, SqlValue> | undefined) ?? null
   }
 
   close(): void {
@@ -534,14 +536,22 @@ function topologicalOrder(tables: Map<string, TableMeta>): string[] {
 /**
  * 版の集合から、設計書 §1 の定義どおりに「アプリの表の見え方」を計算する。
  *
- * 手順は設計書の順番そのまま:
+ * 表は親が先の順に回る（子の表示値と「親が削除されている」の判定に親の結果が要る）。表ごとの手順は
+ * 設計書 §1.3〜1.7 の順番そのまま:
  *
- * 1. `Max`（§1.2.5）—— キーごとに最強の版
- * 2. 候補（§1.3）—— `Max` が行の版の id
- * 3. 表示値（§1.4）—— 外部キーの読み替え、置かない行、1:1 の主キー
- * 4. 強い順に一時 DB へ入れる（§1.6）—— 入れば置く行、UNIQUE で落ちれば隠れた行、
- *    ほかの制約で落ちれば置かない行
- * 5. 勝者（§1.5）と `Res`（§1.6）
+ * 1. `Max`（§1.2.4〜1.2.5）—— キーごとに最強の版
+ * 2. 候補 —— `Max` が行の版の id。削除の版の id は死んでいて、子から見た「消えた親」になる
+ * 3. 表示値 —— 外部キーの読み替え、1:1 の主キーの読み替え。親が置かれていなければ、
+ *    宣言された `ON DELETE` に従う
+ *    - 親が削除されている（`Max` が削除の版か、親自身が同じ理由で入らない）→
+ *      **親が削除されているので置かない行**（原則4・付則3）。版は捨てない。
+ *      その子（孫）も同じ親の削除を原因として入らない
+ *    - それ以外で親が置かれていない → 置かない行
+ * 4. 主キーが NULL の候補は置かない行
+ * 5. 版の順序の強い順に一時 DB へ入れる —— 入れば置く行、UNIQUE・主キーで落ちれば
+ *    隠れた行、白紙のリスト（NOT NULL・CHECK など。{@link UNPLACEABLE_CODES}）の
+ *    エラーで落ちれば置かない行。**それ以外のエラーは例外にして中止する**
+ * 6. 勝者と `Res` —— 隠れた行ごとに、かぶった置く行のうち最も強いもの
  */
 export function derive(versions: Version[], schema: OracleSchema): Derived {
   const values = new ValueOracle()
@@ -558,7 +568,7 @@ function deriveWith(
   model: SchemaModel,
   versions: Version[]
 ): Derived {
-  // 1. Max（§1.2.5）
+  // 1. Max（§1.2.4〜1.2.5）
   const max = new Map<string, Map<string, Version>>()
   for (const name of model.tables.keys()) max.set(name, new Map())
   for (const version of versions) {
@@ -579,9 +589,9 @@ function deriveWith(
   const res = new Map<string, Map<string, SqlValue | null>>()
   const rows = new Map<string, Record<string, SqlValue>[]>()
   const dead = new Map<string, Set<string>>()
-  const discarded = new Map<string, Set<string>>()
   /**
-   * 消えている id（原則4）。表 → 真の id の正規形 → 大元の削除。
+   * 削除されている id と、親が削除されているので入らない id（原則4）。
+   * 表 → 真の id の正規形 → 大元の削除。
    * 表は親が先の順（`model.order`）に回るので、子を見るときには親のぶんが揃っている。
    */
   const gone = new Map<string, Map<string, GoneCause>>()
@@ -593,10 +603,9 @@ function deriveWith(
     const tableRes = new Map<string, SqlValue | null>()
     const tableRows: Record<string, SqlValue>[] = []
     const tableDead = new Set<string>()
-    const tableDiscarded = new Set<string>()
     const tableGone = new Map<string, GoneCause>()
 
-    // 2. 候補（§1.3）。死んでいる id は `dead` として返す
+    // 2. 候補。死んでいる id は `dead` として返す
     const living: Version[] = []
     for (const [key, version] of perTable) {
       if (version.kind === 'row') living.push(version)
@@ -607,7 +616,7 @@ function deriveWith(
       }
     }
 
-    // 3〜4. 版の順序の強い順、同着は真の id の正規形の小さい順（§1.6）
+    // 3〜5. 版の順序の強い順、同着は真の id の正規形の小さい順（§1.3〜1.7 の強い順）
     living.sort((a, b) => {
       const byVersion = compareVersions(values, b, a)
       if (byVersion !== 0) return byVersion
@@ -622,29 +631,20 @@ function deriveWith(
 
     for (const version of living) {
       const key = values.idKey(version.id)
-      const shown = displayValues(
-        values,
-        model,
-        table,
-        version,
-        res,
-        candidates,
-        gone
-      )
-      if (shown.kind === 'discard') {
-        // 親が削除されている。版ごと捨てる（原則4）
+      const shown = displayValues(values, model, table, version, res, gone)
+      if (shown.kind === 'parentDeleted') {
+        // 親が削除されている間は入らない（原則4・付則3）。版は捨てない
         tableCandidates.set(key, {
           table: name,
           key,
-          placement: 'discarded',
+          placement: 'parentDeleted',
           display: { ...(version.content ?? {}) },
           reason: `親が削除されている（${shown.cause.table}:${shown.cause.key}）`,
           reasonKind: 'parent',
           cause: shown.cause,
         })
         tableRes.set(key, null)
-        tableDiscarded.add(key)
-        // 捨てられた行を親とする孫も捨てる（連鎖。大元の削除をそのまま伝える）
+        // この行を親とする孫も入らない（連鎖。大元の削除をそのまま伝える）
         tableGone.set(key, shown.cause)
         continue
       }
@@ -654,7 +654,7 @@ function deriveWith(
           key,
           placement: 'unplaceable',
           display: { ...(version.content ?? {}) },
-          reason: '親が置かれていない（設計書 §1.4）',
+          reason: '親が置かれていない（設計書 §1.3〜1.7）',
           reasonKind: 'parent',
         })
         tableRes.set(key, null)
@@ -709,7 +709,7 @@ function deriveWith(
       }
     }
 
-    // 5. 勝者（§1.5）—— かぶった置く行のうち、いちばん強いもの。置く行は強い順に
+    // 6. 勝者 —— かぶった置く行のうち、いちばん強いもの。置く行は強い順に
     //    並んでいるので、先に当たったものが勝者
     for (const row of hidden) {
       // **エラーの種別で分岐しない。** 主キーと UNIQUE の両方に当たる候補では
@@ -731,7 +731,7 @@ function deriveWith(
       const entry = tableCandidates.get(row.key) as CandidateResult
       if (winner === undefined) {
         // かぶる相手が見つからない（部分索引の当たり方などで起こりうる）。
-        // 設計書 §1.6 の表の「それ以外」に落とし、Res は ⊥
+        // 勝者の無い隠れた行として、Res は ⊥ にする
         tableRes.set(row.key, null)
         continue
       }
@@ -743,11 +743,10 @@ function deriveWith(
     res.set(name, tableRes)
     rows.set(name, tableRows)
     dead.set(name, tableDead)
-    discarded.set(name, tableDiscarded)
     gone.set(name, tableGone)
   }
 
-  return { candidates, res, rows, dead, discarded }
+  return { candidates, res, rows, dead }
 }
 
 /** 表示上の主キー（主キーが1列である前提）。 */
@@ -762,20 +761,20 @@ function displayPrimaryKey(
 type DisplayOutcome =
   /** 置ける（表示値が決まった） */
   | { kind: 'values'; display: Record<string, SqlValue> }
-  /** 置かない行。版は残る */
+  /** 置かない行 */
   | { kind: 'unplaceable' }
-  /** 版ごと捨てる（原則4）。`cause` は削除されている親 */
-  | { kind: 'discard'; cause: GoneCause }
+  /** 親が削除されているので置かない行（原則4）。`cause` は大元の削除 */
+  | { kind: 'parentDeleted'; cause: GoneCause }
 
 /**
- * 表示値（設計書 §1.4、原則4）。
+ * 表示値（設計書 §1.3〜1.7、原則4）。
  *
  * 外部キーの列は、同期する親を指していれば `Res_p` で読み替える。親が置かれていなければ
  * 宣言された `ON DELETE` に従う。主キーが親を指している（1:1）表では、主キーも読み替える。
  *
- * 親が置かれていないまま落ちるとき、その親が**削除されている**（または同じ規則で
- * 捨てられた）なら、置かない行ではなく **`discard`**（原則4）。単に届いていない・
- * 制約で置けない・隠れているだけなら、従来どおり置かない行のまま。
+ * 親が置かれていないまま落ちるとき、その親が**削除されている**（または親自身が同じ理由で
+ * 入らない）なら **`parentDeleted`**（原則4・付則3）。単に届いていない・制約で置けない・
+ * 隠れているだけなら置かない行。どちらも版は残り、アプリの表には入らない。
  */
 function displayValues(
   values: ValueOracle,
@@ -783,7 +782,6 @@ function displayValues(
   table: TableMeta,
   version: Version,
   res: Map<string, Map<string, SqlValue | null>>,
-  candidates: Map<string, Map<string, CandidateResult>>,
   gone: Map<string, Map<string, GoneCause>>
 ): DisplayOutcome {
   const display: Record<string, SqlValue> = {}
@@ -791,32 +789,27 @@ function displayValues(
     display[column] = version.content?.[column] ?? null
   }
   for (const key of table.foreignKeys) {
-    if (!model.tables.has(key.parentTable)) continue // 同期しない表は真の値のまま（§1.4）
+    if (!model.tables.has(key.parentTable)) continue // 同期しない表は真の値のまま（§1.3〜1.7 の表示値）
     const trueValues = key.columns.map((column) => display[column] ?? null)
     // 複合外部キーで1列でも NULL なら、SQLite は検査しない（そのまま置く）
     if (trueValues.some((value) => value === null)) continue
-    const resolved = resolveParent(
-      values,
-      model,
-      key,
-      trueValues,
-      res,
-      candidates
-    )
+    const resolved = resolveParent(values, key, trueValues, res)
     if (resolved !== null) {
       key.columns.forEach((column, index) => {
         display[column] = resolved[index]
       })
       continue
     }
-    // 親が置かれていないとき（§1.4 の下の表）
+    // 親が置かれていないとき（§1.3〜1.7）
     const isPrimary =
       key.columns.length === table.primaryKey.length &&
       key.columns.every((column) => table.primaryKey.includes(column))
-    // 落ちるときの行き先。原因が「削除されている親」なら捨てる、でなければ置かない行
-    const cause = goneParent(values, model, key, trueValues, gone)
+    // 落ちるときの行き先。原因が「削除されている親」なら parentDeleted、でなければ置かない行
+    const cause = goneParent(values, key, trueValues, gone)
     const out = (): DisplayOutcome =>
-      cause === null ? { kind: 'unplaceable' } : { kind: 'discard', cause }
+      cause === null
+        ? { kind: 'unplaceable' }
+        : { kind: 'parentDeleted', cause }
     switch (key.onDelete) {
       case 'SET NULL': {
         if (isPrimary) return out() // 1:1 の主キーは NULL にできない
@@ -833,9 +826,7 @@ function displayValues(
         if (defaults.some((value) => value === undefined)) return out()
         const asValues = defaults as SqlValue[]
         // 既定値の親が置かれていなければ、子は生き残れない
-        if (
-          resolveParent(values, model, key, asValues, res, candidates) === null
-        ) {
+        if (resolveParent(values, key, asValues, res) === null) {
           return out()
         }
         key.columns.forEach((column, index) => {
@@ -852,30 +843,20 @@ function displayValues(
 }
 
 /**
- * 消えている親（原則4）。削除の版が `Max` か、親自身が同じ規則で捨てられたか。
- *
- * 分けられるのは**親の主キーを指している外部キーだけ**。主キー以外の `UNIQUE` 列を
- * 指しているときは、その値を持っていた親がどれだったかが決まらず、「どの削除が原因か」
- * を答えられないので `null`（＝従来どおり置かない行）。
+ * 削除されている親（原則4・付則3）。親の `Max` が削除の版か、親自身が同じ理由で
+ * 入らないか。どちらでもなければ `null`。
  */
 function goneParent(
   values: ValueOracle,
-  model: SchemaModel,
   key: ForeignKey,
   trueValues: SqlValue[],
   gone: Map<string, Map<string, GoneCause>>
 ): GoneCause | null {
-  const parent = model.tables.get(key.parentTable) as TableMeta
-  const parentColumns = model.parentColumnsOf(key)
-  const isParentPrimaryKey =
-    parentColumns.length === parent.primaryKey.length &&
-    parentColumns.every((column) => parent.primaryKey.includes(column))
-  if (!isParentPrimaryKey || parentColumns.length !== 1) return null
   return gone.get(key.parentTable)?.get(values.idKey(trueValues[0])) ?? null
 }
 
 /**
- * 既定値が**定数の字面**なら、その値（設計書 §1.4）。字面でなければ `undefined`。
+ * 既定値が**定数の字面**なら、その値（設計書 §1.3〜1.7 の `SET DEFAULT`）。字面でなければ `undefined`。
  * 字面かどうかは一時 DB に評価させる（`SELECT <既定値>`）。
  */
 function literalDefault(
@@ -897,49 +878,17 @@ function literalDefault(
 }
 
 /**
- * 親の行を探す（設計書 §1.4 の表の1〜4行目）。見つからなければ `null`。
- *
- * - 親の主キーを指しているなら `Res_p`
- * - 主キー以外の UNIQUE 列を指しているなら、その値の組を持つ**置く行**、無ければ
- *   **隠れた行**の勝者
+ * 親の行の表示上の主キー（設計書 §1.3〜1.7 の表示値）。親が置かれていなければ `null`。
+ * 外部キーは親の主キーを参照する（付則4）ので、親の `Res_p` を引く。
  */
 function resolveParent(
   values: ValueOracle,
-  model: SchemaModel,
   key: ForeignKey,
   trueValues: SqlValue[],
-  res: Map<string, Map<string, SqlValue | null>>,
-  candidates: Map<string, Map<string, CandidateResult>>
+  res: Map<string, Map<string, SqlValue | null>>
 ): SqlValue[] | null {
-  const parent = model.tables.get(key.parentTable) as TableMeta
-  const parentColumns = model.parentColumnsOf(key)
-  const isParentPrimaryKey =
-    parentColumns.length === parent.primaryKey.length &&
-    parentColumns.every((column) => parent.primaryKey.includes(column))
-
-  if (isParentPrimaryKey && parentColumns.length === 1) {
-    const resolved = res.get(key.parentTable)?.get(values.idKey(trueValues[0]))
-    return resolved === undefined || resolved === null ? null : [resolved]
-  }
-
-  const placed = model.findPlaced(parent, parentColumns, trueValues)
-  if (placed !== null) {
-    return parentColumns.map((column) => placed[column] ?? null)
-  }
-  // 置く行が無ければ隠れた行の勝者（照合順序を当てずに比べる。模組冒頭の「限界」）
-  for (const entry of candidates.get(key.parentTable)?.values() ?? []) {
-    if (entry.placement !== 'hidden' || entry.winner === undefined) continue
-    const same = parentColumns.every(
-      (column, index) =>
-        values.idKey(entry.display[column] ?? null) ===
-        values.idKey(trueValues[index])
-    )
-    if (!same) continue
-    const winner = candidates.get(key.parentTable)?.get(entry.winner)
-    if (winner === undefined) continue
-    return parentColumns.map((column) => winner.display[column] ?? null)
-  }
-  return null
+  const resolved = res.get(key.parentTable)?.get(values.idKey(trueValues[0]))
+  return resolved === undefined || resolved === null ? null : [resolved]
 }
 
 /* ------------------------------------------------------------------ *
@@ -947,7 +896,7 @@ function resolveParent(
  * ------------------------------------------------------------------ */
 
 /**
- * 見え方 `Φ(F)`（設計書 §1.7）を、`tools/explore/state.ts` の `snapshotData` ＋
+ * 見え方 `Φ(F)`（設計書 §1.3〜1.7 の見え方）を、`tools/explore/state.ts` の `snapshotData` ＋
  * `tools/explore/history.ts` の `viewOf` と**同じ形**の JSON にする。
  *
  * すなわち `[[ "表:id", { …列…, 時刻列は julianday } ], …]` を鍵の昇順に並べたもの。

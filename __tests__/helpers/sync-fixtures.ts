@@ -8,7 +8,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
-import { setupRowsLedgers } from '../../src/setup'
+import { setupRowsLedgers } from '../../src/setup/rows-ledgers'
 import { migrateToRows } from '../../src/rows/migrate'
 import { newInstanceId } from '../../src/rows/meta'
 import { SyncConfig, TableConfig } from '../../src/types'
@@ -124,8 +124,9 @@ export function createSyncFixture(name: string): {
         updatedAt TEXT NOT NULL
       )
     `)
-    // 親と主キーを共有する 1:1 の表。親が畳まれると子のidそのものが動くため、
-    // 動いた先の席が既に埋まっている形を作れる。
+    // 親と主キーを共有する 1:1 の表。
+    // 親が統合されると、子行はユーザーテーブルで統合先の親の主キーで表示される。
+    // そのため、表示される主キーに別の子行が既にある形を作れる。
     db.exec(`
       CREATE TABLE tag_profiles (
         id        TEXT PRIMARY KEY REFERENCES tags(id) ON DELETE CASCADE,

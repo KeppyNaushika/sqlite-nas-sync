@@ -14,14 +14,26 @@
  *
  * ## 時計
  *
- * トリガは `_changelog.changedAt` と `_tombstone.deletedAt` に**壁時計**を刻む。
+ * アプリの操作はトリガーを通って**壁時計**を刻む。刻まれるのは次の3か所である。
+ *
+ * - `_changelog.changedAt`（変更の通知）
+ * - `_tombstone.deletedAt`（削除を実行した時刻）
+ * - 削除の版の `_tombstone._sns_ts`。原則2 により、削除の版の順序用の時刻は
+ *   「実行した時刻」と「手元の Max」の大きい方なので、ふつうは `deletedAt` と同じ値になる。
+ *   統合した行の削除で隠れていた側に書く墓標（原則3）も同じ値を持つ。さらに、
+ *   同じ操作の中で消してから作り直した行の版は、単調化でこの値まで引き上がる
+ *   （`_sns_rows_<表>._sns_ts`）
+ *
  * そのまま使うと、別々の端末への操作 x, y を「x → y」と「y → x」の順に当てたとき、
  * 刻まれる時刻の前後が入れ替わり、**結果の状態が同じにならない**。すると
  * 「別々の端末への操作は入れ替えても結果が同じ」という順序の畳み込み
  * （partial order reduction）の前提が崩れ、畳むと反例を見逃す。しかも同じ列を
  * 再生しても同じミリ秒に収まるかどうかで結果が変わり、反例を再現できない。
+ * `_sns_ts` は版の順序そのものなので、ここが揺れると同じ瞬間の削除が端末ごとに
+ * 違う強さになり、状態の重複排除も効かなくなる。
  *
- * そこで世界に**時計 C** を1本持たせ、操作が刻んだ時刻は操作の直後に C へ書き換える。
+ * そこで世界に**時計 C** を1本持たせ、操作が刻んだ時刻は操作の直後に C へ書き換える
+ * （{@link applyOpWithClock}）。
  *
  * - 操作は C を名乗る（同期を挟まない操作は、端末が違っても**同じ瞬間**に起きた扱い）
  * - `tick` 遷移で C を進める（以後の操作は、それまでのどの時刻より後を名乗る）
@@ -39,7 +51,13 @@
  * 表せる時刻の並びは「同着」「x が先」「y が先」の3通りとも残る
  * （`x, tick, y` と `y, tick, x` と `x, y`）。
  *
- * **同期そのものが刻む時刻（畳みの墓標、`_id_merge.mergedAt` など）は書き換えない。**
+ * ### 同期の中では書き換えない
+ *
+ * 取り込みは相手の版を**そのまま**写す（`_sns_ts` も `deletedAt` も相手の値のまま）。
+ * 相手の値は相手の操作の直後に C へ書き換え済みなので、写った先でも C の値になる。
+ * したがって書き換えるのは操作の直後だけでよく、同期の後に追いかける必要は無い。
+ *
+ * **同期そのものが刻む時刻（取り込みで `_changelog` に書く通知の `changedAt`）は書き換えない。**
  * それはライブラリの振る舞いそのものなので、触ると本物を駆動したことにならない。
  * その代わり、同期の中の2つの刻みが同じミリ秒に収まるかどうかは実行ごとに揺れうる
  * （検査器の限界として docs/exhaustive-check.md に書いてある）。
@@ -52,12 +70,17 @@ import * as path from 'path'
 import Database from 'better-sqlite3'
 import type { SyncConfig, SyncResult, TableConfig } from '../../src/types'
 import { ExploreConfig, TABLE_SETS, idleSuppressionActive } from './config'
-import { checkAfterRebuildCommit } from './judgments'
+import {
+  checkAfterRebuildCommit,
+  checkDeletionPrinciples,
+  witnessBeforeOp,
+} from './judgments'
 import type { OracleSchema } from './oracles/rows-d1'
 import { Op, Transition, applyOp, clientName } from './ops'
 
 /**
- * 案A の作り直しの差し込み口（設計書 §8.2 の `REQUIRED_HOOKS`）。
+ * 作り直しの差し込み口（`src/rows/rebuild.ts` の `RowsRebuildHooks`）。どれが何に使われるかは
+ * docs/exhaustive-check.md の「`src/` 側の差し込み口」にある。
  *
  * `src/rows/rebuild.ts` の形をそのまま写したもの（`src/` を import すると
  * 「壊した版を駆動する」ができなくなるので、型だけ手で写す）。
@@ -82,17 +105,15 @@ export type RuntimeIn = {
   idle?: unknown
 }
 
-/** 作り直しを外から回す口（`REQUIRED_HOOKS` の (1)・(4)）。 */
+/** 作り直しを外から回す口。 */
 export type RebuildApi = {
   /** 主スレッドで計算して適用する（ワーカーは1回17ミリ秒かかるので使わない） */
   rebuildOnce: (
     db: Database.Database,
     options: {
       tables: string[]
-      targets?: string[]
       state?: unknown
       hooks?: RebuildHooksIn
-      mergeAfterSkips?: number
     }
   ) => {
     status: string
@@ -108,13 +129,10 @@ export type RebuildApi = {
   ) => number
   /** まっさらな記憶 */
   createRebuildState: () => unknown
-  /** `instanceId` を外から与える口（`REQUIRED_HOOKS` の (6)） */
-  createRowsTables: (
-    db: Database.Database,
-    tables: { name: string }[],
-    instanceId: string
-  ) => void
-  /** 案A の仕掛けを丸ごと取り付ける（差し込み口の筋書きで、素の DB を仕立てる） */
+  /**
+   * 案A の仕掛けを丸ごと取り付ける（雛形と筋書きの DB を仕立てる）。
+   * `instanceId` はここから `src/rows/schema.ts` の `createRowsTables` へそのまま渡る
+   */
   migrateToRows: (
     db: Database.Database,
     options: { tables: { name: string }[]; instanceId?: string }
@@ -132,110 +150,97 @@ export type Library = {
   /**
    * 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_sync_meta`）を作る。
    *
-   * 旧方式の `setupChangelog` は**段階6 で消えた**ので、雛形の DB は
-   * `setupSync`（`src/index.ts`）と同じ順で仕立てる —— `migrateToRows` で案A の仕掛けを
-   * 取り付けてから、この帳簿を作る
+   * 雛形の DB は `setupSync`（`src/index.ts`）と同じ順で仕立てる —— `migrateToRows` で
+   * 案A の仕掛けを取り付けてから、この帳簿を作る
    */
   setupRowsLedgers: (db: Database.Database) => void
-  /** 案A の作り直しの口。旧方式の版を駆動しているときは `null` */
-  rebuild: RebuildApi | null
-  /**
-   * 無駄な転送の抑制の覚えを作る口（`src/sync/idle.js`）。
-   * 抑制を持たない版を駆動しているときは `null`
-   */
-  createIdleMemory: ((enabled?: boolean) => unknown) | null
+  /** 作り直しの口 */
+  rebuild: RebuildApi
+  /** 無駄な転送の抑制の覚えを作る口（`src/sync/idle.ts`） */
+  createIdleMemory: (enabled?: boolean) => unknown
 }
 
 /**
  * 端末の `instanceId`（設計書 §3.2 の `iid`）。
  *
  * **乱数のままにしない。** `iid` は同着の最後の鍵なので、乱数だと1回の実行で
- * どちらの向きを調べたのかが分からず、再生もできない。端末の番号の順に並ぶ字面を
- * 与えると、端末の入れ替え（reduction.ts の対称性）が `iid` の順位も一緒に
- * 入れ替えることになり、畳み込みがそのまま効く。
+ * どちらの向きを調べたのかが分からず、再生もできない。端末の番号の順に並ぶ字面を与える
+ * （`iid-X` ＜ `iid-x` ＜ `iid-y`。バイト列の比較で端末 a ＜ b ＜ c）。
  *
- * **限界は残る**: この形では「端末 a の iid が端末 b より小さい」側しか調べられない
+ * **端末 a と b は大文字小文字だけが違う。** 版の比較は `instanceId` をバイト列で比べる
+ * （`src/rows/versions.ts` の `compareVersions`、トリガーの `COLLATE BINARY`）。
+ * 大文字小文字を畳んで比べる実装では、この2つが同着になり、`_sns_ts` も `_sns_lamport` も
+ * 等しい2つの版の勝ち負けが決まらない（`--mutant no-binary-collation`）。本物の
+ * `instanceId` は小文字の16進なのでこの形は起きないが、比較がバイト列であることは
+ * 利用者の値によらず守るべき決まりなので、ここで踏めるようにしておく。
+ *
+ * **限界**: この形では「端末 a の iid が端末 b より小さい」側しか調べられない
  * （tools/explore/normalize.ts の instanceLabels の「限界」）。逆向きを調べるには
  * ここを逆順にして走らせ直すこと。
  */
 export function instanceIdFor(index: number): string {
-  return `iid-${clientName(index)}`
+  const labels = ['iid-X', 'iid-x', 'iid-y']
+  const label = labels[index]
+  if (label === undefined) {
+    throw new Error(`端末 ${clientName(index)} の instanceId を決めていない`)
+  }
+  return label
 }
 
 /**
  * コンパイル済みのライブラリを読み込む。
  *
- * @param libDir - `sync.js` と `setup/index.js` を持つディレクトリ
+ * 口が1つでも欠けていれば例外で止める（黙って一部の判定を外して走らせると、
+ * 調べていないのに「反例なし」と出る）。
+ *
+ * @param libDir - コンパイル済みの `src/` のディレクトリ（`sync.js` などを持つ）
  */
 export function loadLibrary(libDir: string): Library {
-  const syncPath = path.join(libDir, 'sync.js')
-  const setupPath = path.join(libDir, 'setup', 'index.js')
-  for (const file of [syncPath, setupPath]) {
+  const load = <T>(relative: string[], names: (keyof T)[]): T => {
+    const file = path.join(libDir, ...relative)
     if (!fs.existsSync(file)) {
       throw new Error(
         `駆動するライブラリが見つからない: ${file}（npm run explore で tools と一緒にコンパイルされる）`
       )
     }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const loaded = require(file) as T
+    for (const name of names) {
+      if (typeof loaded[name] !== 'function') {
+        throw new Error(`${file} に ${String(name)} が無い`)
+      }
+    }
+    return loaded
   }
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const sync = require(syncPath) as Pick<Library, 'performSync'>
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const setup = require(setupPath) as Pick<Library, 'setupRowsLedgers'>
-  if (typeof setup.setupRowsLedgers !== 'function') {
-    throw new Error(
-      `${setupPath} に setupRowsLedgers が無い（案A の版を駆動していない）`
-    )
-  }
+  const sync = load<Pick<Library, 'performSync'>>(['sync.js'], ['performSync'])
+  const setup = load<Pick<Library, 'setupRowsLedgers'>>(
+    ['setup', 'rows-ledgers.js'],
+    ['setupRowsLedgers']
+  )
+  const idle = load<Pick<Library, 'createIdleMemory'>>(
+    ['sync', 'idle.js'],
+    ['createIdleMemory']
+  )
+  const rebuild = load<
+    Pick<RebuildApi, 'rebuildOnce' | 'rebuildDiffCount' | 'createRebuildState'>
+  >(
+    ['rows', 'rebuild.js'],
+    ['rebuildOnce', 'rebuildDiffCount', 'createRebuildState']
+  )
+  const migrate = load<Pick<RebuildApi, 'migrateToRows'>>(
+    ['rows', 'migrate.js'],
+    ['migrateToRows']
+  )
   return {
     performSync: sync.performSync,
     setupRowsLedgers: setup.setupRowsLedgers,
-    rebuild: loadRebuildApi(libDir),
-    createIdleMemory: loadIdleApi(libDir),
-  }
-}
-
-/**
- * 無駄な転送の抑制の口を読み込む。**無ければ `null`**（抑制を持たない版を
- * 駆動しているあいだは、毎回上げ・毎回読む昔の振る舞いになる）。
- */
-function loadIdleApi(libDir: string): ((enabled?: boolean) => unknown) | null {
-  const idlePath = path.join(libDir, 'sync', 'idle.js')
-  if (!fs.existsSync(idlePath)) return null
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const idle = require(idlePath) as {
-    createIdleMemory?: (enabled?: boolean) => unknown
-  }
-  return typeof idle.createIdleMemory === 'function'
-    ? idle.createIdleMemory
-    : null
-}
-
-/**
- * 案A の作り直しの口を読み込む。**無ければ `null`**（旧方式の版を駆動している
- * あいだ、判定8・10・13・20・21 は黙る。偽の反例を出さないため）。
- */
-function loadRebuildApi(libDir: string): RebuildApi | null {
-  const rebuildPath = path.join(libDir, 'rows', 'rebuild.js')
-  const schemaPath = path.join(libDir, 'rows', 'schema.js')
-  const migratePath = path.join(libDir, 'rows', 'migrate.js')
-  for (const file of [rebuildPath, schemaPath, migratePath]) {
-    if (!fs.existsSync(file)) return null
-  }
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const rebuild = require(rebuildPath) as Pick<
-    RebuildApi,
-    'rebuildOnce' | 'rebuildDiffCount' | 'createRebuildState'
-  >
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const schema = require(schemaPath) as Pick<RebuildApi, 'createRowsTables'>
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const migrate = require(migratePath) as Pick<RebuildApi, 'migrateToRows'>
-  return {
-    rebuildOnce: rebuild.rebuildOnce,
-    rebuildDiffCount: rebuild.rebuildDiffCount,
-    createRebuildState: rebuild.createRebuildState,
-    createRowsTables: schema.createRowsTables,
-    migrateToRows: migrate.migrateToRows,
+    rebuild: {
+      rebuildOnce: rebuild.rebuildOnce,
+      rebuildDiffCount: rebuild.rebuildDiffCount,
+      createRebuildState: rebuild.createRebuildState,
+      migrateToRows: migrate.migrateToRows,
+    },
+    createIdleMemory: idle.createIdleMemory,
   }
 }
 
@@ -279,29 +284,6 @@ export const DDL: Record<string, string> = {
      username  TEXT NOT NULL UNIQUE,
      email     TEXT NOT NULL UNIQUE,
      updatedAt TEXT NOT NULL
-   )`,
-  /**
-   * 時刻列が **INTEGER**（設計書 §1.2.3 の群1）。行の時刻はエポックのミリ秒
-   * （tools/explore/ops.ts の `timeValuesFor`）。
-   *
-   * ここだけ `__tests__/helpers/sync-fixtures.ts` に写しが無い（検査器のための表）。
-   */
-  epoch_notes: `CREATE TABLE epoch_notes (
-     id        TEXT PRIMARY KEY,
-     name      TEXT NOT NULL UNIQUE,
-     updatedAt INTEGER NOT NULL
-   )`,
-  /**
-   * 時刻列が **`COLLATE NOCASE` で宣言された TEXT**（設計書 §1.2.3 の群2）。行の時刻は
-   * `julianday` で読めない文字列で、**大文字小文字だけが違う**組を含む。
-   *
-   * 素の比較（＝列の宣言の照合順序）に任せると `TS-A` と `ts-a` が同着になり、
-   * 値が違うのに前後が付かない。`COLLATE BINARY` を明示してある実装ではバイト列で前後が付く。
-   */
-  nocase_notes: `CREATE TABLE nocase_notes (
-     id        TEXT PRIMARY KEY,
-     name      TEXT NOT NULL UNIQUE,
-     updatedAt TEXT COLLATE NOCASE NOT NULL
    )`,
 }
 
@@ -411,7 +393,8 @@ function openClients(dir: string, config: ExploreConfig): Client[] {
 /**
  * 空の世界の雛形を作る（ワーカーの起動時に1回）。以後の世界はこの複製から作る。
  *
- * DDL と `setupChangelog` を世界ごとに流すと、それだけで端末あたり数ミリ秒かかる。
+ * DDL と案A の仕掛けの取り付け（`migrateToRows`）を世界ごとに流すと、それだけで
+ * 端末あたり数ミリ秒かかる。
  */
 export function buildTemplate(
   lib: Library,
@@ -429,11 +412,6 @@ export function buildTemplate(
     for (const table of TABLE_SETS[config.tableSet]) db.exec(DDL[table])
     // `setupSync`（src/index.ts）と同じ順。移行が `_sync_state` を空にするので、
     // 帳簿はそのあとで作る
-    if (lib.rebuild === null) {
-      throw new Error(
-        '案A の作り直しの口（rows/rebuild.js・rows/schema.js・rows/migrate.js）が見つからない'
-      )
-    }
     lib.rebuild.migrateToRows(db, {
       tables: tables.map((table) => ({ name: table.name })),
       instanceId: instanceIdFor(index),
@@ -520,12 +498,37 @@ export function restoreWorld(
 }
 
 /**
- * 1つの操作を当て、操作が刻んだ時刻を時計 C へ書き換える。
+ * 1つの操作を当て、操作が刻んだ壁時計の値を時計 C へ書き換える（モジュール冒頭の「時計」）。
  *
- * 書き換えるのは**この操作で増えた** `_changelog` の行（id が操作前の採番値より大きい）と、
- * **この操作で書かれた** `_tombstone` の行（操作前に同じ (表, id, 削除時刻) が無かった）
- * だけ。`ON DELETE CASCADE` で消えた子の分もトリガが刻むので、ここで一緒に揃う。
- * `_changelog` / `_tombstone` にはトリガが無いので、この書き換えは記録を増やさない。
+ * **この操作で書かれた行**だけを書き換える。見分け方は2つ。
+ *
+ * - `_changelog`: id が操作前の採番値より大きい行
+ * - 版（`_tombstone` と `_sns_rows_<表>`）: `_sns_lamport` が操作前の
+ *   `_sns_clock.lamport` より大きい行。トリガーは本体の先頭で時計を1つ進め、
+ *   書く版にはその値を入れる。取り込みは時計を受け取った版の最大まで引き上げるので
+ *   （不変条件 C）、操作前から在る版の `_sns_lamport` は操作前の時計を超えない
+ *
+ * 書き換える値は次のとおり。
+ *
+ * - `_changelog.changedAt` と `_tombstone.deletedAt` は、この操作で書かれた行なら全部 C にする
+ *   （どちらも実行した時刻そのもの）。`ON DELETE CASCADE` で消えた子の分もトリガーが刻むので、
+ *   ここで一緒にそろう
+ * - `_sns_ts` は、**この操作が刻んだ壁時計の値と等しいものだけ**を C にする。削除の版の
+ *   `_sns_ts` は実行した時刻と手元の Max の大きい方なので、Max が勝った版（未来の時刻の行を
+ *   消した場合など）はアプリが書いた値のまま残す。値の等しさで追うので、同じ操作の中で
+ *   その値を引き継いだ版（消してすぐ作り直した行の版、統合で隠れていた側の墓標）も
+ *   一緒にそろう
+ *
+ * 刻んだ壁時計の値は、書き換える前の `changedAt` と `deletedAt` から集める。
+ * 前の操作が名乗った C と字面が同じになる壁時計の値もありうる（C は「今 + 1ミリ秒」なので）が、
+ * 書き換えるのはこの操作で書かれた行だけなので、前の操作の版を巻き込むことは無い。
+ *
+ * `_changelog` / `_tombstone` / `_sns_rows_<表>` にはトリガーが無いので、この書き換えは記録を増やさない。
+ *
+ * 書き換える前に、原則2・原則3・原則4 を直に確かめる（tools/explore/judgments.ts の
+ * `checkDeletionPrinciples`。実行した時刻と比べるので、壁時計の値が残っているうちに当てる）。
+ *
+ * @throws 原則2・原則3・原則4 の違反（検査器は遷移の例外を反例として経路つきで書き出す）
  */
 function applyOpWithClock(world: World, clientIndex: number, op: Op): string {
   const client = world.clients[clientIndex]
@@ -535,36 +538,52 @@ function applyOpWithClock(world: World, clientIndex: number, op: Op): string {
     .prepare(`SELECT seq FROM sqlite_sequence WHERE name = '_changelog'`)
     .get() as { seq: number } | undefined
   const seqBefore = seqRow?.seq ?? 0
-  const tombKey = (row: {
-    tableName: string
-    recordId: string
-    deletedAt: string
-  }): string => JSON.stringify([row.tableName, row.recordId, row.deletedAt])
-  const readTombs = (): {
-    tableName: string
-    recordId: string
-    deletedAt: string
-  }[] =>
-    db
-      .prepare(`SELECT tableName, recordId, deletedAt FROM _tombstone`)
-      .all() as { tableName: string; recordId: string; deletedAt: string }[]
-  const before = new Set(readTombs().map(tombKey))
+  const names = world.tables.map((entry) => entry.name)
+  const witness = witnessBeforeOp(db, names)
+  const lamportBefore = witness.lamport
 
   const peers = world.clients
     .filter((_, index) => index !== clientIndex)
     .map((peer) => ({ id: peer.id, db: peer.db }))
   const status = applyOp(db, client.id, peers, op)
 
+  const failures = checkDeletionPrinciples(
+    db,
+    names,
+    witness,
+    op.kind === 'deleteRecreate' ? [{ table: op.table, id: op.id }] : []
+  )
+  if (failures.length > 0) throw new Error(failures.join(' / '))
+
+  const stamped = new Set<string>([
+    ...(db
+      .prepare(`SELECT changedAt FROM _changelog WHERE id > ?`)
+      .pluck()
+      .all(seqBefore) as string[]),
+    ...(db
+      .prepare(`SELECT deletedAt FROM _tombstone WHERE _sns_lamport > ?`)
+      .pluck()
+      .all(lamportBefore) as string[]),
+  ])
   db.prepare(`UPDATE _changelog SET changedAt = ? WHERE id > ?`).run(
     clock,
     seqBefore
   )
-  const rewrite = db.prepare(
-    `UPDATE _tombstone SET deletedAt = ? WHERE tableName = ? AND recordId = ?`
+  db.prepare(`UPDATE _tombstone SET deletedAt = ? WHERE _sns_lamport > ?`).run(
+    clock,
+    lamportBefore
   )
-  for (const row of readTombs()) {
-    if (!before.has(tombKey(row))) {
-      rewrite.run(clock, row.tableName, row.recordId)
+  if (stamped.size > 0) {
+    const values = [...stamped]
+    const placeholders = values.map(() => '?').join(', ')
+    for (const table of [
+      '_tombstone',
+      ...names.map((name) => `_sns_rows_${name}`),
+    ]) {
+      db.prepare(
+        `UPDATE "${table}" SET _sns_ts = ?
+          WHERE _sns_lamport > ? AND _sns_ts IN (${placeholders})`
+      ).run(clock, lamportBefore, ...values)
     }
   }
   return status
@@ -624,6 +643,12 @@ export async function applyTransition(
  * 取る（時計を印に戻してから名乗り、壁時計が追い越すまで待つ）。こうしないと、書き込みと同期の
  * 刻みが同じミリ秒に収まるかどうかで結果が揺れる。
  *
+ * **この同期の前に、その端末の「無駄な転送の抑制」の覚えを空にする**（立ち上げ直した直後と同じ）。
+ * 覚えが前に上げたときと同じ印を持っていると、`performSync` は上げる回を省いて `backup` を
+ * 呼ばず、書き込みを差し込めない。覚えは状態に入らない（{@link idleMemoryFor}）ので、同じ状態から
+ * 来た節でも、世界を開き直したか（覚えが空か）で差し込めたり差し込めなかったりする。空にすれば
+ * 必ず上げるので、この遷移は状態だけで決まる。空の覚えは何も落とさない側なので、振る舞いも変えない。
+ *
  * @throws `performSync` が `backup` を呼ばずに戻った場合（書き込みが起きていないのに起きた
  *   ことにすると、履歴が嘘になる）
  */
@@ -633,15 +658,23 @@ async function syncWithWrite(
   transition: Extract<Transition, { kind: 'syncWrite' }>
 ): Promise<TransitionOutcome> {
   waitPastClock(world)
+  world.idle.delete(transition.client)
   const client = world.clients[transition.client]
   const db = client.db as Database.Database & {
     backup: Database.Database['backup']
   }
   const original = Database.prototype.backup
   let status: string | null = null
+  // 書き込みの例外（原則2・原則3・原則4 の違反）は、同期の中で飲み込まれないよう、同期のあとで投げ直す
+  let failure: unknown = null
   const write = (): void => {
     setClock(world, null)
-    status = applyOpWithClock(world, transition.client, transition.op)
+    try {
+      status = applyOpWithClock(world, transition.client, transition.op)
+    } catch (error) {
+      failure = error
+      status = 'failed'
+    }
     waitPastClock(world)
   }
   db.backup = async function (
@@ -670,6 +703,7 @@ async function syncWithWrite(
     delete (db as Partial<typeof db>).backup
   }
   setClock(world, null)
+  if (failure !== null) throw failure
   if (status === null) {
     throw new Error(
       '同期の最中の書き込みを差し込めなかった（performSync が copyToNas の backup を呼ばなかった）'
@@ -685,17 +719,12 @@ async function syncWithWrite(
  *   `createRowsTables(db, tables, instanceId)` へそのまま渡り、`_sns_clock` と
  *   `_sync_meta` の両方が同じ字面になる
  * - `forceMainThread` は必ず立てる。本物のワーカーは1回あたり約17ミリ秒かかり、
- *   1つの列で何百回も作り直す検査器では現実的な時間にならない（`REQUIRED_HOOKS` の (1)）
+ *   1つの列で何百回も作り直す検査器では現実的な時間にならない
  * - `rebuild` は**毎回まっさら**。同期をまたいで見送りの回数を持ち回ると、
  *   同じ状態でも前の履歴で振る舞いが変わり、状態の突き合わせが成り立たない
  */
-function runtimeFor(
-  lib: Library,
-  world: World,
-  index: number
-): RuntimeIn | undefined {
+function runtimeFor(lib: Library, world: World, index: number): RuntimeIn {
   const api = lib.rebuild
-  if (api === null) return undefined
   const names = world.tables.map((table) => table.name)
   const client = world.clients[index]
   return {
@@ -750,13 +779,16 @@ function runtimeFor(
  *
  * つまり抑制の有無は、同じ節から**同じ正準の後継**を生む。覚えを状態に足すと、
  * 振る舞いの同じ状態が別物に見えて探索が無駄に広がるだけになる。
+ *
+ * **ただし例外を1つ実測している**（2026-09-24）。相手を読まない回は、その相手の
+ * `_changelog` の隙間も調べないので、`hadChangelogGap` が偽になりうる。すると
+ * `performSync` は「上げてから作り直す」順に回り、読んだ回（隙間ありで「作り直してから上げる」）
+ * と比べて、NAS の自分の写しに入る `_sns_dirty` が違う（作り直しの前か後か）。
+ * 他の端末はその表を読まない（設計書 §3.1）ので振る舞いは変わらないが、状態の直列化には
+ * 現れるので、「再生して違う状態に戻った節」として数えられる。範囲の例: `--tables tags --ids 2
+ * --keys 1 --times 0 --no-prune --no-tick --sync-write before --depth 4` で2節。
  */
-function idleMemoryFor(
-  lib: Library,
-  world: World,
-  index: number
-): unknown | undefined {
-  if (lib.createIdleMemory === null) return undefined
+function idleMemoryFor(lib: Library, world: World, index: number): unknown {
   const kept = world.idle.get(index)
   if (kept !== undefined) return kept
   const memory = lib.createIdleMemory(idleSuppressionActive(world.config))

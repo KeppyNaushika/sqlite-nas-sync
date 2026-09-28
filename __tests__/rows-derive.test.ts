@@ -135,7 +135,7 @@ function del(
  * - `置く id=… name=…`: 置く行（表示値つき）
  * - `隠れ→g1`: 隠れた行（勝者の真の id）
  * - `置かない`: 置かない行（版は残る）
- * - `捨てる→<表>:<id>`: 版ごと捨てる行と、原因になった削除（原則4）
+ * - `親削除→<表>:<id>`: 親が削除されているので置かない行と、原因になった削除（原則4。版は残る）
  * - `死`: 削除の版が `Max`
  */
 export function summarize(
@@ -154,9 +154,9 @@ export function summarize(
         lines.push(
           `${table.name}:${key} 隠れ→${result.winner ?? '（勝者なし）'}`
         )
-      } else if (result.placement === 'discarded') {
+      } else if (result.placement === 'parentDeleted') {
         lines.push(
-          `${table.name}:${key} 捨てる→${result.cause?.table}:${result.cause?.key}`
+          `${table.name}:${key} 親削除→${result.cause?.table}:${result.cause?.key}`
         )
       } else {
         lines.push(`${table.name}:${key} 置かない`)
@@ -275,7 +275,7 @@ const CASES: Case[] = [
     expect: [`tags:g1 置く id=g1 name=t2 updatedAt=${T0}`],
   },
   {
-    name: '§1.4 読み替え —— 隠れた親を指す子は、勝者の主キーへ付け替わる',
+    name: '§1.4 表示 —— 隠れた親を指す子は、勝者の主キーで表示される',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -309,7 +309,7 @@ const CASES: Case[] = [
     expect: ['tag_notes:n3 置かない'],
   },
   {
-    name: '§1.4 1:1 の表 —— 表示上の主キーも読み替える',
+    name: '§1.4 1:1 の表 —— 子の主キーも勝者の主キーで表示される',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
@@ -329,7 +329,7 @@ const CASES: Case[] = [
     ],
   },
   {
-    name: '§1.4〜1.6 1:1 の表で、読み替えた主キーが先客とかぶる',
+    name: '§1.4〜1.6 1:1 の表で、表示する主キーが先客とかぶる',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T2 }, 1, 'a'),
@@ -407,11 +407,11 @@ const CASES: Case[] = [
     expect: ['tags:g1 置かない'],
   },
   {
-    name: '原則4: 親が削除されていれば、あとから届いた子も時刻によらず捨てる',
+    name: '原則4: 親が削除されていれば、あとから届いた子も時刻によらず入らない（版は残る）',
     schema: FAMILY,
     versions: [
       del('tags', 'g1', T1, 2, 'a'),
-      // 削除より新しい時刻で書かれた子。それでも捨てる
+      // 削除より新しい時刻で書かれた子。それでも入らない
       row(
         'tag_notes',
         'n1',
@@ -420,7 +420,7 @@ const CASES: Case[] = [
         'b'
       ),
     ],
-    expect: ['tags:g1 死', 'tag_notes:n1 捨てる→tags:g1'],
+    expect: ['tags:g1 死', 'tag_notes:n1 親削除→tags:g1'],
   },
   {
     name: '原則4: 親がまだ届いていないだけなら、置かない行のまま（版は残る）',
@@ -437,7 +437,7 @@ const CASES: Case[] = [
     expect: ['tag_notes:n1 置かない'],
   },
   {
-    name: '原則4: 1:1 の子は NULL にできないので捨てる',
+    name: '原則4: 1:1 の子は NULL にできないので入らない',
     schema: FAMILY,
     versions: [
       del('tags', 'g1', T1, 2, 'a'),
@@ -449,10 +449,10 @@ const CASES: Case[] = [
         'b'
       ),
     ],
-    expect: ['tags:g1 死', 'tag_profiles:g1 捨てる→tags:g1'],
+    expect: ['tags:g1 死', 'tag_profiles:g1 親削除→tags:g1'],
   },
   {
-    name: '原則4: ON DELETE SET NULL の子は捨てずに残る',
+    name: '原則4: ON DELETE SET NULL の子は列を NULL にした形で入る',
     schema: GUARDED,
     versions: [
       del('tags', 'g1', T1, 2, 'a'),
@@ -491,9 +491,53 @@ const CASES: Case[] = [
     ],
     expect: [
       'tags:g1 死',
-      'tag_notes:n1 捨てる→tags:g1',
-      'note_marks:m1 捨てる→tags:g1',
+      'tag_notes:n1 親削除→tags:g1',
+      'note_marks:m1 親削除→tags:g1',
     ],
+  },
+  {
+    name: '原則4: 親が同じ主キーで書き直され、書き直しが削除に勝てば、子は元の形で入る',
+    schema: CHAIN,
+    versions: [
+      del('tags', 'g1', T1, 2, 'a'),
+      // 書き直しは削除の時刻まで単調化され、_sns_lamport で勝つ
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 3, 'a', T1),
+      row(
+        'tag_notes',
+        'n1',
+        { id: 'n1', tagId: 'g1', body: 'b1', updatedAt: T0 },
+        1,
+        'b'
+      ),
+      row(
+        'note_marks',
+        'm1',
+        { id: 'm1', noteId: 'n1', updatedAt: T0 },
+        2,
+        'b'
+      ),
+    ],
+    expect: [
+      `tags:g1 置く id=g1 name=t1 updatedAt=${T0}`,
+      `tag_notes:n1 置く id=n1 tagId=g1 body=b1 updatedAt=${T0}`,
+      `note_marks:m1 置く id=m1 noteId=n1 updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '原則4: 書き直しが削除に負ければ、親は削除されたままで子は入らない',
+    schema: FAMILY,
+    versions: [
+      del('tags', 'g1', T2, 2, 'a'),
+      row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'b'),
+      row(
+        'tag_notes',
+        'n1',
+        { id: 'n1', tagId: 'g1', body: 'b1', updatedAt: T1 },
+        2,
+        'b'
+      ),
+    ],
+    expect: ['tags:g1 死', 'tag_notes:n1 親削除→tags:g1'],
   },
 ]
 
@@ -583,7 +627,7 @@ describe('derive —— かぶりの勝者（完了条件4）', () => {
   it('主キーと UNIQUE の両方に当たる候補では、主キーで引けた行が勝者（穴3の訂正）', () => {
     // SQLite は両方に当たっても `SQLITE_CONSTRAINT_UNIQUE` しか返さない（確認済み）。
     // エラーの種別で分岐すると、主キーの席を占めている行とは別の行を勝者にしてしまう。
-    // 1:1 の表では、表示上の主キーが読み替えで別の候補と重なるので、この形が実際に起きる
+    // 1:1 の表では、表示する主キーが勝者の主キーになって別の候補と重なるので、この形が実際に起きる
     const schema: RowsSchema = {
       tables: [
         {

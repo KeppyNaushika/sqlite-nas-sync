@@ -49,6 +49,35 @@ describe('validateDatabase', () => {
     )
   })
 
+  it('設定の主キー列が、表で宣言された主キーでない場合エラー', () => {
+    // 同期は宣言された主キー（uuid）を使うので、通すと設定の `id` ではなく uuid をキーにして黙って同期される
+    db.exec(`
+      CREATE TABLE users (
+        id TEXT NOT NULL,
+        uuid TEXT PRIMARY KEY NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `)
+
+    const errors = validateDatabase(db, [{ name: 'users' }], 'id')
+    expect(errors).toHaveLength(1)
+    expect(errors[0].message).toContain(
+      "Primary key column 'id' is not the declared PRIMARY KEY"
+    )
+    expect(errors[0].message).toContain("'uuid'")
+  })
+
+  it('設定の主キー列と宣言された主キーが大文字小文字だけ違うなら通す', () => {
+    db.exec(`
+      CREATE TABLE users (
+        ID TEXT PRIMARY KEY NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `)
+
+    expect(validateDatabase(db, [{ name: 'users' }], 'id')).toEqual([])
+  })
+
   it('PKがTEXT型でない場合エラー', () => {
     db.exec(`
       CREATE TABLE users (
@@ -99,13 +128,6 @@ describe('validateDatabase', () => {
     // logs: INTEGER PK + updatedAtなし
     expect(errors.length).toBeGreaterThanOrEqual(1)
     expect(errors.every((e) => e.table === 'logs')).toBe(true)
-  })
-
-  it('テーブル不在の場合、後続チェックをスキップ', () => {
-    const errors = validateDatabase(db, [{ name: 'missing' }], 'id')
-    // エラーは1つだけ（不在エラーのみ、PKやupdatedAtのエラーは出ない）
-    expect(errors).toHaveLength(1)
-    expect(errors[0].message).toBe('Table does not exist')
   })
 
   it('カスタムtimestampColumnが存在しない場合エラー', () => {

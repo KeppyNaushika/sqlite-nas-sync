@@ -1,8 +1,8 @@
 /**
  * 案A の表を作る（設計書 `docs/rows-table-design.md` §3.1・§3.2・§3.5）。
  *
- * 段階2 の受け持ちのうち「器」の側である。中身を書くトリガーは
- * `src/rows/triggers.ts` にある。
+ * ここは表を作るだけである。
+ * 中身を書くトリガーは `src/rows/triggers.ts` にある。
  *
  * | 表 | 何 |
  * | --- | --- |
@@ -12,10 +12,10 @@
  * | `_sns_dirty` | 作り直しの対象の表 |
  * | `_sns_shown` | 1:1 の表の「真の id ↔ 表示している id」 |
  * | `_sns_hidden` | 隠れた行と、その勝者 |
- * | `_sns_unplaceable` | 置かない行（警告の重複を避けるため） |
+ * | `_sns_unplaceable` | 置かない行と、親が削除されているときの原因（前回との差で警告と報告を出すため） |
  * | `_sns_rebuilding` | 作り直しの最中である旗 |
- * | `_tombstone` | 削除の版（表ごとでない。`IF NOT EXISTS` なので既存の DB には触らない） |
- * | `_changelog` | 変更の記録（同上） |
+ * | `_tombstone` | 削除の版（表ごとでない） |
+ * | `_changelog` | 変更の記録（表ごとでない） |
  *
  * **`_sns_rows_<表>` に制約を写さない理由**: ここは「受け取った事実」の置き場で、
  * 置けるかどうかを決める場所ではない。制約を写すと、他端末から届いた版が
@@ -27,6 +27,7 @@
  */
 import Database from 'better-sqlite3'
 import { escapeIdentifier, isSameIdentifier, NOW_SQL } from '../setup/sql'
+import { DEFAULTS } from '../types'
 
 /** 同期する表1つ分の指定。 */
 export interface RowsTableSpec {
@@ -40,7 +41,7 @@ export interface RowsTableSpec {
 }
 
 /** 時刻列の既定。 */
-export const DEFAULT_TIMESTAMP_COLUMN = 'updatedAt'
+export const DEFAULT_TIMESTAMP_COLUMN = DEFAULTS.timestampColumn
 
 /** ライブラリが `_sns_rows_<表>` と `_tombstone` に足す列。 */
 export const VERSION_COLUMNS = {
@@ -113,13 +114,15 @@ export function primaryKeyColumn(
     .filter((column) => column.pk > 0)
     .sort((a, b) => a.pk - b.pk)
   if (keys.length === 0) {
-    throw new Error(`同期する表 ${table} に主キーが無い（前提 P1）`)
+    throw new Error(
+      `同期する表 ${table} に主キーが無い。同期する表には1列の主キーが要る`
+    )
   }
   if (keys.length > 1) {
     throw new Error(
       `同期する表 ${table} の主キーが複合（${keys
         .map((column) => column.name)
-        .join(', ')}）である（前提 P11）`
+        .join(', ')}）である。同期する表の主キーは1列でなければならない`
     )
   }
   return keys[0]
@@ -134,7 +137,7 @@ export function primaryKeyColumn(
  *
  * @param db 同期するローカル DB
  * @param tables 同期する表
- * @param instanceId この `setupSync` の端末の id（`_sns_clock` に無いときだけ使う）
+ * @param instanceId この `setupSync` の端末の id（`_sns_clock.instanceId` を毎回これで上書きする。§3.2）
  */
 export function createRowsTables(
   db: Database.Database,
@@ -142,6 +145,7 @@ export function createRowsTables(
   instanceId: string
 ): void {
   createSharedTables(db)
+  ensureUnplaceableCauseColumns(db)
   ensureClockRow(db, instanceId)
   ensureTombstoneVersionColumns(db)
   for (const table of tables) {
@@ -210,12 +214,16 @@ function createSharedTables(db: Database.Database): void {
     )
   `)
 
-  // 置かない行（設計書 §1.4）。警告の重複を避けるためだけに持つ。
+  // 置かない行（設計書 §1.4）。同期のたびに前回との差を取り、新しく置かなくなった行を
+  // 警告し、親が削除されているので置かない行（原則4）の出入りを報告する。
+  // `causeTable` と `causeId` は、親が削除されているときの大元の削除（それ以外は NULL）。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _sns_unplaceable (
-      tableName TEXT NOT NULL,
-      trueId    TEXT NOT NULL,
-      reason    TEXT,
+      tableName  TEXT NOT NULL,
+      trueId     TEXT NOT NULL,
+      reason     TEXT,
+      causeTable TEXT,
+      causeId    TEXT,
       PRIMARY KEY (tableName, trueId)
     )
   `)
@@ -230,9 +238,10 @@ function createSharedTables(db: Database.Database): void {
     )
   `)
 
-  // 削除の版と通知の置き場。旧方式の取り付けを通していない DB でも
-  // トリガーが書けるよう、同じ形をここでも作る（`IF NOT EXISTS` なので
-  // 既存の DB には触らない）。
+  // 削除の版と通知の置き場。
+  // 案A の形でない DB（新しい DB を含む）では、移行（`src/rows/migrate.ts`）がこの2つの表を先に作り直しているので、ここでは何も起きない。
+  // ここで作るのは、移行を通さずにこの関数を呼んだとき（試験など）と、外で表が消されたときである。
+  // `_tombstone` の版の3列は、この後の `ensureTombstoneVersionColumns` が足す。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _tombstone (
       tableName  TEXT NOT NULL,
@@ -255,10 +264,9 @@ function createSharedTables(db: Database.Database): void {
 /**
  * `_tombstone` に版の3列を足す（冪等）。
  *
- * **`ensureTombstoneColumn` は使えない。** あれは `ADD COLUMN <name> TEXT` と
- * 決め打ちで、`_sns_ts` に TEXT の親和性が付いてしまう。順序用の時刻は
- * 「値の種類」で順序が決まるので（設計書 §1.2.3）、入れた数値が文字列へ
- * 化けると群1 の値が群2 に化け、**順序そのものが変わる**。型名を書かずに足す。
+ * **`_sns_ts` は型名を書かずに足す。**
+ * `TEXT` を付けると TEXT の親和性が付き、入れた数値が文字列へ化ける。
+ * 順序用の時刻は「値の種類」で順序が決まるので（設計書 §1.2.3）、群1 の値が群2 に化けると**順序そのものが変わる**。
  */
 export function ensureTombstoneVersionColumns(db: Database.Database): void {
   const existing = new Set(
@@ -303,6 +311,27 @@ export function ensureTombstoneVersionColumns(db: Database.Database): void {
 }
 
 /**
+ * `_sns_unplaceable` に `causeTable` と `causeId` を足す（冪等）。
+ *
+ * 0.20.0 の DB の `_sns_unplaceable` にはこの2列が無い。足したばかりの列は NULL で、
+ * 「親が削除されているので置かない行ではない」と読まれる。次の作り直しが書き直すので、
+ * その回の同期で親の削除による行が報告に出る。
+ */
+function ensureUnplaceableCauseColumns(db: Database.Database): void {
+  const existing = new Set(
+    (db.pragma(`table_info(_sns_unplaceable)`) as RowsColumn[]).map(
+      (column) => column.name
+    )
+  )
+  for (const column of ['causeTable', 'causeId']) {
+    if (existing.has(column)) continue
+    db.exec(
+      `ALTER TABLE _sns_unplaceable ADD COLUMN ${escapeIdentifier(column)} TEXT`
+    )
+  }
+}
+
+/**
  * `_sns_rows_<表>` を作る（冪等）。
  *
  * アプリの列の**宣言された型名だけ**を写す。NOT NULL も DEFAULT も UNIQUE も
@@ -344,7 +373,12 @@ function createRowsTable(db: Database.Database, table: string): void {
   )
 }
 
-/** `_sns_clock` に行が無ければ作る（冪等）。lamport には触らない。 */
+/**
+ * `_sns_clock` の行を用意する（冪等）。
+ *
+ * 行が無ければ作り、あれば `instanceId` だけを渡された値で上書きする（`setupSync` のたびに端末の id を作り直す。§3.2）。
+ * lamport と `importTick` には触らない。
+ */
 export function ensureClockRow(
   db: Database.Database,
   instanceId: string

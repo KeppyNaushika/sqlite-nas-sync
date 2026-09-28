@@ -1,32 +1,27 @@
 /**
- * 判定5〜10（設計書 docs/rows-table-design.md §8.1）を検査器へ足すための土台。
+ * 判定5〜13（設計書 docs/rows-table-design.md §8.1）の当て方。
  *
- * | # | 判定 | いまの状態 |
+ * | # | 判定 | 当て方 |
  * | --- | --- | --- |
- * | 5 | 同じ版の鍵ならどの端末でも中身が同じ | **有効**（同期のたびに当てる） |
- * | 6 | 各キーの `Max` が端末ごとに時間方向で単調 | **有効**（同上） |
- * | 7 | 作り直しの確定直後に、アプリの表が UNIQUE・外部キー・NOT NULL・CHECK を満たす | **有効**（同期のたびに当てる） |
- * | 8 | 作り直しの冪等性 | **有効**（{@link checkAfterRebuildCommit}。`rebuildDiffCount` が 0 か） |
- * | 9 | 不動点に達する回数の上限 | **有効**（tools/explore/probe.ts の `no-fixpoint`） |
- * | 10 | 判定4 を作り直しの確定ごとに当てる | **有効**（{@link checkAfterRebuildCommit}。`onRebuildCommitted` から） |
- * | 11 | 版の順序が全前順序 | **有効**（{@link checkVersionOrderIsTotalPreorder}。総当たり） |
- * | 12 | 突き合わせは格納クラス込み | **有効**（{@link typedValue}） |
- * | 13 | 置かない行・隠れた行の逆向きの検査 | **有効**（{@link checkAfterRebuildCommit}。参照実装の逆向き＋本物の帳簿との突き合わせ） |
- * | 20 | 計算が1つの快照から読む | **有効**（tools/explore/rebuild-scenarios.ts。`duringCompute`） |
- * | 21 | `SQLITE_BUSY` の見送りと k 回での合流経路 | **有効**（同上。`beginImmediate`） |
+ * | 5 | 同じ版の鍵ならどの端末でも中身が同じ | 収束の検査の同期のたびに当てる（{@link JudgmentLedger}） |
+ * | 6 | 各キーの `Max` が端末ごとに時間方向で単調。一度見えたキーの版は消えない | 同上 |
+ * | 7 | 作り直しの確定直後に、アプリの表が UNIQUE・外部キー・NOT NULL・CHECK を満たす | 同期のたびに当てる（{@link checkAppTables}） |
+ * | 8 | 作り直しの冪等性 | 作り直しの確定ごと（{@link checkAfterRebuildCommit}。`rebuildDiffCount` が 0 か） |
+ * | 9 | 不動点に達する回数の上限 | tools/explore/probe.ts の `no-fixpoint` |
+ * | 10 | 判定4 を作り直しの確定ごとに当てる | 作り直しの確定ごと（{@link checkAfterRebuildCommit}） |
+ * | 11 | 版の順序が全前順序 | 起動時の総当たり（{@link checkVersionOrderIsTotalPreorder}） |
+ * | 12 | 突き合わせは格納クラス込み | {@link typedValue} |
+ * | 13 | 置かない行・隠れた行の逆向きの検査 | 作り直しの確定ごと（参照実装の逆向き＋本物の帳簿との突き合わせ） |
+ * | 20 | 計算が1つの快照から読む | tools/explore/rebuild-scenarios.ts（`duringCompute`） |
+ * | 21 | `SQLITE_BUSY` の見送りと k 回での合流経路 | 同上（`beginImmediate`） |
  *
- * ## 判定は実装より先に、設計書の字面から書く
+ * さらに、アプリの操作1回ごとに docs/principles.md の原則2・原則3・原則4 を直に確かめる
+ * （{@link checkDeletionPrinciples}）。
  *
- * 実装を書き終えたあとで判定を書くと、「実装に都合のよい判定」になる。ここは案A が
- * `src/` に入る前に書いてある。集まらない場面（案A の表が無い版を駆動しているとき）では
- * 黙って何も言わない —— 偽の反例を出さないため。
+ * ## 判定は実装より先に、仕様の字面から書く
  *
- * ## `src/` 側に要る差し込み口
- *
- * {@link REQUIRED_HOOKS} にまとめてある。**6つとも埋まっている**
- * （`src/rows/rebuild.ts` の `rebuildOnce` / `rebuildDiffCount` / `RowsRebuildHooks` と、
- * `src/rows/schema.ts` の `createRowsTables(db, tables, instanceId)`。
- * 検査器からの配線は tools/explore/world.ts）。
+ * 実装を書き終えたあとで判定を書くと、「実装に都合のよい判定」になる。判定は
+ * docs/principles.md と設計書の字面から書き、実装の内部の手順は借りない。
  *
  * @module tools/explore/judgments
  */
@@ -41,58 +36,6 @@ import {
   derive,
 } from './oracles/rows-d1'
 
-/** 差し込み口1つ。 */
-export interface RequiredHook {
-  name: string
-  why: string
-  /** どの口に繋がったか（`src/` 側 → 検査器側） */
-  wiredTo: string
-}
-
-/**
- * `src/` 側に用意してもらう差し込み口（設計書 §8.2「検査器の作り」）。
- *
- * **6つとも埋まっている。** どこに繋がっているかは {@link RequiredHook.wiredTo} を見ること。
- */
-export const REQUIRED_HOOKS: RequiredHook[] = [
-  {
-    name: '主スレッドで作り直しを計算する経路（公開 API にはしない）',
-    why: '本物のワーカーは1回あたり約17ミリ秒。検査器は1つの列で何百回も作り直すので、ワーカー経由では現実的な時間で回らない（設計書 §8.2）',
-    wiredTo:
-      'src/rows/rebuild.ts の rebuildOnce（RowsSyncRuntime.forceMainThread で選ぶ）→ tools/explore/world.ts の runtimeFor',
-  },
-  {
-    name: '「作り直しが確定した」ことを知らせる呼び出し（表・generation つき）',
-    why: '判定4・7・8・10 は「作り直しの確定ごと」に当てる。同期の戻り値だけでは、1回の同期の中で何回確定したかが分からない',
-    wiredTo:
-      'RowsRebuildHooks.onRebuildCommitted → tools/explore/world.ts の runtimeFor（判定8・10・13）',
-  },
-  {
-    name: '作り直しの計算の途中に書き込みを差し込む口',
-    why: '設計書 §8.4「UPDATE トリガーが NEW の全列で版を作る」「計算中の差し込み」の壊し方は、この口が無いと踏めない',
-    wiredTo:
-      'RowsRebuildHooks.duringCompute → tools/explore/rebuild-scenarios.ts（判定20）',
-  },
-  {
-    name: 'もう1回だけ作り直して差分を返す（適用はしない）関数',
-    why: '判定8（作り直しの冪等性）。差が空でなければ違反',
-    wiredTo:
-      'src/rows/rebuild.ts の rebuildDiffCount → tools/explore/judgments.ts の checkAfterRebuildCommit（判定8）',
-  },
-  {
-    name: '`BEGIN IMMEDIATE` を失敗させる差し込み口（試験用）',
-    why: '作り直しの適用がロックを取れない場面（他の接続が書いている）を作る。設計書 §3.7.4 の「見送りが続いたときの経路」と、判定3（見送りが k 回を超えても前進しない）を踏むのに要る。検査器は端末ごとに接続を1本しか開かないので、外から失敗させない限りこの経路に入れない',
-    wiredTo:
-      'RowsRebuildHooks.beginImmediate → tools/explore/rebuild-scenarios.ts（判定21）',
-  },
-  {
-    name: '`instanceId` を外から与える（試験用）',
-    why: '同着の最後の鍵が `iid` の字面の比較なので、乱数のままだと1回の実行で片方の向きしか調べられない（tools/explore/normalize.ts の instanceLabels の「限界」）',
-    wiredTo:
-      'src/rows/schema.ts の createRowsTables(db, tables, instanceId)（RowsSyncRuntime.instanceId から migrateToRows 経由で渡る）→ tools/explore/world.ts の instanceIdFor',
-  },
-]
-
 /* ------------------------------------------------------------------ *
  * 版を集める（判定2・4・5・6 の入力）
  * ------------------------------------------------------------------ */
@@ -100,12 +43,7 @@ export const REQUIRED_HOOKS: RequiredHook[] = [
 /** 端末から読み取った版1つ。 */
 export type CollectedVersion = Version & { client: string }
 
-/**
- * 端末の DB から版を集める（設計書 §3.1 の `_sns_rows_<表>` と `_tombstone`）。
- *
- * **案A の表が無ければ空を返す。** 旧方式の `src/` を駆動しているあいだ、判定5・6 は
- * 何も言わない（偽の反例を出さないため）。
- */
+/** 端末の DB から版を集める（設計書 §3.1 の `_sns_rows_<表>` と `_tombstone`）。 */
 export function collectVersions(
   db: Database.Database,
   client: string,
@@ -114,7 +52,6 @@ export function collectVersions(
   const collected: CollectedVersion[] = []
   for (const table of tables) {
     const rowsTable = `_sns_rows_${table}`
-    if (!tableExists(db, rowsTable)) continue
     for (const row of db
       .prepare(`SELECT * FROM "${rowsTable}"`)
       .all() as Record<string, SqlValue>[]) {
@@ -134,42 +71,23 @@ export function collectVersions(
       })
     }
   }
-  if (tableExists(db, '_tombstone') && hasColumn(db, '_tombstone', '_sns_ts')) {
-    for (const row of db
-      .prepare(
-        `SELECT tableName, recordId, _sns_ts, _sns_lamport, _sns_instance FROM _tombstone`
-      )
-      .all() as Record<string, SqlValue>[]) {
-      if (!tables.includes(String(row.tableName))) continue
-      collected.push({
-        client,
-        table: String(row.tableName),
-        id: row.recordId ?? null,
-        kind: 'delete',
-        ts: row._sns_ts ?? null,
-        lamport: Number(row._sns_lamport ?? 0),
-        instance: String(row._sns_instance ?? ''),
-      })
-    }
+  for (const row of db
+    .prepare(
+      `SELECT tableName, recordId, _sns_ts, _sns_lamport, _sns_instance FROM _tombstone`
+    )
+    .all() as Record<string, SqlValue>[]) {
+    if (!tables.includes(String(row.tableName))) continue
+    collected.push({
+      client,
+      table: String(row.tableName),
+      id: row.recordId ?? null,
+      kind: 'delete',
+      ts: row._sns_ts ?? null,
+      lamport: Number(row._sns_lamport ?? 0),
+      instance: String(row._sns_instance ?? ''),
+    })
   }
   return collected
-}
-
-function tableExists(db: Database.Database, name: string): boolean {
-  return (
-    db
-      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`)
-      .get(name) !== undefined
-  )
-}
-
-function hasColumn(
-  db: Database.Database,
-  table: string,
-  column: string
-): boolean {
-  const info = db.pragma(`table_info("${table}")`) as { name: string }[]
-  return info.some((row) => row.name === column)
 }
 
 /* ------------------------------------------------------------------ *
@@ -193,7 +111,7 @@ export function typedValue(value: SqlValue): [string, string] {
   return ['text', value]
 }
 
-/** 版の鍵（設計書 §1.2.5 の不変条件 U: `(iid, L)` は書き込み1回を一意に指す）。 */
+/** 版の鍵（設計書 §1.2.4〜1.2.5 の不変条件 U: `(iid, L)` は書き込み1回を一意に指す）。 */
 export function versionKey(version: Version): string {
   return JSON.stringify([
     version.table,
@@ -217,9 +135,9 @@ export function versionBody(version: Version): string {
 /**
  * 判定5・6 を、実行のあいだ通して見る帳簿。
  *
- * - **判定5**: 同じ鍵の版を違う端末で見たら、中身も同じであること（設計書 §8.1 の穴15-1）。
+ * - **判定5**: 同じ鍵の版を違う端末で見たら、中身も同じであること。
  *   **1回の実行の中で**見る（{@link beginRun}）
- * - **判定6**: 端末ごとに、各キーの `Max` が時間方向で弱くならないこと（穴15-2）
+ * - **判定6**: 端末ごとに、各キーの `Max` が時間方向で弱くならないこと
  */
 export class JudgmentLedger {
   private readonly values = new ValueOracle()
@@ -243,7 +161,7 @@ export class JudgmentLedger {
    *   違う。**1つの実行の中では起きえない**組み合わせなので、これを違反と
    *   数えてはいけない
    *
-   * どちらも段階5 で実際に踏んだ（偽の反例）。
+   * どちらも実際に踏んだ（偽の反例）。
    */
   beginRun(): void {
     this.lastMax.clear()
@@ -253,9 +171,10 @@ export class JudgmentLedger {
   /**
    * ある時点の、ある端末の版を受け取る。
    *
+   * @param client 版を集めた端末。渡すと、その端末の版が1つも無いときも「消えた」を見る
    * @returns 見つかった違反の説明（空なら違反なし）
    */
-  observe(versions: CollectedVersion[]): string[] {
+  observe(versions: CollectedVersion[], client?: string): string[] {
     const violations: string[] = []
     // 判定5
     for (const version of versions) {
@@ -282,6 +201,20 @@ export class JudgmentLedger {
         maxByKey.set(key, version)
       }
     }
+    // 判定6 の続き: 一度見えたキーの版が、同じ端末から消えないこと。版は併合で
+    // 強い方に置き換わるだけで、キーごと消える経路は無い（原則4 で親が削除されている
+    // 子の版も捨てない）。消えると、2周で一致する議論の前提
+    // 「各端末の版の集合は併合でしか変わらない」が破れる
+    const clients = new Set(versions.map((version) => version.client))
+    if (client !== undefined) clients.add(client)
+    for (const [key, previous] of this.lastMax) {
+      if (maxByKey.has(key)) continue
+      if (!clients.has(key.slice(0, key.indexOf('|')))) continue
+      violations.push(
+        `判定6 違反: ${key} の版が消えた（直前の Max: ${versionBody(previous)}）`
+      )
+      this.lastMax.delete(key)
+    }
     for (const [key, version] of maxByKey) {
       const previous = this.lastMax.get(key)
       if (
@@ -303,12 +236,10 @@ export class JudgmentLedger {
  * ------------------------------------------------------------------ */
 
 /**
- * 判定7: アプリの表が、宣言された UNIQUE・外部キー・NOT NULL・CHECK を満たすこと
- * （設計書 §8.1 の穴15-3）。
+ * 判定7: アプリの表が、宣言された UNIQUE・外部キー・NOT NULL・CHECK を満たすこと。
  *
  * `PRAGMA integrity_check`（UNIQUE 索引の整合・NOT NULL・CHECK）と
- * `PRAGMA foreign_key_check`（外部キー）を当てる。**これは案A でなくても効く**ので、
- * いまの `src/` にもそのまま当てている。
+ * `PRAGMA foreign_key_check`（外部キー）を当てる。
  *
  * @returns 違反の説明（`null` なら満たしている）
  */
@@ -335,33 +266,8 @@ export function checkAppTables(
 }
 
 /* ------------------------------------------------------------------ *
- * 判定8・10（差し込み口を待つ）
+ * 判定8・10・13（作り直しの確定ごと）
  * ------------------------------------------------------------------ */
-
-/**
- * 作り直しの差し込み口（{@link REQUIRED_HOOKS}）。`src/` が案A になったら、
- * 検査器はこの形の関数を受け取って判定8・10 を当てる。
- */
-export type RebuildHooks = {
-  /** もう1回だけ作り直して、前の結果との差の件数を返す（適用はしない） */
-  rebuildDiffCount: (db: Database.Database) => number
-  /** 作り直しが確定するたびに呼ばれる（判定4・7・10 をここで当てる） */
-  onRebuildCommitted: (
-    listener: (db: Database.Database) => string | null
-  ) => void
-}
-
-/** 判定8: 続けてもう1回作り直すと差が空であること（設計書 §8.1 の穴15-4）。 */
-export function checkRebuildIdempotent(
-  db: Database.Database,
-  hooks: RebuildHooks | null
-): string | null {
-  if (hooks === null) return null // 差し込み口が無いあいだは何も言わない
-  const diff = hooks.rebuildDiffCount(db)
-  return diff === 0
-    ? null
-    : `判定8 違反: もう1回作り直すと ${String(diff)} 件の差が出た（冪等でない）`
-}
 
 /**
  * **作り直しが確定するたびに**当てる判定（設計書 §8.1 の判定8・10・13）。
@@ -377,7 +283,7 @@ export function checkRebuildIdempotent(
  * - **判定8**: もう1回作り直しても差が出ないこと（冪等）
  *
  * @param applied 今回入れ替えた表（それ以外は汚れていないので触っていない）
- * @param diffCount 判定8 の当て手（`rebuildDiffCount`）。無ければ判定8 は黙る
+ * @param diffCount 判定8 の当て手（`rebuildDiffCount`）
  * @returns 違反の説明（空なら違反なし）
  */
 export function checkAfterRebuildCommit(
@@ -386,7 +292,7 @@ export function checkAfterRebuildCommit(
   tables: readonly string[],
   schema: OracleSchema,
   applied: readonly string[],
-  diffCount: (() => number) | null
+  diffCount: () => number
 ): string[] {
   const failures: string[] = []
   const derived = derive(collectVersions(db, client, tables), schema)
@@ -421,13 +327,11 @@ export function checkAfterRebuildCommit(
   }
 
   // 判定8（冪等）
-  if (diffCount !== null) {
-    const diff = diffCount()
-    if (diff !== 0) {
-      failures.push(
-        `判定8 違反: 確定した直後にもう1回作り直すと ${String(diff)} 件の差が出た（冪等でない）`
-      )
-    }
+  const diff = diffCount()
+  if (diff !== 0) {
+    failures.push(
+      `判定8 違反: 確定した直後にもう1回作り直すと ${String(diff)} 件の差が出た（冪等でない）`
+    )
   }
   return failures
 }
@@ -436,7 +340,9 @@ export function checkAfterRebuildCommit(
  * 本物の帳簿（`_sns_hidden` / `_sns_unplaceable` / `_sns_shown`）と、参照実装の
  * 行き先を突き合わせる（判定13 の後半）。
  *
- * 帳簿が無い DB（旧方式）では何も言わない。
+ * 親が削除されているので置かない行（原則4）は、`_sns_unplaceable` に**原因の親つきで**
+ * 載るのが正しい。原因の親は利用者への報告（`SyncResult.parentDeleted`）の元になるので、
+ * 原因まで突き合わせる。アプリの表の見え方はどちらでも同じなので、判定4・10 では出ない。
  */
 function comparePlacementLedgers(
   db: Database.Database,
@@ -455,8 +361,17 @@ function comparePlacementLedgers(
       expectedHidden.push(
         JSON.stringify([candidate.key, candidate.winner ?? null])
       )
-    } else if (candidate.placement === 'unplaceable') {
-      expectedUnplaceable.push(candidate.key)
+    } else if (
+      candidate.placement === 'unplaceable' ||
+      candidate.placement === 'parentDeleted'
+    ) {
+      expectedUnplaceable.push(
+        JSON.stringify([
+          candidate.key,
+          candidate.cause?.table ?? null,
+          candidate.cause?.key ?? null,
+        ])
+      )
     }
   }
   for (const [key, value] of derived.res.get(table) ?? []) {
@@ -466,19 +381,20 @@ function comparePlacementLedgers(
     if (shown !== key) expectedShown.push(JSON.stringify([key, shown]))
   }
 
-  const rows = (sql: string): Record<string, SqlValue>[] => {
-    try {
-      return db.prepare(sql).all(table) as Record<string, SqlValue>[]
-    } catch {
-      return [] // 帳簿の無い DB
-    }
-  }
+  const rows = (sql: string): Record<string, SqlValue>[] =>
+    db.prepare(sql).all(table) as Record<string, SqlValue>[]
   const actualHidden = rows(
     `SELECT trueId, winnerId FROM _sns_hidden WHERE tableName = ?`
   ).map((row) => JSON.stringify([String(row.trueId), row.winnerId ?? null]))
   const actualUnplaceable = rows(
-    `SELECT trueId FROM _sns_unplaceable WHERE tableName = ?`
-  ).map((row) => String(row.trueId))
+    `SELECT trueId, causeTable, causeId FROM _sns_unplaceable WHERE tableName = ?`
+  ).map((row) =>
+    JSON.stringify([
+      String(row.trueId),
+      row.causeTable === null ? null : String(row.causeTable),
+      row.causeId === null ? null : String(row.causeId),
+    ])
+  )
   const actualShown = rows(
     `SELECT trueId, shownId FROM _sns_shown WHERE tableName = ?`
   ).map((row) => JSON.stringify([String(row.trueId), String(row.shownId)]))
@@ -493,7 +409,11 @@ function comparePlacementLedgers(
     )
   }
   say('隠れた行（_sns_hidden）', expectedHidden, actualHidden)
-  say('置かない行（_sns_unplaceable）', expectedUnplaceable, actualUnplaceable)
+  say(
+    '置かない行と親の削除の原因（_sns_unplaceable）',
+    expectedUnplaceable,
+    actualUnplaceable
+  )
   say('表示している id（_sns_shown）', expectedShown, actualShown)
   return failures
 }
@@ -544,7 +464,7 @@ export const ORDER_PROBE_VALUES: SqlValue[] = [
 ]
 
 /**
- * 判定11: 版の順序 `≺`（設計書 §1.2.5。`_sns_ts`・`L`・`iid` の辞書順で、時刻は
+ * 判定11: 版の順序 `≺`（設計書 §1.2.4〜1.2.5。`_sns_ts`・`L`・`iid` の辞書順で、時刻は
  * §1.2.3 の値の種類の順序）が**全前順序**であること。
  *
  * - 反射: `compare(x, x) = 0`
@@ -552,7 +472,7 @@ export const ORDER_PROBE_VALUES: SqlValue[] = [
  * - 推移: `a ≼ b` かつ `b ≼ c` なら `a ≼ c`。同順どうしの推移も見る
  * - 全: どの2つにも大小か同順が決まる（`compare` が常に数を返す）
  *
- * 全前順序でないと、「強い順に並べる」（§1.6）の答えが並べ方によって変わり、
+ * 全前順序でないと、「強い順に並べる」（§1.3〜1.7）の答えが並べ方によって変わり、
  * 端末ごとに違う表ができる。**総当たりで確かめる。**
  *
  * @returns 違反の説明（空なら成り立っている）
@@ -628,7 +548,7 @@ export function checkVersionOrderIsTotalPreorder(): string[] {
  * を確かめる。順方向（「入らなかったから隠れた行」）だけだと、入れる順や表示値の作り方を
  * 間違えて**入るはずの行を捨てた**場合に気づけない。
  *
- * 外部キーは検査しない（親が置かれていないときの扱いは §1.4 の表示値の規則で決めるもので、
+ * 外部キーは検査しない（親が置かれていないときの扱いは §1.3〜1.7 の表示値の規則で決めるもので、
  * SQLite に判定させる部分ではない）。
  *
  * @returns 違反の説明（空なら成り立っている）
@@ -703,6 +623,183 @@ export function checkPlacementsAreReal(
 }
 
 /* ------------------------------------------------------------------ *
+ * 原則2・原則3・原則4（アプリの操作ごと）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 操作の直前に読んでおくもの（{@link checkDeletionPrinciples} の入力）。
+ *
+ * 統合で隠れている行と、アプリの表に見えている行（真の id）。どちらも「アプリから見て
+ * いま何が1行に統合されているか」であり、原則3 の「統合した行」はこれを指す。
+ */
+export type DeletionWitness = {
+  /** 同期時計の lamport（この操作で書かれた版を見分けるのに使う。tools/explore/world.ts） */
+  lamport: number
+  /** 表 → 見えている行の、表示上の id → 真の id */
+  shown: Map<string, Map<string, string>>
+  /** 統合で隠れている行（勝者の決まっているものだけ） */
+  hidden: { table: string; trueId: string; winnerId: string }[]
+}
+
+/** {@link checkDeletionPrinciples} が使い回す比較の道具（操作ごとに作ると `:memory:` の DB が溜まる）。 */
+let deletionValues: ValueOracle | null = null
+
+/** 操作の直前に {@link DeletionWitness} を読む。 */
+export function witnessBeforeOp(
+  db: Database.Database,
+  tables: readonly string[]
+): DeletionWitness {
+  const lamport = (
+    db.prepare(`SELECT lamport FROM _sns_clock`).get() as { lamport: number }
+  ).lamport
+  const shown = new Map<string, Map<string, string>>()
+  for (const table of tables) {
+    shown.set(table, visibleRows(db, table))
+  }
+  const hidden = (
+    db
+      .prepare(
+        `SELECT tableName, trueId, winnerId FROM _sns_hidden WHERE winnerId IS NOT NULL`
+      )
+      .all() as { tableName: string; trueId: string; winnerId: string }[]
+  )
+    .filter((row) => tables.includes(row.tableName))
+    .map((row) => ({
+      table: row.tableName,
+      trueId: String(row.trueId),
+      winnerId: String(row.winnerId),
+    }))
+  return { lamport, shown, hidden }
+}
+
+/** アプリの表に見えている行の、表示上の id → 真の id（1:1 の表では `_sns_shown` で引く）。 */
+function visibleRows(
+  db: Database.Database,
+  table: string
+): Map<string, string> {
+  const remapped = new Map<string, string>()
+  for (const row of db
+    .prepare(`SELECT trueId, shownId FROM _sns_shown WHERE tableName = ?`)
+    .all(table) as { trueId: SqlValue; shownId: SqlValue }[]) {
+    remapped.set(String(row.shownId), String(row.trueId))
+  }
+  const visible = new Map<string, string>()
+  for (const id of db
+    .prepare(`SELECT CAST(id AS TEXT) FROM "${table}"`)
+    .pluck()
+    .all() as string[]) {
+    visible.set(id, remapped.get(id) ?? id)
+  }
+  return visible
+}
+
+/**
+ * アプリの操作1回ごとに、docs/principles.md の原則2・原則3・原則4 を直に確かめる。
+ *
+ * - **原則2**（付則2）: `DELETE` の版の順序に使う時刻は、削除を実行した時刻である。
+ *   手元の Max がそれより強ければ単調化でそこまで上がるが、実行した時刻より弱くはならない。
+ *   そこで、この操作で書かれた削除の版ごとに「`_sns_ts` ≧ 実行した時刻（`deletedAt`）」を見る
+ * - **原則3**: 統合した行を `DELETE` したら、統合されていた両方の主キーが削除される。
+ *   この操作でアプリの表から消えた行（`recreated` を含む）ごとに、その後ろに隠れていた
+ *   主キーの Max が削除の版になっていることを見る
+ * - **原則4**（付則3 の前半）: 親行を `DELETE` したクライアントにその時点であった子行は、
+ *   SQLite が `ON DELETE` に従って削除し、その削除は変更として複製される。そこで、
+ *   この操作でアプリの表から消えた行（消してすぐ作り直した行を除く）ごとに、その主キーの
+ *   Max が削除の版になっていることを見る。子行に削除の版が無いと、親行を書き直したときに
+ *   子行が戻る
+ *
+ * どちらも、収束や参照実装との突き合わせでは見えない壊れ方を捕まえる。全端末が同じように
+ * 壊れて一致してしまい、しかも何が統合されていたか・いつ実行したかは発行した操作の列から
+ * 決められない（tools/explore/oracles/from-history.ts）ので、参照実装も突き合わせを見送る。
+ *
+ * **時計 C へ書き換える前に呼ぶこと**（実行した時刻と比べるので、壁時計の値が要る）。
+ *
+ * @param recreated この操作で消してすぐ作り直した行（表, 表示上の id）。アプリの表には
+ *   残っているが、一度消えている
+ * @returns 違反の説明（空なら違反なし）
+ */
+export function checkDeletionPrinciples(
+  db: Database.Database,
+  tables: readonly string[],
+  witness: DeletionWitness,
+  recreated: { table: string; id: string }[]
+): string[] {
+  const failures: string[] = []
+  deletionValues ??= new ValueOracle()
+  const values = deletionValues
+
+  // 原則2
+  for (const row of db
+    .prepare(
+      `SELECT tableName, recordId, deletedAt, _sns_ts FROM _tombstone WHERE _sns_lamport > ?`
+    )
+    .all(witness.lamport) as {
+    tableName: string
+    recordId: string
+    deletedAt: SqlValue
+    _sns_ts: SqlValue
+  }[]) {
+    if (values.compareTs(row._sns_ts, row.deletedAt) < 0) {
+      failures.push(
+        `原則2 違反: ${row.tableName}:${row.recordId} の削除の版の _sns_ts（${String(row._sns_ts)}）が、` +
+          `削除を実行した時刻（${String(row.deletedAt)}）より弱い`
+      )
+    }
+  }
+
+  const strongestOf = (table: string, trueId: string): Version | null => {
+    let strongest: Version | null = null
+    for (const version of collectVersions(db, 'self', [table])) {
+      if (values.idKey(version.id) !== trueId) continue
+      if (
+        strongest === null ||
+        compareVersions(values, strongest, version) < 0
+      ) {
+        strongest = version
+      }
+    }
+    return strongest
+  }
+
+  // 原則3・原則4
+  const deleted = new Map<string, Set<string>>()
+  for (const table of tables) {
+    const before = witness.shown.get(table) ?? new Map<string, string>()
+    const after = visibleRows(db, table)
+    const gone = new Set<string>()
+    for (const [displayId, trueId] of before) {
+      if (after.has(displayId)) continue
+      gone.add(trueId)
+      // 原則4: 消えた行（`ON DELETE CASCADE` で消えた子行を含む）は削除の版を持つ
+      const strongest = strongestOf(table, trueId)
+      if (strongest === null || strongest.kind !== 'delete') {
+        failures.push(
+          `原則4 違反: ${table}:${trueId} がこの操作でアプリの表から消えたのに、` +
+            `Max が削除の版でない（${strongest === null ? '版が無い' : '行の版'}）`
+        )
+      }
+    }
+    for (const entry of recreated) {
+      if (entry.table !== table) continue
+      const trueId = before.get(entry.id)
+      if (trueId !== undefined) gone.add(trueId)
+    }
+    deleted.set(table, gone)
+  }
+  for (const entry of witness.hidden) {
+    if (!(deleted.get(entry.table)?.has(entry.winnerId) ?? false)) continue
+    const strongest = strongestOf(entry.table, entry.trueId)
+    if (strongest === null || strongest.kind !== 'delete') {
+      failures.push(
+        `原則3 違反: ${entry.table}:${entry.winnerId} を消したのに、統合されていた ` +
+          `${entry.table}:${entry.trueId} が消えていない（Max が ${strongest === null ? '無い' : '行の版'}）`
+      )
+    }
+  }
+  return failures
+}
+
+/* ------------------------------------------------------------------ *
  * 単体テスト
  * ------------------------------------------------------------------ */
 
@@ -762,6 +859,9 @@ export function runJudgmentUnitTests(): string[] {
       .length,
     0
   )
+  const vanish = new JudgmentLedger()
+  vanish.observe([version('a', 2, '2026-01-01T00:00:01.000Z', 't2')], 'a')
+  check('判定6 版が消えれば違反', vanish.observe([], 'a').length, 1)
   const regress = new JudgmentLedger()
   regress.observe([version('a', 2, '2026-01-01T00:00:01.000Z', 't2')])
   check(
@@ -772,8 +872,8 @@ export function runJudgmentUnitTests(): string[] {
 
   // 判定7: 制約を満たす表では黙り、壊れた表では言う
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Database = require('better-sqlite3') as typeof import('better-sqlite3')
-  const db = new Database(':memory:')
+  const Sqlite = require('better-sqlite3') as typeof import('better-sqlite3')
+  const db = new Sqlite(':memory:')
   try {
     db.pragma('foreign_keys = OFF')
     db.exec(
@@ -795,13 +895,6 @@ export function runJudgmentUnitTests(): string[] {
   } finally {
     db.close()
   }
-
-  // 判定8: 差し込み口が無ければ黙る
-  check(
-    '判定8 差し込み口が無ければ黙る',
-    checkRebuildIdempotent(null as unknown as Database.Database, null),
-    null
-  )
 
   // 判定11: 版の順序が全前順序であること（総当たり）
   failures.push(...checkVersionOrderIsTotalPreorder())

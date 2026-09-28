@@ -13,7 +13,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
-import { SyncConfig, SyncTransfers } from '../src/types'
+import { SyncConfig, SyncInstance, SyncTransfers } from '../src/types'
 import { FORCE_EVERY } from '../src/sync/idle'
 
 /** 手元へ写した回数を数える（写した直後の `query_only = ON` を数える）。 */
@@ -39,6 +39,8 @@ describe('無駄な転送の抑制', () => {
   const nasDir = path.join(testDir, 'nas')
   const isolatedTmp = path.join(testDir, 'tmp')
   let savedTmpDir: string | undefined
+  /** この試験で作った `SyncInstance`。後片付けで `stop()` を呼ぶ */
+  const instances: SyncInstance[] = []
 
   beforeEach(() => {
     fs.mkdirSync(nasDir, { recursive: true })
@@ -50,6 +52,7 @@ describe('無駄な転送の抑制', () => {
   })
 
   afterEach(() => {
+    for (const instance of instances.splice(0)) instance.stop()
     if (savedTmpDir === undefined) delete process.env.TMPDIR
     else process.env.TMPDIR = savedTmpDir
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
@@ -69,6 +72,13 @@ describe('無駄な転送の抑制', () => {
     `)
     db.close()
     return dbPath
+  }
+
+  /** `setupSync` を呼び、後片付けで止めるために覚えておく。 */
+  function setup(config: SyncConfig): SyncInstance {
+    const instance = setupSync(config)
+    instances.push(instance)
+    return instance
   }
 
   function makeConfig(
@@ -113,9 +123,9 @@ describe('無駄な転送の抑制', () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
     const pathC = createDb('c')
-    const syncA = setupSync(makeConfig(pathA, 'a', false))
-    const syncB = setupSync(makeConfig(pathB, 'b', false))
-    const syncC = setupSync(makeConfig(pathC, 'c', false))
+    const syncA = setup(makeConfig(pathA, 'a', false))
+    const syncB = setup(makeConfig(pathB, 'b', false))
+    const syncC = setup(makeConfig(pathC, 'c', false))
 
     write(pathB, 'n-b', 'from b', '2026-09-01T00:00:00.000Z')
     write(pathC, 'n-c', 'from c', '2026-09-01T00:00:00.000Z')
@@ -135,8 +145,8 @@ describe('無駄な転送の抑制', () => {
   it('起動直後は、変更が無くても必ず上げる・読む', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
     await syncB.syncNow()
 
     const first = transfersOf((await syncA.syncNow()).transfers)
@@ -144,7 +154,7 @@ describe('無駄な転送の抑制', () => {
     expect(first.peerReads).toBe(1)
 
     // 同じ設定で立ち上げ直したら、また1回目として上げ・読む
-    const syncA2 = setupSync(makeConfig(pathA, 'a'))
+    const syncA2 = setup(makeConfig(pathA, 'a'))
     const again = transfersOf((await syncA2.syncNow()).transfers)
     expect(again.uploads).toBe(1)
     expect(again.peerReads).toBe(1)
@@ -153,8 +163,8 @@ describe('無駄な転送の抑制', () => {
   it('変更が無ければ、上げない・写さない', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
 
     write(pathB, 'n-b', 'from b', '2026-09-01T00:00:00.000Z')
     await syncB.syncNow()
@@ -176,7 +186,7 @@ describe('無駄な転送の抑制', () => {
 
   it('手元が変われば上げる', async () => {
     const pathA = createDb('a')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
+    const syncA = setup(makeConfig(pathA, 'a'))
     // 1回目は必ず上げる。2回目も上げる —— 1回目は写しを作った**あと**に手元が
     // 動いている（下ごしらえと作り直し）ので、写しと手元が食い違ったままに
     // ならないよう上げ直す。3回目で落ち着く
@@ -197,8 +207,8 @@ describe('無駄な転送の抑制', () => {
   it('相手のファイルが変われば写す', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
     await syncB.syncNow()
     await syncA.syncNow()
     await syncA.syncNow()
@@ -215,8 +225,8 @@ describe('無駄な転送の抑制', () => {
   it('取り込んだ回の次は、自分から上げ直す（中継が止まらない）', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
     // 互いを知っている状態にする。B の写しに `_changelog` の行が載っているので、
     // A の読み位置は 0 より先へ進み、次からは隙間なしの経路に入る
     write(pathB, 'n-b0', 'from b', '2026-09-01T00:00:00.000Z')
@@ -239,8 +249,8 @@ describe('無駄な転送の抑制', () => {
   it('自分の写しを自分以外が書いたら、上げない回でも気づいて上げ直す', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
     await syncB.syncNow()
     await syncA.syncNow()
     await syncA.syncNow()
@@ -262,8 +272,8 @@ describe('無駄な転送の抑制', () => {
   it('印が同じでも、一定回数ごとに必ず読む・上げる', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')
-    const syncA = setupSync(makeConfig(pathA, 'a'))
-    const syncB = setupSync(makeConfig(pathB, 'b'))
+    const syncA = setup(makeConfig(pathA, 'a'))
+    const syncB = setup(makeConfig(pathB, 'b'))
     await syncB.syncNow()
 
     let uploads = 0
@@ -288,7 +298,7 @@ describe('無駄な転送の抑制', () => {
       fs.mkdirSync(isolatedTmp, { recursive: true })
       const paths = ['a', 'b', 'c'].map(createDb)
       const syncs = ['a', 'b', 'c'].map((id, index) =>
-        setupSync(makeConfig(paths[index], id, suppress))
+        setup(makeConfig(paths[index], id, suppress))
       )
       for (let round = 0; round < 3; round += 1) {
         for (let index = 0; index < 3; index += 1) {

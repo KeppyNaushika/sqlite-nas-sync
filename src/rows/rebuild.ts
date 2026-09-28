@@ -39,19 +39,18 @@ import {
   dependencyOrder,
   foreignKeysOf,
   readRebuildToken,
-  RebuildPlanDiscarded,
   reviveRebuildPlan,
   sameRebuildToken,
 } from './rebuild-plan'
-import { RowsColumn, primaryKeyColumn, rowsTableName } from './schema'
+import { RowsColumn } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import { SqlValue, ValueOrdering } from './versions'
 
 /** 合流経路に落ちるまでの見送りの回数（設計書 §3.7.4 の k）。 */
-const DEFAULT_MERGE_AFTER_SKIPS = 3
+const MERGE_AFTER_SKIPS = 3
 
 /** 合流経路の `busy_timeout`（ミリ秒）。設計書の「数十 ms」。 */
-const DEFAULT_MERGED_BUSY_TIMEOUT_MS = 50
+const MERGED_BUSY_TIMEOUT_MS = 50
 
 /**
  * 検査と試験のための差し込み口（設計書 §8.2 の `REQUIRED_HOOKS`）。
@@ -90,22 +89,29 @@ export interface RowsRebuildState {
   generation: number
   /** 外部キーの検査に落ちて、対象から外した表 */
   excluded: Set<string>
-  /** 利用者へ知らせる警告 */
-  warnings: string[]
 }
 
-/** {@link rebuildOnce} の設定。 */
+/** {@link rebuildOnce} の設定。適用する表は `_sns_dirty` の表とその子孫である。 */
 interface RowsRebuildOptions {
   /** 同期する表 */
   tables: string[]
-  /** 適用する表（省略すると `_sns_dirty` の表とその子孫） */
-  targets?: string[]
   state?: RowsRebuildState
   hooks?: RowsRebuildHooks
-  /** 合流経路に落ちるまでの見送りの回数 @defaultValue 3 */
-  mergeAfterSkips?: number
-  /** 合流経路の `busy_timeout`（ミリ秒） @defaultValue 50 */
-  mergedBusyTimeoutMs?: number
+}
+
+/**
+ * {@link rebuildDiffCount} の設定。
+ *
+ * `targets` は網羅検査器（`tools/explore/world.ts`）の判定8 のための差し込み口である。
+ * 作り直しが確定した直後は `_sns_dirty` が空なので、確定した表を明示して差を測る。
+ * 本番の同期は {@link rebuildDiffCount} を呼ばない。
+ */
+interface RowsRebuildDiffOptions {
+  /** 同期する表 */
+  tables: string[]
+  /** 差を測る表（省略すると同期する表の全部） */
+  targets?: string[]
+  state?: RowsRebuildState
 }
 
 /** {@link rebuildOnce} の結果。 */
@@ -123,7 +129,6 @@ interface RowsRebuildOutcome {
   /** そのときの見送りの回数 */
   skips: number
   generation: number
-  warnings: string[]
   reason?: string
   /**
    * アプリの表に当てた差の内訳（設計書 §4.4 の `inserted` / `updated` / `deleted`）。
@@ -132,13 +137,6 @@ interface RowsRebuildOutcome {
    * 突き合わせて**数える。`status` が `applied` でなければ全部 0。
    */
   counts: RowsRebuildCounts
-  /**
-   * 版ごと捨てた行（原則4）。親が削除されているので `_sns_rows_<表>` から落とした。
-   *
-   * **中身を載せる**のは、落としたあとには誰も読めなくなるからである。
-   * ライブラリは退避しない。必要ならアプリケーションが受け取って退避する。
-   */
-  discarded: RebuildPlanDiscarded[]
 }
 
 /** アプリの表に当てた差の内訳。 */
@@ -153,7 +151,7 @@ interface RowsRebuildCounts {
 
 /** まっさらな記憶。 */
 export function createRebuildState(): RowsRebuildState {
-  return { skips: 0, generation: 0, excluded: new Set(), warnings: [] }
+  return { skips: 0, generation: 0, excluded: new Set() }
 }
 
 /**
@@ -171,19 +169,17 @@ export function rebuildOnce(
   if (db.inTransaction) {
     return outcome(state, 'noop', 'normal', [], 'すでにトランザクションの中')
   }
-  if (!hasWork(db, options)) {
+  if (!hasWork(db)) {
     state.skips = 0
     return outcome(state, 'noop', 'normal', [], '_sns_dirty が空')
   }
-  const merged =
-    state.skips >= (options.mergeAfterSkips ?? DEFAULT_MERGE_AFTER_SKIPS)
+  const merged = state.skips >= MERGE_AFTER_SKIPS
   const mode: 'normal' | 'merged' = merged ? 'merged' : 'normal'
   // 対象から外す表が増えるたびに計算し直す。表の数を超えて回ることはない
   for (let attempt = 0; attempt <= tables.length; attempt += 1) {
     const compute = (): RebuildPlan =>
       computeRebuildPlan(db, {
         tables,
-        targets: options.targets,
         excluded: [...state.excluded],
         insideTransaction: mode === 'merged',
       })
@@ -203,7 +199,7 @@ export function rebuildOnce(
  */
 export function rebuildDiffCount(
   db: Database.Database,
-  options: RowsRebuildOptions
+  options: RowsRebuildDiffOptions
 ): number {
   const tables = canonicalTables(db, options.tables)
   const state = options.state ?? createRebuildState()
@@ -234,7 +230,6 @@ interface RebuildWorkerOptions {
   /** 読み取り専用で開く DB の位置（WAL が前提） */
   dbPath: string
   tables: string[]
-  targets?: string[]
   excluded?: readonly string[]
   /**
    * ワーカーの入口の位置。既定は同じ場所の `rebuild-worker.js`
@@ -257,7 +252,6 @@ export function computeRebuildPlanInWorker(
     dbPath: options.dbPath,
     options: {
       tables: options.tables,
-      targets: options.targets,
       excluded:
         options.excluded === undefined ? undefined : [...options.excluded],
     },
@@ -303,11 +297,11 @@ export async function rebuildOnceInWorker(
   if (db.inTransaction) {
     return outcome(state, 'noop', 'normal', [], 'すでにトランザクションの中')
   }
-  if (!hasWork(db, options)) {
+  if (!hasWork(db)) {
     state.skips = 0
     return outcome(state, 'noop', 'normal', [], '_sns_dirty が空')
   }
-  if (state.skips >= (options.mergeAfterSkips ?? DEFAULT_MERGE_AFTER_SKIPS)) {
+  if (state.skips >= MERGE_AFTER_SKIPS) {
     // 合流経路。ワーカーは使わない
     return rebuildOnce(db, { ...options, state })
   }
@@ -349,13 +343,7 @@ function applyRebuild(
   const previousBusyTimeout = Number(
     db.pragma('busy_timeout', { simple: true })
   )
-  db.pragma(
-    `busy_timeout = ${
-      mode === 'merged'
-        ? (options.mergedBusyTimeoutMs ?? DEFAULT_MERGED_BUSY_TIMEOUT_MS)
-        : 0
-    }`
-  )
+  db.pragma(`busy_timeout = ${mode === 'merged' ? MERGED_BUSY_TIMEOUT_MS : 0}`)
   db.pragma('foreign_keys = OFF')
   // `finally` では書かない。`finally` の中の `throw` は、本体が投げた例外を
   // 黙って捨てる（ESLint の `no-unsafe-finally`）。**戻す処理を2つの出口で
@@ -389,14 +377,13 @@ function applyRebuild(
         return outcome(state, 'deferred', mode, [], 'token が違う')
       }
     }
-    const report = applyPlan(db, plan, tables, options)
+    const report = applyPlan(db, plan, tables)
     if (report.violations.length > 0) {
       db.exec('ROLLBACK')
       for (const table of report.violations) state.excluded.add(table)
       const message =
         `外部キーの違反が残るので、作り直しの対象から外した: ` +
         report.violations.join(', ')
-      state.warnings.push(message)
       hooks.onWarning?.(message)
       return outcome(state, 'excluded', mode, report.applied, message)
     }
@@ -409,8 +396,7 @@ function applyRebuild(
       mode,
       report.applied,
       undefined,
-      report.counts,
-      report.discarded
+      report.counts
     )
   }
 
@@ -441,22 +427,17 @@ function applyRebuild(
 /** 適用の中で分かったこと。 */
 interface ApplyReport {
   applied: string[]
-  /** 後始末で触った同期しない表 */
-  touched: string[]
   /** 外部キーの検査に落ちて、対象から外すべき表 */
   violations: string[]
   /** アプリの表に当てた差の内訳（入れ替える**前**に数える） */
   counts: RowsRebuildCounts
-  /** 版ごと落とした行（原則4） */
-  discarded: RebuildPlanDiscarded[]
 }
 
 /** トランザクションの中身（設計書 §3.7.2 の箱の中）。 */
 function applyPlan(
   db: Database.Database,
   plan: RebuildPlan,
-  tables: string[],
-  options: RowsRebuildOptions
+  tables: string[]
 ): ApplyReport {
   const applied = plan.apply.map((table) => table.name)
   // 差は**入れ替える前に**数える。入れ替えたあとでは、消した行も入れた行も
@@ -475,11 +456,8 @@ function applyPlan(
   restoreApplicationTriggers(db, dropped)
   const violations = checkForeignKeys(db, applied, touched)
   if (violations.length > 0) {
-    return { applied, touched, violations, counts, discarded: [] }
+    return { applied, violations, counts }
   }
-  // 親が削除されている子の版を落とす（原則4）。**外部キーの検査を通ってから**
-  // 落とすのは、巻き戻す回で版を失わないためである
-  const discarded = dropDiscardedVersions(db, plan, applied)
   // 旗が立っている間に消す（下ろしてから消すと、その間の汚れまで消える）
   if (applied.length > 0) {
     db.prepare(
@@ -489,44 +467,7 @@ function applyPlan(
     ).run(...applied)
   }
   lowerFlag(db)
-  void options
-  return { applied, touched, violations, counts, discarded }
-}
-
-/**
- * 親が削除されている子の版を `_sns_rows_<表>` から落とす（原則4）。
- *
- * 落とすのは**適用した表のぶんだけ**。祖先について計算しただけの表には触らない。
- *
- * 墓標は書かない。親の削除の版がすでに他のクライアントへ渡っており、
- * 同じ計算をすれば同じ子が落ちる。子ごとに墓標を書くと、
- * `ON DELETE CASCADE` の連鎖1回で `_tombstone` が子孫の数だけ膨らむ。
- *
- * @returns 実際に落ちた行（落ちなかったぶんは載せない）
- */
-function dropDiscardedVersions(
-  db: Database.Database,
-  plan: RebuildPlan,
-  applied: readonly string[]
-): RebuildPlanDiscarded[] {
-  if (plan.discarded.length === 0) return []
-  const appliedSet = new Set(applied.map(foldIdentifier))
-  const dropped: RebuildPlanDiscarded[] = []
-  const statements = new Map<string, Database.Statement>()
-  for (const entry of plan.discarded) {
-    if (!appliedSet.has(foldIdentifier(entry.table))) continue
-    let statement = statements.get(entry.table)
-    if (statement === undefined) {
-      const primaryKey = primaryKeyColumn(db, entry.table).name
-      statement = db.prepare(
-        `DELETE FROM ${escapeIdentifier(rowsTableName(entry.table))}
-          WHERE CAST(${escapeIdentifier(primaryKey)} AS TEXT) = ?`
-      )
-      statements.set(entry.table, statement)
-    }
-    if (statement.run(entry.trueId).changes > 0) dropped.push(entry)
-  }
-  return dropped
+  return { applied, violations, counts }
 }
 
 /**
@@ -886,9 +827,9 @@ function rewriteOutputs(
     if (!appliedSet.has(foldIdentifier(entry.table))) continue
     hidden.run(entry.table, entry.trueId, entry.winnerId)
   }
-  // `_sns_unplaceable` は**警告の重複を避けるため**の表なので、すでに知らせた
-  // 行は消さずに残し（行があれば同じ警告を繰り返さない）、いま置けるようになった
-  // 行だけを落とす
+  // `_sns_unplaceable` は、同期のたびに前回との差で警告と報告を出すための表である
+  // （`src/sync/rows-sync.ts` の `reportHiddenChanges`）。いま置かない行を書き、
+  // 置けるようになった行を落とす。親の削除の原因（原則4）も書く
   const keep = new Set(
     plan.unplaceable
       .filter((entry) => appliedSet.has(foldIdentifier(entry.table)))
@@ -908,14 +849,23 @@ function rewriteOutputs(
     remove.run(row.tableName, row.trueId)
   }
   const upsert = db.prepare(
-    `INSERT INTO "_sns_unplaceable" ("tableName", "trueId", "reason")
-     VALUES (?, ?, ?)
+    `INSERT INTO "_sns_unplaceable"
+       ("tableName", "trueId", "reason", "causeTable", "causeId")
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT ("tableName", "trueId") DO UPDATE SET
-       "reason" = "excluded"."reason"`
+       "reason" = "excluded"."reason",
+       "causeTable" = "excluded"."causeTable",
+       "causeId" = "excluded"."causeId"`
   )
   for (const entry of plan.unplaceable) {
     if (!appliedSet.has(foldIdentifier(entry.table))) continue
-    upsert.run(entry.table, entry.trueId, entry.reason)
+    upsert.run(
+      entry.table,
+      entry.trueId,
+      entry.reason,
+      entry.causeTable,
+      entry.causeId
+    )
   }
 }
 
@@ -937,8 +887,7 @@ function outcome(
   mode: 'normal' | 'merged',
   tables: string[],
   reason?: string,
-  counts?: RowsRebuildCounts,
-  discarded?: RebuildPlanDiscarded[]
+  counts?: RowsRebuildCounts
 ): RowsRebuildOutcome {
   return {
     status,
@@ -946,10 +895,8 @@ function outcome(
     tables,
     skips: state.skips,
     generation: state.generation,
-    warnings: [...state.warnings],
     reason,
     counts: counts ?? { inserted: 0, updated: 0, deleted: 0 },
-    discarded: discarded ?? [],
   }
 }
 
@@ -966,17 +913,14 @@ function canonicalTables(
 }
 
 /** `_sns_dirty` に何か載っているか（載っていなければ作り直すものが無い）。 */
-function hasWork(db: Database.Database, options: RowsRebuildOptions): boolean {
-  if (options.targets !== undefined) return options.targets.length > 0
+function hasWork(db: Database.Database): boolean {
   return db.prepare(`SELECT 1 FROM "_sns_dirty" LIMIT 1`).get() !== undefined
 }
 
 /**
  * ライブラリの表を除いた、この DB のふつうの表。
  *
- * `_heartbeat` と `_id_merge` は**もう作らない**が、除外の名前は残す。旧版で
- * 作られた DB にはこれらの表がまだ在りうるので、外すと「アプリの表」として
- * 拾われてしまう。
+ * 旧版が作っていた `_heartbeat` と `_id_merge` は、`setupSync` のたびに移行（`src/rows/migrate.ts`）が落とすので、ここでは数えない。
  */
 function allUserTables(db: Database.Database): string[] {
   return (
@@ -987,7 +931,7 @@ function allUserTables(db: Database.Database): string[] {
             AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
             AND name NOT LIKE '\\_sns\\_%' ESCAPE '\\'
             AND name NOT IN ('_tombstone', '_changelog', '_changelog_prune',
-                             '_heartbeat', '_sync_meta', '_sync_state', '_id_merge')`
+                             '_sync_meta', '_sync_state')`
       )
       .all() as { name: string }[]
   ).map((row) => row.name)

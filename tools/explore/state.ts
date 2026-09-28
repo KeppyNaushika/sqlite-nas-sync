@@ -17,24 +17,22 @@
  *   並びが違えば処理の順が変わりうる。主キー順に並べ直すと、その違いを潰してしまう
  * - `_tombstone`（全列、rowid 順。作り直しが `WHERE tableName = ?` で順序指定なしに読む）
  * - `_sns_rows_<表>`（全列、rowid 順。案A の版の正）
- * - `_sns_clock`・`_sns_shown`・`_sns_hidden`・`_sns_dirty`（全列、rowid 順）
- * - `_id_merge`（全列、rowid 順）。旧方式の残りで、いまの `src/` が作ることはない
- *   （`src/rows/migrate.ts` が移行のときに落とす）。移行前のDBを読んでも取りこぼさないため
- * - `_changelog`（id, tableName, recordId, operation, changedAt。id 順）
+ * - `_sns_clock`（`importTick` を除く）・`_sns_shown`・`_sns_hidden`・`_sns_unplaceable`・`_sns_dirty`
+ *   （全列、rowid 順）。`_sns_unplaceable` は次の同期の報告（`parentDeleted` / `parentReturned` と
+ *   `Unplaceable` の警告）の「前回の状態」になる
+ * - `_changelog`（id, tableName, recordId, operation, changedAt。id 順）。`changedAt` は値を持たず、時刻として読めるかだけを残す（下の「振る舞いに効かない値」）
  * - `sqlite_sequence`（次に振られる changelog の id）
  * - `_changelog_prune.prunedThroughId`
  * - `_sync_state`（remoteClientId, lastSeenId）
- * - `_sync_meta`（**self-check が「どこまで見直したか」を changelog の id で置いている**。
- *   前任の途中成果はこれを外していた。外すと「見直し済みの位置だけが違う2状態」を
- *   同じと見て、見直しが走らない側の反例を見逃す）
+ * - `_sync_meta`（全行。`sns.generation`・`sns.lastLamport`・`sns.instanceId` など、
+ *   復元の判定と版の確認に効く値が入る）
  * - スキーマ（`sqlite_master` の全 SQL の要約）。作り直しはトリガを外して付け直すので、
  *   付け直し損ねた状態を同じと見ないため
  * - NAS ディレクトリにある、端末のコピー以外のファイル名（`.tmp` の残骸など）
  * - 時計 C（tools/explore/world.ts）。どの刻みと等しいか（等しくなければ「fresh」）だけ
  *
- * 上のうち `_sns_*` と `_id_merge` は、DBに**在るときだけ**読む（方式の違うDBでも同じ検査器で
- * 読めるように）。読み落とすと「それだけが違う2状態」を同じと見て反例を見逃すので、
- * 表が増えたら必ずここに載せること。
+ * 読み落とすと「それだけが違う2状態」を同じと見て反例を見逃すので、
+ * `src/` が内部の表を増やしたら必ずここに載せること。
  *
  * ## 絶対値を持たない値
  *
@@ -46,11 +44,32 @@
  *   「残りの深さ + 1」以上で打ち切る
  * - `instanceId`（`_sns_instance` と `_sync_meta.instanceId`）—— 字面の順を保った記号
  *
- * `_sns_clock.tick` は含めない（作り直しの検出の数え上げで、値そのものは以後の振る舞いを決めない）。
+ * `_sns_tick`（表ごとの書き込み回数）と `_sns_clock.importTick` は含めない（作り直しの計算が
+ * 古くないかを見る数え上げで、値そのものは以後の振る舞いを決めない）。
  *
  * ## 含めないもの
  *
  * - SQLite の空きページ・ファイルの大きさ —— 論理的な中身だけが振る舞いに効く
+ * - NAS 上のコピーの `_sns_dirty`（下の「振る舞いに効かない値」）
+ *
+ * ## 振る舞いに効かない値
+ *
+ * 再生するたびに揺れる値が状態に入ると、同じ列を再生しても違う状態に戻り（`replayMismatches`）、
+ * 状態の同一視と順序の畳み込みの前提が崩れる。
+ * 揺れる値のうち、ライブラリが読まないか、読んでも答えが状態によらず決まっているものは、状態から外す。
+ *
+ * - `_changelog.changedAt` —— ライブラリが読むのは掃除（`src/changelog.ts` の `cleanupChangelog` と
+ *   `describeChangelogPruneWall`）だけで、見るのは「時刻として読めるか」と「保持期間（7日）より古いか」である。
+ *   検査の中の `changedAt` は、操作が刻む時計 C と、取り込みが刻む実行中の現在時刻しか無く、
+ *   どちらも保持期間の内側にある（{@link TimeLabeler.assertRuntimeTimes} で毎回確かめる）。
+ *   検査器の `pruneChangelog` は id で消すので時刻を見ない。
+ *   したがって値の大小も同着も振る舞いに効かない。
+ *   値を残すと、1回の同期の中で取り込みが書く2件の通知が同じミリ秒に収まるかどうかで状態が割れる。
+ *   他の時刻の順位もずれるので、札を付ける時刻の集合（{@link collectTimes}）からも外す
+ * - NAS 上のコピーの `_sns_dirty` —— 他の端末は相手のコピーの `_sns_dirty` を読まない（設計書 §3.1）。
+ *   自分のコピーから読むのは `_sync_meta` の印だけである。
+ *   無駄な転送の抑制の覚え（状態に入らない）によって「上げてから作り直す」と「作り直してから上げる」が入れ替わり、
+ *   コピーに入る `_sns_dirty` だけが揺れる
  *
  * ## 採番値（`_changelog.id` など）は**生のまま**含める
  *
@@ -60,7 +79,6 @@
  * - `hasChangelogGap` は `lastSeenId === 0`、`prunedThroughId > 0` を特別扱いする
  * - 性質テストの `pruneChangelog` は `id <= floor + 1` で消す。読み位置 0 の相手に対しては
  *   「id 1 だけ」を消すので、頭が既に削られていれば何も消えない
- * - `_sync_meta` の self-check の位置は文字列として格納された id
  *
  * ずらすと、この違いを持つ2状態を同じと見る。重複排除の効きは少し落ちるが、
  * 嘘をつくよりよいので**ずらさない**。
@@ -71,8 +89,13 @@
  *
  * 1. **範囲で決めた行の時刻**（`2026-01-01T00:00:00.000Z` など。書式違いも含む）——
  *    実行をまたいで同じ値なので**字面のまま**持つ
- * 2. **実行中に刻まれる時刻**（時計 C、同期が刻む墓標や `_id_merge.mergedAt`）——
- *    字面を入れると同じ状態が二度と一致せず、重複排除が完全に効かなくなる
+ * 2. **実行中に刻まれる時刻** —— 時計 C（操作が刻んだ `changedAt`・`deletedAt`・削除の版の
+ *    `_sns_ts` を C へそろえたもの。tools/explore/world.ts の「時計」）と、同期が刻む
+ *    `_changelog.changedAt`。字面を入れると同じ状態が二度と一致せず、重複排除が完全に効かなくなる
+ *
+ * 時刻として札を付ける列は、名前が `At` で終わる列と `_sns_ts`（{@link isTimeColumn}）。
+ * `_sns_ts` には 1 の値（アプリが書いた時刻を引き上げたもの）と 2 の値（削除を実行した時刻）の
+ * 両方が入る。1 の値は字面のまま残るので、2 の値だけが順位に置き換わる。
  *
  * 2 は、状態に現れる全ての時刻（1 の値は状態に無くても全部）を `julianday` の順に
  * 並べた**順位**へ置き換える。同じ瞬間は同じ順位、ただし**字面が違えば順位の中で
@@ -127,31 +150,24 @@ function readDb(db: Database.Database, dataTables: readonly string[]): RawDb {
     const columns = statement.columns().map((column) => column.name)
     sections.push({ name, columns, rows: statement.all() as Value[][] })
   }
-  const present = new Set(
-    db
-      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`)
-      .pluck()
-      .all() as string[]
-  )
-  const readIfPresent = (name: string): void => {
-    if (present.has(name)) read(name, `SELECT * FROM "${name}" ORDER BY rowid`)
-  }
   for (const table of dataTables) {
     read(table, `SELECT * FROM "${table}" ORDER BY rowid`)
   }
   read('_tombstone', `SELECT * FROM _tombstone ORDER BY rowid`)
-  readIfPresent('_id_merge')
-  // 案A（docs/rows-table-design.md §8.2）の表。いまの `src/` には無いので、
-  // **在るときだけ**読む。読み落とすと「_sns_rows_* だけが違う2状態」を同じと見て
-  // 反例を見逃すので、案A の実装が入ったら必ずここに載っていることを確かめること
-  for (const table of dataTables) readIfPresent(`_sns_rows_${table}`)
+  for (const table of dataTables) {
+    read(
+      `_sns_rows_${table}`,
+      `SELECT * FROM "_sns_rows_${table}" ORDER BY rowid`
+    )
+  }
   for (const name of [
     '_sns_clock',
     '_sns_shown',
     '_sns_hidden',
+    '_sns_unplaceable',
     '_sns_dirty',
   ]) {
-    readIfPresent(name)
+    read(name, `SELECT * FROM "${name}" ORDER BY rowid`)
   }
   read(
     '_changelog',
@@ -335,6 +351,26 @@ export class TimeLabeler {
     return j
   }
 
+  /**
+   * 札を付けない時刻（`_changelog.changedAt`）が、実行中に刻まれた時刻の範囲にあることを確かめる。
+   *
+   * 範囲で決めた行の時刻と同じ字面なら確かめない（前提が崩れていないので）。
+   * 崩れていれば、値を捨てたことで振る舞いの違う2状態を同じと見るおそれがあるので例外で止める。
+   */
+  assertRuntimeTimes(values: Iterable<string>): void {
+    for (const value of values) {
+      if (this.known.has(value)) continue
+      const j = this.julianOf(value)
+      if (j === null) continue
+      if (j <= this.pastMaxJulian || j >= this.futureMinJulian) {
+        throw new Error(
+          `時刻の正規化の前提が崩れている: 状態から外した changedAt ${value} が、` +
+            `実行中に刻まれた時刻の範囲に無い`
+        )
+      }
+    }
+  }
+
   /** 状態に現れた時刻の集合から、字面 → 札 の対応を作る。 */
   labels(values: Iterable<string>): Map<string, string> {
     const universe = new Set<string>(this.known)
@@ -402,13 +438,50 @@ export class TimeLabeler {
   }
 }
 
-/** 時刻として札を付ける列か（名前が `At` で終わる列） */
+/**
+ * 時刻として札を付ける列か。名前が `At` で終わる列（`updatedAt`・`deletedAt`・`changedAt`）と、
+ * 版の順序用の時刻 `_sns_ts`。
+ *
+ * `_sns_ts` を外すと、削除の版に入る実行時刻（C の値）が生の字面のまま状態の鍵に入り、
+ * 同じ形の状態が実行ごとに別物になって重複排除が効かなくなる。
+ */
 function isTimeColumn(column: string): boolean {
-  return column.endsWith('At')
+  return column.endsWith('At') || column === '_sns_ts'
 }
 
 function stampValues(raw: RawWorld): Set<string> {
   return new Set(collectTimes(raw))
+}
+
+/**
+ * 値を持たない時刻の列か（`_changelog.changedAt`）。
+ *
+ * 札を付けず、時刻として読めるかだけを残す（冒頭の「振る舞いに効かない値」）。
+ */
+function isUnvaluedTime(section: string, column: string): boolean {
+  return section === '_changelog' && column === 'changedAt'
+}
+
+/** 値を持たない時刻の列の中身を集める（前提の確かめに使う）。 */
+function collectUnvaluedTimes(raw: RawWorld): string[] {
+  const values: string[] = []
+  const visit = (db: RawDb | null): void => {
+    if (db === null) return
+    for (const section of db.sections) {
+      section.columns.forEach((column, index) => {
+        if (!isUnvaluedTime(section.name, column)) return
+        for (const row of section.rows) {
+          const value = row[index]
+          if (typeof value === 'string' && TIME_PATTERN.test(value)) {
+            values.push(value)
+          }
+        }
+      })
+    }
+  }
+  raw.local.forEach(visit)
+  raw.nas.forEach(visit)
+  return values
 }
 
 /** 状態に現れる、札を付ける対象の時刻を集める。 */
@@ -419,6 +492,7 @@ export function collectTimes(raw: RawWorld): string[] {
     for (const section of db.sections) {
       section.columns.forEach((column, index) => {
         if (!isTimeColumn(column)) return
+        if (isUnvaluedTime(section.name, column)) return
         for (const row of section.rows) {
           const value = row[index]
           if (typeof value === 'string' && TIME_PATTERN.test(value)) {
@@ -464,28 +538,21 @@ const INSTANCE_COLUMNS = new Set(['instanceId', '_sns_instance'])
 /**
  * 状態に含めない列。
  *
- * `_sns_clock.tick` / `_sns_clock.importTick` は作り直しの検出に使う数え上げで、
- * 値そのものは以後の振る舞いを決めない（設計書 §8.2 が「含めない」と書いている）。
- * **段階5 で `importTick` を足した** —— 実装の列名は `importTick`（§3.7.1 の token）で、
- * 取り込みのたびに1つ進む。含めたままだと、同期するたびに「前と同じだが importTick だけ
- * 違う」状態が生まれ、**不動点に永久に達しない**（判定3 の偽の反例になる）。
+ * `_sns_clock.importTick` は作り直しの計算が古くないかを見る数え上げ（設計書 §3.7.1 の token）で、
+ * 値そのものは以後の振る舞いを決めない。取り込みのたびに1つ進むので、含めたままだと
+ * 同期するたびに「前と同じだが importTick だけ違う」状態が生まれ、**不動点に永久に達しない**
+ * （判定9 の偽の反例になる）。
  */
 const DROPPED_COLUMNS: Record<string, Set<string>> = {
-  _sns_clock: new Set(['tick', 'importTick']),
+  _sns_clock: new Set(['importTick']),
 }
 
-/**
- * `_sync_meta` の鍵のうち、端末ごとの乱数の id が入るもの（案A。`src/rows/meta.ts`）。
- */
-const INSTANCE_META_KEYS = new Set([
-  'instanceId',
-  'sns.instanceId',
-  'sns.lastInstance',
-])
-/** `_sync_meta` の鍵のうち、lamport の値が入るもの（案A）。 */
+/** `_sync_meta` の鍵のうち、端末ごとの乱数の id が入るもの（`src/rows/meta.ts`）。 */
+const INSTANCE_META_KEYS = new Set(['sns.instanceId', 'sns.lastInstance'])
+/** `_sync_meta` の鍵のうち、lamport の値が入るもの。 */
 const LAMPORT_META_KEYS = new Set(['sns.lastLamport'])
-/** `_sync_meta` の鍵のうち、`generation` が入るもの（案A では `sns.generation`）。 */
-const GENERATION_META_KEYS = ['sns.generation', 'generation']
+/** `_sync_meta` の鍵のうち、`generation` が入るもの。 */
+const GENERATION_META_KEY = 'sns.generation'
 
 /** `_sync_meta` の1つのキーの値を読む（無ければ null）。 */
 function metaValue(db: RawDb | null, key: string): string | null {
@@ -504,13 +571,8 @@ function metaValue(db: RawDb | null, key: string): string | null {
   return null
 }
 
-/** 案A・旧版のどちらの鍵でも `generation` を読む。 */
 function generationOf(db: RawDb | null): string | null {
-  for (const key of GENERATION_META_KEYS) {
-    const value = metaValue(db, key)
-    if (value !== null) return value
-  }
-  return null
+  return metaValue(db, GENERATION_META_KEY)
 }
 
 /** 世界ぜんたいに現れた lamport の値と instanceId の字面を集める。 */
@@ -534,7 +596,6 @@ function collectNormalizable(raw: RawWorld): {
         }
       })
     }
-    // 案A の鍵は `sns.instanceId` / `sns.lastInstance`、旧版は `instanceId`
     const section = db.sections.find((item) => item.name === '_sync_meta')
     if (section !== undefined) {
       const keyIndex = section.columns.indexOf('key')
@@ -561,18 +622,15 @@ function collectNormalizable(raw: RawWorld): {
 /**
  * 正規化した状態を1本の文字列にする。
  *
- * @param permutation - 端末の入れ替え（`permutation[元の添字] = 新しい添字`）。
- *   恒等なら `[0, 1, …]`。入れ替えるのは**端末の並び**と**端末名の字面**
- *   （`_sync_state.remoteClientId`）だけで、中身には触らない
+ * 端末の並びは入れ替えない（案A では端末の入れ替えは対称でない。tools/explore/reduction.ts）。
+ *
  * @param options - 案A の値（`generation`・lamport）の畳み方
  */
 export function serializeState(
   raw: RawWorld,
   labels: Map<string, string>,
-  permutation: number[],
   options: NormalizeOptions
 ): string {
-  const n = permutation.length
   const { lamports, instances } = collectNormalizable(raw)
   // instanceId は端末ごとの乱数で、字面をそのまま持つと同じ状態が二度と一致しない。
   // 正規化の入り切りを設けていないのは、**外す意味が無い**（外すと重複排除が全く効かない）から
@@ -586,31 +644,24 @@ export function serializeState(
       ? `gen ${generationRelation(generationOf(local), generationOf(raw.nas[index]))}`
       : null
   )
-  const renameClient = (value: Value): Value => {
-    if (typeof value !== 'string') return value
-    for (let index = 0; index < n; index += 1) {
-      if (value === clientName(index)) return clientName(permutation[index])
-    }
-    return value
-  }
   const serializeDb = (
     db: RawDb | null,
-    generationLabel: string | null
+    generationLabel: string | null,
+    place: 'local' | 'nas'
   ): string => {
     if (db === null) return 'absent'
     const parts: string[] = [`schema ${db.schema}`]
     for (const section of db.sections) {
+      // NAS 上のコピーの `_sns_dirty` は誰も読まない（冒頭の「振る舞いに効かない値」）
+      if (place === 'nas' && section.name === '_sns_dirty') continue
       const dropped = DROPPED_COLUMNS[section.name]
       const keptColumns = section.columns
         .map((column, index) => ({ column, index }))
         .filter(({ column }) => dropped === undefined || !dropped.has(column))
       const keyIndex = section.columns.indexOf('key')
-      let rows = section.rows.map((row) =>
+      const rows = section.rows.map((row) =>
         keptColumns.map(({ column, index }) => {
           const value = row[index]
-          if (section.name === '_sync_state' && index === 0) {
-            return renameClient(value)
-          }
           // 案A: lamport は最大値からの隔たり、instanceId は字面の順を保った記号へ
           if (LAMPORT_COLUMNS.has(column) && typeof value === 'number') {
             return lamportMap.get(value) ?? value
@@ -622,7 +673,7 @@ export function serializeState(
             const key = keyIndex < 0 ? null : String(row[keyIndex])
             if (
               key !== null &&
-              GENERATION_META_KEYS.includes(key) &&
+              key === GENERATION_META_KEY &&
               generationLabel !== null
             ) {
               return generationLabel
@@ -641,25 +692,23 @@ export function serializeState(
               }
             }
           }
+          if (isUnvaluedTime(section.name, column)) {
+            // 時刻として読めるかだけを残す（読めない値は掃除の「壁」になる）
+            return typeof value === 'string' && TIME_PATTERN.test(value)
+              ? 'time'
+              : value
+          }
           if (typeof value === 'string' && isTimeColumn(column)) {
             return labels.get(value) ?? value
           }
           return value
         })
       )
-      if (section.name === '_sync_state') {
-        // 端末名を入れ替えたら並びも名前の順へ揃え直す（読むのは名前で引く箇所だけ）
-        rows = [...rows].sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1))
-      }
       parts.push(`${section.name} ${JSON.stringify(rows)}`)
     }
     return parts.join('\n')
   }
 
-  const order: number[] = new Array<number>(n)
-  permutation.forEach((to, from) => {
-    order[to] = from
-  })
   // 時計は「どの刻みと等しいか」だけが効く。等しい刻みが無ければ（印のまま、または
   // 名乗った操作が何も書かなかった）以後の操作は全ての刻みより後なので、印と同じに扱う
   const clockValue = raw.clock
@@ -668,31 +717,18 @@ export function serializeState(
       ? (labels.get(clockValue) ?? clockValue)
       : 'fresh'
   const lines: string[] = [`clock ${clockLabel}`]
-  order.forEach((from, to) => {
+  raw.local.forEach((local, index) => {
     // generation の札は「その端末の手元と NAS の写しの関係」なので、両側へ同じものを置く
-    const generationLabel = generationLabels[from]
+    const generationLabel = generationLabels[index]
     lines.push(
-      `## local ${clientName(to)}\n${serializeDb(raw.local[from], generationLabel)}`
+      `## local ${clientName(index)}\n${serializeDb(local, generationLabel, 'local')}`
     )
     lines.push(
-      `## nas ${clientName(to)}\n${serializeDb(raw.nas[from], generationLabel)}`
+      `## nas ${clientName(index)}\n${serializeDb(raw.nas[index], generationLabel, 'nas')}`
     )
   })
-  lines.push(
-    `nasExtras ${JSON.stringify(raw.nasExtras.map((file) => renameClientFile(file, permutation)))}`
-  )
+  lines.push(`nasExtras ${JSON.stringify(raw.nasExtras)}`)
   return lines.join('\n')
-}
-
-function renameClientFile(file: string, permutation: number[]): string {
-  let renamed = file
-  permutation.forEach((to, from) => {
-    renamed = renamed.replace(
-      `client-${clientName(from)}.`,
-      `client-${clientName(to)}#.`
-    )
-  })
-  return renamed.replace(/#\./g, '.')
 }
 
 export function hashString(text: string): string {
@@ -701,52 +737,19 @@ export function hashString(text: string): string {
 
 /** 正規化の結果。 */
 export type CanonicalState = {
-  /** 重複排除の鍵（対称性で畳んだ場合は、軌道の中で最小のハッシュ） */
+  /** 重複排除の鍵（正規化した状態の直列化のハッシュ） */
   key: string
-  /**
-   * 並びを変えない（渡した候補の先頭＝恒等で直列化した）ハッシュ。世界の上で同じ状態かを見るのに使う
-   * （鏡写しの状態どうしは key が同じでも frameKey が違う）
-   */
-  frameKey: string
-  /** `key` を与えた端末の入れ替え（自己対称な状態では複数） */
-  permutations: number[][]
 }
 
-/**
- * 状態の鍵を作る。`permutations` に入れ替えの候補（恒等を含む）を渡す。
- */
+/** 状態の鍵を作る。 */
 export function canonicalize(
   raw: RawWorld,
   labeler: TimeLabeler,
-  permutations: number[][],
   options: NormalizeOptions
 ): CanonicalState {
   const labels = labeler.labels(collectTimes(raw))
-  let best: string | null = null
-  let achieving: number[][] = []
-  let frameKey = ''
-  permutations.forEach((permutation, index) => {
-    const hash = hashString(serializeState(raw, labels, permutation, options))
-    if (index === 0) frameKey = hash
-    if (best === null || hash < best) {
-      best = hash
-      achieving = [permutation]
-    } else if (hash === best) {
-      achieving.push(permutation)
-    }
-  })
-  return { key: best ?? '', frameKey, permutations: achieving }
-}
-
-/** 反例を読むための、正規化した状態の中身そのもの（恒等の並び）。 */
-export function dumpState(
-  raw: RawWorld,
-  labeler: TimeLabeler,
-  options: NormalizeOptions
-): string {
-  const labels = labeler.labels(collectTimes(raw))
-  const identity = raw.local.map((_, index) => index)
-  return serializeState(raw, labels, identity, options)
+  labeler.assertRuntimeTimes(collectUnvaluedTimes(raw))
+  return { key: hashString(serializeState(raw, labels, options)) }
 }
 
 type Row = Record<string, unknown>

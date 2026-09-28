@@ -12,18 +12,23 @@ import Database from 'better-sqlite3'
 import { SyncResult } from '../types'
 
 /**
- * `_sync_state` テーブルからリモートクライアントの同期進捗を取得する。
+ * `_sync_state` テーブルから、その相手をどこまで読んだか（`lastSeenId`）を取得する。
+ *
+ * 行が無ければ `null` を返す。
+ * **「まだ一度も読んでいない」と「0 まで読んだ」は別の状態である。**
+ * 一度も書いていない相手は `_changelog` が空なので、読み終えたあとのカーソルも 0 になる。
+ * 行の有無で分けないと、その相手を読むたびに「初回」と判断してフルマージを繰り返す。
  * @internal
  */
 export function getSyncState(
   localDb: Database.Database,
   remoteClientId: string
-): { lastSeenId: number } {
+): number | null {
   const row = localDb
     .prepare(`SELECT lastSeenId FROM _sync_state WHERE remoteClientId = ?`)
     .get(remoteClientId) as { lastSeenId: number } | undefined
 
-  return row ?? { lastSeenId: 0 }
+  return row === undefined ? null : row.lastSeenId
 }
 
 /**
@@ -44,22 +49,29 @@ export function updateSyncState(
 }
 
 /**
- * スキーマバージョン不一致でスキップしたリモートを結果に記録する。
+ * スキーマのバージョンが違うので見送ったリモートを結果に記録する。
  *
- * 後方互換のため warnings にも文字列を追加する。
- * 同一クライアントは1回のsyncにつき1エントリのみ記録する。
+ * `skippedRemotes` に載せ、`warnings` にも1行足す。
+ * 同一クライアントは1回の同期につき1エントリのみ記録する。
  *
+ * @param remoteVersion - 相手のスキーマのバージョン。読めなければ `null`
+ * @param localVersion - 自分のスキーマのバージョン
+ * @param formatDiffers - スキーマのバージョンは同じで、ライブラリのデータの形式だけが違う
  * @internal
  */
 export function recordSkippedRemote(
   result: SyncResult,
   clientId: string,
   remoteVersion: string | null,
-  localVersion: string
+  localVersion: string,
+  formatDiffers = false
 ): void {
   if (result.skippedRemotes.some((s) => s.clientId === clientId)) return
   result.skippedRemotes.push({ clientId, remoteVersion, localVersion })
   result.warnings.push(
-    `Skipping client ${clientId}: schema version mismatch (local=${localVersion}, remote=${remoteVersion ?? 'unknown'})`
+    `Skipping client ${clientId}: schema version mismatch (local=${localVersion}, remote=${remoteVersion ?? 'unknown'})` +
+      (formatDiffers
+        ? ` — the schema versions match but the library data format differs; update sqlite-nas-sync on both clients to the same version`
+        : '')
   )
 }

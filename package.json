@@ -73,8 +73,7 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
-    "docs/principles.md",
-    "docs/rows-table-design.md"
+    "docs/principles.md"
   ],
   "engines": {
     "node": ">=16.0.0"

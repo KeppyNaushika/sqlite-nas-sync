@@ -1,5 +1,5 @@
 /**
- * 案A の同期の流れ（設計書 `docs/rows-table-design.md` §4.1）。
+ * 同期1回の流れ（設計書 `docs/rows-table-design.md` §4.1）。
  *
  * 1回の `performSync` はこう進む:
  *
@@ -38,11 +38,10 @@ import {
 import {
   cleanupChangelog,
   describeChangelogPruneWall,
-  getMaxChangelogId,
+  fullMergeCursor,
   hasChangelogGap,
   normalizeRetentionDays,
   readChangelog,
-  readChangelogPrunedThroughId,
 } from '../changelog'
 import {
   FileStamp,
@@ -66,14 +65,9 @@ import {
   localPushFingerprint,
   readWouldBeNoOp,
 } from './idle'
-import { readSchemaVersion, writeSchemaVersion } from '../setup'
+import { readSchemaVersion, writeSchemaVersion } from '../setup/schema-version'
 import { getSyncState, recordSkippedRemote, updateSyncState } from './state'
-import {
-  ROWS_FORMAT,
-  RowsImportKey,
-  importFromPeer,
-  readSnsFormat,
-} from '../rows/import'
+import { ROWS_FORMAT, RowsImportKey, importFromPeer } from '../rows/import'
 import {
   RowsRebuildHooks,
   RowsRebuildState,
@@ -90,7 +84,13 @@ import {
   selfCopyPath,
 } from '../rows/restore-detect'
 import { migrateToRows } from '../rows/migrate'
-import { RowsTableSpec } from '../rows/schema'
+import {
+  RowsTableSpec,
+  VERSION_COLUMNS,
+  primaryKeyColumn,
+  rowsTableName,
+} from '../rows/schema'
+import { escapeIdentifier } from '../setup/sql'
 import { SNS_META_KEYS, readSnsMeta } from '../rows/meta'
 
 /**
@@ -104,9 +104,9 @@ export interface RowsSyncRuntime {
   rebuild: RowsRebuildState
   /** この `setupSync` の端末の id（`sns.instanceId`） */
   instanceId?: string
-  /** 作り直しの計算に使うワーカーの位置（省略すると `dist` の隣） */
+  /** 試験のための差し込み口。作り直しの計算に使うワーカーの位置（省略すると `dist` の隣） */
   workerPath?: string
-  /** ワーカーを使わず主スレッドで計算する（試験・検査器） */
+  /** 試験のための差し込み口。ワーカーを使わず主スレッドで計算する（試験・検査器） */
   forceMainThread?: boolean
   /**
    * 無駄な転送を落とすための覚え（`sync/idle`）。同期をまたいで持ち回る。
@@ -116,14 +116,14 @@ export interface RowsSyncRuntime {
    */
   idle?: IdleMemory
   /**
-   * 作り直しの差し込み口（設計書 §8.2 の `REQUIRED_HOOKS`）。**公開 API ではない**
-   * ——`SyncConfig` には出さない。網羅検査器が判定8・10・13・20・21 を
-   * 当てるために使う
+   * 試験と網羅検査器のための、作り直しの差し込み口（設計書 §8.2）。
+   * **公開 API ではない**ので `SyncConfig` には出さない。
+   * 検査器は設計書 §8.1 の判定8・10・13・20・21 をこれで当てる
    */
   hooks?: RowsRebuildHooks
 }
 
-/** 案A の同期を1回行う。 */
+/** 同期を1回行う。 */
 export async function performRowsSync(
   localDb: Database.Database,
   config: SyncConfig,
@@ -164,7 +164,8 @@ export async function performRowsSync(
     conflictsResolved: 0,
     folds: [],
     restores: [],
-    discarded: [],
+    parentDeleted: [],
+    parentReturned: [],
     warnings: [],
     skippedRemotes: [],
     hadChangelogGap: false,
@@ -198,7 +199,7 @@ export async function performRowsSync(
 
   // (H) 取り込みより前に見る。取り込みが lamport を引き上げると証拠が消える
   let restored = false
-  if (!canSkipRestoreCheck(idle, selfStamp).skip) {
+  if (!canSkipRestoreCheck(idle, selfStamp)) {
     const hadCopy = existsSync(selfPath)
     const restore = checkRestoreBeforeImport(localDb, location)
     if (hadCopy) {
@@ -211,12 +212,12 @@ export async function performRowsSync(
 
   const machinery = checkRowsMachinery(localDb, specs)
   if (machinery.needsRepair) {
-    // 欠けを1件ずつ並べると、旧方式から移る最初の1回で表の数×4本ぶんの警告が
+    // 欠けを1件ずつ並べると、トリガーが消えただけでも表の数×4本ぶんの警告が
     // 出て、他の知らせが埋もれる。**数と代表の1件**にまとめ、静かだと困る
     // 「旗の残り」だけは必ず書く（§3.10 の I）
     const first = machinery.issues[0]
     result.warnings.push(
-      `案A の仕掛けが ${machinery.issues.length} 件欠けている（例: ${first.message}）`
+      `同期の仕組み（内部テーブルの行・トリガー）が ${machinery.issues.length} 件欠けている（例: ${first.message}）`
     )
     if (machinery.rebuildingLeftover) {
       const leftover = machinery.issues.find(
@@ -233,7 +234,7 @@ export async function performRowsSync(
     })
     for (const warning of migration.warnings) result.warnings.push(warning)
     result.warnings.push(
-      `仕掛けが欠けていたので作り直した（${migration.from === 'legacy' ? '旧方式から移行' : '取り付け直し'}）`
+      `欠けていた同期の仕組みを作り直した（${migrationWording(migration.from)}）`
     )
   }
   const instanceId =
@@ -250,13 +251,9 @@ export async function performRowsSync(
   /* -------------------------------------------------------------- *
    * 段階 1 —— 相手の列挙と隙間の事前確認
    *
-   * **相手の写しを手元へ写すのは、1回の同期で相手1人につき1回だけ。** 以前は
-   * ここで写して隙間を調べ、`importAll` でもう一度写していた（相手2人なら
-   * 1回の同期で4回）。開いた手を段階2 の取り込みまで持ち回って1回にする。
-   * 持ち回っても見えるものは変わらない —— どちらも「その瞬間の写し」を読むので、
-   * 途中で相手が書き直しても、以前の形ではその2回が食い違いえた
-   * （隙間なしと見て、取り込みでは隙間のある中身を読む）。1回にすると、その
-   * 食い違いごと無くなる。
+   * **相手の写しを手元へ写すのは、1回の同期で相手1人につき1回だけ。**
+   * ここで開いた写しを段階2 の取り込みまで持ち回る。
+   * 隙間の判定と取り込みが同じ写しを読むので、途中で相手が書き直しても、隙間なしと見た相手から隙間のある中身を読むことは無い。
    * -------------------------------------------------------------- */
   ensureDirectory(config.nasPath)
   const remoteClients = listRemoteClients(config.nasPath, config.clientId)
@@ -265,14 +262,8 @@ export async function performRowsSync(
   try {
     for (const remote of remoteClients) {
       const stamp = fileStamp(remote.filePath)
-      const { lastSeenId } = getSyncState(localDb, remote.clientId)
-      const decision = canSkipRemoteRead(
-        idle,
-        remote.clientId,
-        stamp,
-        lastSeenId
-      )
-      if (decision.skip) {
+      const lastSeenId = getSyncState(localDb, remote.clientId)
+      if (canSkipRemoteRead(idle, remote.clientId, stamp, lastSeenId)) {
         // 前に読んだときと同じファイル・同じ読み位置。読んでも何も起きないことは
         // そのとき確かめてある（`readWouldBeNoOp`）ので、写さない
         transfers.peerReadsSkipped += 1
@@ -310,7 +301,7 @@ export async function performRowsSync(
         selfCopyExists: selfStamp !== null || existsSync(selfPath),
         restored,
         selfStampChanged,
-      }).skip
+      })
       if (skip) {
         transfers.uploadsSkipped += 1
         return true
@@ -338,7 +329,8 @@ export async function performRowsSync(
         transfers.bytes += fileSize(selfPath)
         if (ownership.taken) {
           result.warnings.push(
-            ownership.message ?? '写しの取り合いが起きている'
+            ownership.message ??
+              'NAS 上の自分のコピーを、同じ clientId を使う別のクライアントが書いている'
           )
           return false
         }
@@ -350,17 +342,20 @@ export async function performRowsSync(
     const hiddenBefore = snapshotHidden(localDb)
     const unplaceableBefore = snapshotUnplaceable(localDb)
 
+    // 隠れた行の差分は**作り直しの直後**に取る。写しの `await` を挟むと、その間に
+    // アプリが書いた行まで「統合が解けた」の判定に混ざる。また、写しで止まったときに
+    // 差分を載せずに返すと、次の回の「前」はもう新しい状態なので、二度と知らせられない
     if (!hasAnyGap) {
       if (!(await publish())) return stop(localDb, config, result)
-      importAll(localDb, peers, config, schemaVersion, specs, idle, result)
+      importAll(localDb, peers, schemaVersion, specs, idle, result)
       await rebuild(localDb, config, tableNames, state, result)
+      reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
     } else {
-      importAll(localDb, peers, config, schemaVersion, specs, idle, result)
+      importAll(localDb, peers, schemaVersion, specs, idle, result)
       await rebuild(localDb, config, tableNames, state, result)
+      reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
       if (!(await publish())) return stop(localDb, config, result)
     }
-
-    reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
   } finally {
     for (const peer of peers) peer.handle?.cleanup()
   }
@@ -405,8 +400,8 @@ interface PeerSlot {
   remote: { clientId: string; filePath: string }
   /** 段階1 で見たファイルの印 */
   stamp: FileStamp | null
-  /** 段階1 で見た手元の読み位置 */
-  lastSeenId: number
+  /** 段階1 で見た手元の読み位置。まだ一度も読んでいない相手は `null` */
+  lastSeenId: number | null
   /** 開いた手。写さなかった／開けなかったときは `null` */
   handle: RemoteDbHandle | null
   /** フルマージで読むか */
@@ -418,7 +413,6 @@ interface PeerSlot {
 function importAll(
   localDb: Database.Database,
   peers: PeerSlot[],
-  config: SyncConfig,
   schemaVersion: string | undefined,
   specs: RowsTableSpec[],
   idle: IdleMemory,
@@ -441,42 +435,28 @@ function importAll(
       }
       const peerDb = handle.db
 
-      // 版が違う相手は丸ごと見送る。`sns-format` が `rows1` でない相手も同じ（§4.2）
+      // `schemaVersion` が違う相手は丸ごと見送る（§4.2）。
+      // `schemaVersion` は `sns-format` を含むので、形式の違う相手もここで見送る
       if (!sameSchema(peerDb, schemaVersion)) {
+        const remoteVersion = readSchemaVersion(peerDb)
         recordSkippedRemote(
           result,
           remote.clientId,
-          readSchemaVersion(peerDb),
-          schemaVersion ?? ''
-        )
-        continue
-      }
-      const format = readSnsFormat(peerDb)
-      if (format !== ROWS_FORMAT) {
-        recordSkippedRemote(
-          result,
-          remote.clientId,
-          readSchemaVersion(peerDb),
-          schemaVersion ?? ''
-        )
-        result.warnings.push(
-          `Skipped remote ${remote.clientId}: sns-format=${format ?? '(無し)'}` +
-            `（こちらは ${ROWS_FORMAT}）`
+          appPartOf(remoteVersion ?? undefined) ?? null,
+          appPartOf(schemaVersion) ?? '',
+          remoteVersion !== null &&
+            appPartOf(remoteVersion) === appPartOf(schemaVersion)
         )
         continue
       }
 
-      const { lastSeenId } = getSyncState(localDb, remote.clientId)
-      const gap = peer.gap
+      const lastSeenId = peer.lastSeenId
       let keys: RowsImportKey[] | undefined
       let cursor: number
-      if (gap) {
+      if (peer.gap || lastSeenId === null) {
         // フルマージ。範囲は相手の `_sns_rows_*` と `_tombstone` の全部
         keys = undefined
-        cursor = Math.max(
-          getMaxChangelogId(peerDb),
-          readChangelogPrunedThroughId(peerDb)
-        )
+        cursor = fullMergeCursor(peerDb)
       } else {
         const entries = readChangelog(peerDb, lastSeenId)
         if (entries.length === 0) {
@@ -494,14 +474,14 @@ function importAll(
         tables: specs,
         keys,
       })
-      // **この取り込みが事実を1つでも動かしたか。** 動かしていないなら、同じ
+      // **この取り込みが版を1つでも動かしたか。** 動かしていないなら、同じ
       // ファイルを同じ読み位置でもう一度読んでも動かない（下の `rememberRead`）。
+      // `_sns_dirty` に表を載せるのは `Max` が動いたキーがあるときだけなので、
+      // `changed` が空なら載せた表も無い。
       // `_sns_clock` の token や lamport の引き上げは数えない —— どちらも
       // 二度目は同じ値で、取り込みの答えを変えないから
       const movedNothing =
-        imported.status === 'imported' &&
-        imported.changed.length === 0 &&
-        imported.dirtyTables.length === 0
+        imported.status === 'imported' && imported.changed.length === 0
       if (imported.status === 'skipped') {
         result.warnings.push(
           `Skipped remote ${remote.clientId}: ${imported.reason ?? '不明'}`
@@ -539,8 +519,8 @@ function importAll(
  *
  * 1. {@link readWouldBeNoOp} —— 差分が残っておらず、フルマージも要らない。
  *    もう一度読んでも、取り込みの入口にすら届かない
- * 2. `movedNothing` —— この回の取り込みが**事実を1つも動かさなかった**
- *    （`Max` が変わったキーも `_sns_dirty` に載せた表も無い）。フルマージへ
+ * 2. `movedNothing` —— この回の取り込みが**版を1つも動かさなかった**
+ *    （`Max` が変わったキーが無い）。フルマージへ
  *    落ちる相手（`_changelog` が空の写しを上げた端末など）はこちらに当たる。
  *    同じファイルを同じ読み位置でもう一度読めば、また何も動かない ——
  *    案A の取り込みは版の `Max` を取るだけで、手元の版は**下がらない**ので、
@@ -585,8 +565,8 @@ function dedupeKeys(
 /**
  * その相手をフルマージで読むか（§4.3 の「隙間あり」）。
  *
- * `hasChangelogGap` の規則に加えて、**まだ一度も読んでいない相手
- * （`lastSeenId === 0`）は必ずフルマージにする。**
+ * `hasChangelogGap` の規則に加えて、**まだ一度も読んでいない相手は必ずフルマージにする。**
+ * まだ読んでいないことは、`_sync_state` に行が無い（`lastSeenId` が `null`）ことで判断する。
  *
  * 差分の範囲は「相手の `_changelog` の `id > lastSeenId`」だが、相手の
  * `_changelog` は**事実そのものではなく通知の索引**で、掃除でも移行でも短くなる。
@@ -595,14 +575,22 @@ function dedupeKeys(
  * なりうる。空の `_changelog` を「言うことが無い」と読むと、その端末の行は
  * **誰にも届かないまま**になる（3端末の性質テストが踏んだ）。
  *
- * 一度も読んでいない相手からはどのみち全部要るので、初回をフルマージにすれば
- * この穴は閉じる。2回目以降は `lastSeenId > 0` なので通常の差分に戻る。
+ * 一度も読んでいない相手からはどのみち全部要るので、初回をフルマージにすればこの穴は閉じる。
+ * 一度読めば `_sync_state` に行ができるので、2回目以降は `hasChangelogGap` の判定に戻る。
+ * 一度も書いていない相手は `_changelog` が空で `prunedThroughId` も 0 なので、フルマージのあともカーソルは 0 のままになる。
+ * そのため、カーソルが 0 であることを「まだ読んでいない」の印にはできない。
+ * 印にすると、その相手を読むたびにフルマージを繰り返す。
+ *
+ * 行の有無で分けると、「0 まで読んだ相手が、そのあと書いた行の `_changelog` を読まれる前に失った」形は
+ * `hasChangelogGap` が拾わなければならない。
+ * `_changelog` が空で `prunedThroughId` も 0 のままだと、一度も書いていない相手と見分けが付かない。
+ * そのため `hasChangelogGap` は、相手が振った最大の id（`sqlite_sequence`）と残っている id の数も比べる。
  */
 function needsFullMerge(
   peerDb: Database.Database,
-  lastSeenId: number
+  lastSeenId: number | null
 ): boolean {
-  if (lastSeenId === 0) return true
+  if (lastSeenId === null) return true
   return hasChangelogGap(peerDb, lastSeenId)
 }
 
@@ -615,12 +603,24 @@ function sameSchema(
   return readSchemaVersion(peerDb) === schemaVersion
 }
 
+/** 仕組みを作り直したときの知らせに添える、作り直す前の DB の形。 */
+function migrationWording(from: 'legacy' | 'fresh' | 'refresh'): string {
+  if (from === 'legacy') return '以前のバージョンのライブラリの形式から移行した'
+  if (from === 'fresh') return '同期の内部テーブルが無かったので新しく作った'
+  return '付け直した'
+}
+
 /** アプリの版に `;sns-format=rows1` を付けた形にする（§3.8）。 */
 function withRowsFormat(schemaVersion: string): string {
   return `${appPartOf(schemaVersion) as string};sns-format=${ROWS_FORMAT}`
 }
 
-/** `<アプリの版>;sns-format=rows1` からアプリの版だけを取り出す。 */
+/**
+ * `<アプリの版>;sns-format=rows1` からアプリの版だけを取り出す。
+ *
+ * 利用者に見せる版（`SkippedRemote`）はこちらにする。
+ * `;sns-format=…` はライブラリの内部の印で、利用者が渡した値でも自動で計算した値でもない。
+ */
 function appPartOf(schemaVersion: string | undefined): string | undefined {
   if (schemaVersion === undefined) return undefined
   const at = schemaVersion.indexOf(';sns-format=')
@@ -658,16 +658,6 @@ async function rebuild(
   result.inserted += outcome.counts.inserted
   result.updated += outcome.counts.updated
   result.deleted += outcome.counts.deleted
-  // 捨てた子の中身は、ここでしか渡せない（`_sns_rows_<表>` から落としてある）
-  for (const entry of outcome.discarded) {
-    result.discarded.push({
-      tableName: entry.table,
-      recordId: entry.trueId,
-      content: entry.content,
-      causeTable: entry.causeTable,
-      causeId: entry.causeId,
-    })
-  }
   if (outcome.status === 'deferred') {
     result.warnings.push(
       `Rebuild deferred: ${outcome.reason ?? '不明'}（見送り ${outcome.skips} 回目）`
@@ -697,26 +687,61 @@ function snapshotHidden(db: Database.Database): Map<string, string | null> {
   return seen
 }
 
-function snapshotUnplaceable(db: Database.Database): Map<string, string> {
-  const seen = new Map<string, string>()
+/** `_sns_unplaceable` の1行。`cause` は親が削除されているときの大元の削除（原則4）。 */
+interface UnplaceableEntry {
+  reason: string
+  cause: { table: string; id: string } | null
+}
+
+function snapshotUnplaceable(
+  db: Database.Database
+): Map<string, UnplaceableEntry> {
+  const seen = new Map<string, UnplaceableEntry>()
   if (!tableExists(db, '_sns_unplaceable')) return seen
   for (const row of db
-    .prepare(`SELECT tableName, trueId, reason FROM _sns_unplaceable`)
-    .all() as { tableName: string; trueId: string; reason: string | null }[]) {
-    seen.set(`${row.tableName}\u0000${row.trueId}`, row.reason ?? '')
+    .prepare(
+      `SELECT tableName, trueId, reason, causeTable, causeId FROM _sns_unplaceable`
+    )
+    .all() as {
+    tableName: string
+    trueId: string
+    reason: string | null
+    causeTable: string | null
+    causeId: string | null
+  }[]) {
+    seen.set(`${row.tableName}\u0000${row.trueId}`, {
+      reason: row.reason ?? '',
+      cause:
+        row.causeTable === null || row.causeId === null
+          ? null
+          : { table: row.causeTable, id: row.causeId },
+    })
   }
   return seen
 }
 
 /**
- * `_sns_hidden` と `_sns_unplaceable` の**差分だけ**を結果へ載せる（§4.4）。
+ * 前回との差だけを結果へ載せる（§4.4）。前回の状態は、前回の作り直しが書いた
+ * `_sns_hidden` と `_sns_unplaceable` である。
  *
- * 全部載せると、隠れたままの行が同期のたびに何度も知らされる。
+ * 全部載せると、隠れたままの行や入らないままの行が同期のたびに何度も知らされる。
+ * 差で出すので、同じ行が他のクライアントから再び届いても、状態が変わらなければ出ない。
+ *
+ * `restores`（統合が解けた行）に載せるのは、`_sns_hidden` から外れ、**かつ
+ * いまアプリの表に置かれている**行だけである。`_sns_hidden` は作り直しのたびに
+ * 丸ごと書き直されるので、外れた理由は「統合が解けた」だけではない。
+ * 統合した行を `DELETE` すると両方の主キーに削除の版が付き（原則3）、負けていた側も
+ * 隠れる対象でなくなって `_sns_hidden` から外れる。ほかに、置けなくなった
+ * （`_sns_unplaceable`）場合も外れる。どれもアプリの表には入っていないので、
+ * `restores` に載せると事実と食い違う。
+ *
+ * 親が削除されているので置かない行（原則4）は、`Unplaceable` の警告ではなく
+ * `parentDeleted` に出す。そうでなくなってアプリの表に置かれた行は `parentReturned` に出す。
  */
 function reportHiddenChanges(
   db: Database.Database,
   hiddenBefore: Map<string, string | null>,
-  unplaceableBefore: Map<string, string>,
+  unplaceableBefore: Map<string, UnplaceableEntry>,
   result: SyncResult
 ): void {
   const hiddenAfter = snapshotHidden(db)
@@ -724,15 +749,121 @@ function reportHiddenChanges(
     if (hiddenBefore.has(token)) continue
     result.folds.push(foldOf(token, winnerId))
   }
+  const placed = placedLookup(db)
   for (const [token, winnerId] of hiddenBefore) {
     if (hiddenAfter.has(token)) continue
-    result.restores?.push(foldOf(token, winnerId))
+    const [tableName, trueId] = token.split('\u0000')
+    if (!placed(tableName, trueId)) continue
+    result.restores.push(foldOf(token, winnerId))
   }
   const unplaceableAfter = snapshotUnplaceable(db)
-  for (const [token, reason] of unplaceableAfter) {
-    if (unplaceableBefore.has(token)) continue
+  const content = contentLookup(db)
+  for (const [token, entry] of unplaceableAfter) {
+    const before = unplaceableBefore.get(token)
     const [tableName, trueId] = token.split('\u0000')
-    result.warnings.push(`Unplaceable ${tableName}:${trueId}: ${reason}`)
+    if (entry.cause !== null) {
+      // 親が削除されているので入らない。前回もそうだったなら出さない
+      if (before !== undefined && before.cause !== null) continue
+      result.parentDeleted.push({
+        tableName,
+        recordId: trueId,
+        content: content(tableName, trueId),
+        causeTable: entry.cause.table,
+        causeId: entry.cause.id,
+      })
+      continue
+    }
+    // 前回もこの行が同じ筋で入らなかったなら、警告はもう出してある
+    if (before !== undefined && before.cause === null) continue
+    result.warnings.push(`Unplaceable ${tableName}:${trueId}: ${entry.reason}`)
+  }
+  for (const [token, entry] of unplaceableBefore) {
+    if (entry.cause === null) continue
+    const now = unplaceableAfter.get(token)
+    if (now !== undefined && now.cause !== null) continue
+    const [tableName, trueId] = token.split('\u0000')
+    // 親が戻っても、別の理由で入らない（置かない行・隠れた行）なら出さない
+    if (!placed(tableName, trueId)) continue
+    result.parentReturned.push({
+      tableName,
+      recordId: trueId,
+      content: content(tableName, trueId),
+      causeTable: entry.cause.table,
+      causeId: entry.cause.id,
+    })
+  }
+}
+
+/**
+ * 真の id の行の内容を `_sns_rows_<表>` から読む関数を作る（報告に載せる内容）。
+ *
+ * 版の順序の3列は載せない。行の版が無ければ空のオブジェクトを返す。
+ */
+function contentLookup(
+  db: Database.Database
+): (tableName: string, trueId: string) => Record<string, unknown> {
+  const hidden = new Set<string>(Object.values(VERSION_COLUMNS))
+  const statements = new Map<string, Database.Statement>()
+  return (tableName, trueId) => {
+    const rows = rowsTableName(tableName)
+    if (!tableExists(db, rows)) return {}
+    let statement = statements.get(tableName)
+    if (statement === undefined) {
+      const primaryKey = escapeIdentifier(primaryKeyColumn(db, tableName).name)
+      statement = db.prepare(
+        `SELECT * FROM ${escapeIdentifier(rows)}
+          WHERE CAST(${primaryKey} AS TEXT) = ? LIMIT 1`
+      )
+      statements.set(tableName, statement)
+    }
+    const row = statement.get(trueId) as Record<string, unknown> | undefined
+    const picked: Record<string, unknown> = {}
+    for (const [column, value] of Object.entries(row ?? {})) {
+      if (!hidden.has(column)) picked[column] = value
+    }
+    return picked
+  }
+}
+
+/**
+ * 真の id の行が、いまアプリの表に置かれているかを答える関数を作る。
+ *
+ * アプリの表の主キーは**表示している id** である。1:1 の表では真の id と違うことが
+ * あり、その対応は `_sns_shown` にある（作り直しの結果）。
+ *
+ * - `_sns_shown` に真の id の行があれば、その `shownId` の行がアプリの表にあるか
+ * - 無ければ真の id そのものの行があるか。ただし、その id を**別の真の id が**
+ *   表示に使っている（`_sns_shown.shownId` に載っている）なら、それは別の行である
+ *
+ * id の突き合わせは `CAST(主キー AS TEXT)` で行う。真の id の正規形がこの形である
+ * （`ValueOrdering.idKey`）。
+ */
+function placedLookup(
+  db: Database.Database
+): (tableName: string, trueId: string) => boolean {
+  const shownOf = db.prepare(
+    `SELECT "shownId" FROM "_sns_shown" WHERE "tableName" = ? AND "trueId" = ?`
+  )
+  const shownByOther = db.prepare(
+    `SELECT 1 FROM "_sns_shown" WHERE "tableName" = ? AND "shownId" = ?`
+  )
+  const rowExists = new Map<string, Database.Statement>()
+  return (tableName, trueId) => {
+    if (!tableExists(db, tableName)) return false
+    let exists = rowExists.get(tableName)
+    if (exists === undefined) {
+      const primaryKey = escapeIdentifier(primaryKeyColumn(db, tableName).name)
+      exists = db.prepare(
+        `SELECT 1 FROM ${escapeIdentifier(tableName)}
+          WHERE CAST(${primaryKey} AS TEXT) = ? LIMIT 1`
+      )
+      rowExists.set(tableName, exists)
+    }
+    const shown = shownOf.get(tableName, trueId) as
+      { shownId: string } | undefined
+    if (shown !== undefined) return exists.get(shown.shownId) !== undefined
+    if (shownByOther.get(tableName, trueId) !== undefined) return false
+    return exists.get(trueId) !== undefined
   }
 }
 
