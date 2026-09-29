@@ -70,9 +70,37 @@ export interface RowsColumn {
   hidden: number
 }
 
+/** `_sns_rows_<表>` の接頭辞。 */
+const ROWS_TABLE_PREFIX = '_sns_rows_'
+
 /** `_sns_rows_<表>` の名前。 */
 export function rowsTableName(table: string): string {
-  return `_sns_rows_${table}`
+  return `${ROWS_TABLE_PREFIX}${table}`
+}
+
+/** `_sns_rows_<表>` の名前から、元の表の名前を取り出す。そうでない名前なら `null`。 */
+export function tableOfRowsTable(name: string): string | null {
+  return name.startsWith(ROWS_TABLE_PREFIX)
+    ? name.slice(ROWS_TABLE_PREFIX.length)
+    : null
+}
+
+/** 他の端末が NAS の写しから読む、`_sns_rows_<表>` 以外の表（設計書 §3.1）。 */
+const PUBLISHED_LEDGERS: readonly string[] = [
+  '_tombstone',
+  '_changelog',
+  '_changelog_prune',
+  '_sync_meta',
+]
+
+/**
+ * NAS の写しに載せる表か（設計書 §3.1 の「他端末が読む」表）。
+ *
+ * 写しにはこれだけを載せる。アプリの表・トリガー・他の端末が読まない帳簿は載せない。
+ * `_changelog` の `AUTOINCREMENT` の値は、別に `sqlite_sequence` から写す。
+ */
+export function isPublishedTable(name: string): boolean {
+  return PUBLISHED_LEDGERS.includes(name) || tableOfRowsTable(name) !== null
 }
 
 /** SQL の文字列リテラル（表の名前を SQL に埋めるときに通す）。 */
