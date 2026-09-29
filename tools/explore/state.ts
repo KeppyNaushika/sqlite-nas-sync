@@ -145,7 +145,17 @@ const TIME_PATTERN = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/
 
 function readDb(db: Database.Database, dataTables: readonly string[]): RawDb {
   const sections: Section[] = []
+  const present = new Set(
+    (
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+        .all() as { name: string }[]
+    ).map((row) => row.name)
+  )
   const read = (name: string, sql: string): void => {
+    // NAS の写しには、他の端末が読む表しか載っていない（src/nas.ts の copyToNas）。
+    // 載っていない表は、その写しの節として持たない
+    if (!present.has(name)) return
     const statement = db.prepare(sql).raw(true)
     const columns = statement.columns().map((column) => column.name)
     sections.push({ name, columns, rows: statement.all() as Value[][] })

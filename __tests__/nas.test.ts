@@ -233,8 +233,11 @@ describe('NASが思いどおりでないとき', () => {
 
     it('置いたファイルは、そのまま開いて読める', async () => {
       const db = new Database(path.join(testDir, 'local3.sqlite'))
-      db.exec(`CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)`)
-      db.prepare(`INSERT INTO t (id, v) VALUES (?, ?)`).run('a', 'hello')
+      db.exec(`CREATE TABLE _sync_meta (key TEXT PRIMARY KEY, value TEXT)`)
+      db.prepare(`INSERT INTO _sync_meta (key, value) VALUES (?, ?)`).run(
+        'schemaVersion',
+        'v1'
+      )
       const nasDir = path.join(testDir, 'nas3')
 
       await copyToNas(db, nasDir, 'me')
@@ -246,12 +249,81 @@ describe('NASが思いどおりでないとき', () => {
       )
       expect(handle).not.toBeNull()
       const row = handle!.db
-        .prepare(`SELECT v FROM t WHERE id = ?`)
-        .get('a') as {
-        v: string
-      }
-      expect(row.v).toBe('hello')
+        .prepare(`SELECT value FROM _sync_meta WHERE key = ?`)
+        .get('schemaVersion') as { value: string }
+      expect(row.value).toBe('v1')
       handle!.cleanup()
+    })
+
+    it('他の端末が読む表だけを、索引と AUTOINCREMENT の値ごと載せる', async () => {
+      const db = new Database(path.join(testDir, 'local4.sqlite'))
+      db.pragma('journal_mode = WAL')
+      db.exec(`
+        CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);
+        CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN SELECT 1; END;
+        CREATE VIRTUAL TABLE notes_fts USING fts5(body);
+        CREATE TABLE _sns_rows_notes (id TEXT PRIMARY KEY, body TEXT, _sns_ts);
+        CREATE TABLE _changelog (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, tableName TEXT, recordId TEXT
+        );
+        CREATE INDEX _changelog_by_key ON _changelog (tableName, recordId);
+        CREATE TABLE _sns_clock (onlyRow INTEGER PRIMARY KEY, lamport INTEGER);
+      `)
+      db.prepare(`INSERT INTO notes (id, body) VALUES ('n1', 'hello')`).run()
+      db.prepare(
+        `INSERT INTO _sns_rows_notes (id, body, _sns_ts) VALUES ('n1', 'hello', 5)`
+      ).run()
+      const log = db.prepare(
+        `INSERT INTO _changelog (tableName, recordId) VALUES ('notes', ?)`
+      )
+      for (const key of ['a', 'b', 'c']) log.run(key)
+      // 末尾の通知を直に消す。振った最大の id（3）は写しにも残らなければならない
+      db.exec(`DELETE FROM _changelog WHERE id = 3`)
+      const nasDir = path.join(testDir, 'nas4')
+
+      await copyToNas(db, nasDir, 'me')
+      db.close()
+
+      const copy = new Database(path.join(nasDir, 'client-me.sqlite'), {
+        readonly: true,
+      })
+      try {
+        const objects = copy
+          .prepare(
+            `SELECT type, name FROM sqlite_master
+              WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`
+          )
+          .all()
+        expect(objects).toEqual([
+          { type: 'index', name: '_changelog_by_key' },
+          { type: 'table', name: '_changelog' },
+          { type: 'table', name: '_sns_rows_notes' },
+        ])
+        expect(copy.prepare(`SELECT * FROM _sns_rows_notes`).all()).toEqual([
+          { id: 'n1', body: 'hello', _sns_ts: 5 },
+        ])
+        expect(copy.prepare(`SELECT id FROM _changelog`).all()).toEqual([
+          { id: 1 },
+          { id: 2 },
+        ])
+        expect(
+          copy
+            .prepare(
+              `SELECT seq FROM sqlite_sequence WHERE name = '_changelog'`
+            )
+            .get()
+        ).toEqual({ seq: 3 })
+      } finally {
+        copy.close()
+      }
+      // 手元の一時ファイルは残さない
+      const tmpDir = path.join(os.tmpdir(), 'sqlite-nas-sync')
+      const leftovers = fs.existsSync(tmpDir)
+        ? fs
+            .readdirSync(tmpDir)
+            .filter((name) => name.startsWith(`publish-${process.pid}-`))
+        : []
+      expect(leftovers).toEqual([])
     })
   })
 

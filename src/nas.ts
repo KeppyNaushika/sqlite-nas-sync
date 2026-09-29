@@ -12,6 +12,8 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
 import { RemoteClient } from './types'
+import { isPublishedTable } from './rows/schema'
+import { escapeIdentifier } from './setup/sql'
 
 /**
  * ディレクトリが存在しない場合に再帰的に作成する。
@@ -25,13 +27,22 @@ export function ensureDirectory(dirPath: string): void {
 }
 
 /**
- * ローカルDBをNASにアトミックコピーする。
+ * ローカルDBの写しを NAS に置く。
  *
- * better-sqlite3 の `backup()` APIで一時ファイルに書き込み、
- * `fs.renameSync` でアトミックにリネームする。
+ * **写しに載せるのは、他の端末が読む表だけである**（設計書 §3.1。`isPublishedTable`）。
+ * アプリの表とトリガーは載せない。どちらも他の端末は読まず、写しの大きさの大半を占める。
+ *
+ * 1. better-sqlite3 の `backup()` で、手元の一時領域に DB 全体の一貫した写しを取る
+ * 2. 新しい DB に、載せる表を元と同じ `CREATE` 文と索引で作り、行を写す
+ * 3. `sqlite_sequence` の値を元のまま写す。`_changelog` の隙間の判定がこの値を読むので、
+ *    行から数え直した値（いま残っている最大の id）にしてはいけない
+ * 4. NAS の一時ファイルへ置き、`fs.renameSync` でアトミックに差し替える
+ *
+ * 不要な表を `DROP` して作る方法は採らない。アプリの仮想表は、そのモジュールが
+ * 登録されていない接続では `DROP` できないからである。
  * ファイル名は `client-{clientId}.sqlite` となる。
  *
- * @param localDb - バックアップ元のローカルSQLiteデータベース接続
+ * @param localDb - 写す元のローカルSQLiteデータベース接続
  * @param nasPath - NAS上の共有ディレクトリパス
  * @param clientId - このクライアントの識別子
  * @throws NASへの書き込みに失敗した場合
@@ -47,7 +58,18 @@ export async function copyToNas(
   const destPath = path.join(nasPath, destFile)
   const tempPath = `${destPath}.tmp`
 
-  await localDb.backup(tempPath)
+  const tmpDir = defaultTmpDir()
+  ensureDirectory(tmpDir)
+  const fullPath = tempCopyPath(tmpDir, 'publish')
+  const publishedPath = tempCopyPath(tmpDir, 'publish')
+  try {
+    await localDb.backup(fullPath)
+    writePublishedTables(fullPath, publishedPath)
+    fs.copyFileSync(publishedPath, tempPath)
+  } finally {
+    removeRemoteCopyFiles(fullPath)
+    removeRemoteCopyFiles(publishedPath)
+  }
   // **印は rename の前に取る。** rename は inode も更新時刻も大きさも持ち越すので、
   // ここで取った印は「いま書いた中身」の印である。rename のあとに取ると、
   // 割り込んだ別の端末が同じ名前へ書いた**相手の**ファイルを印にしてしまう
@@ -55,6 +77,72 @@ export async function copyToNas(
   const stamp = fileStamp(tempPath)
   fs.renameSync(tempPath, destPath)
   return stamp
+}
+
+/**
+ * `sourcePath` の DB から、NAS の写しに載せる表だけを `destPath` の新しい DB へ写す。
+ *
+ * `sourcePath` は `backup()` が作ったこの処理だけのファイルなので、読むあいだに誰も書かない。
+ */
+function writePublishedTables(sourcePath: string, destPath: string): void {
+  const db = new Database(destPath)
+  try {
+    db.prepare(`ATTACH DATABASE ? AS src`).run(sourcePath)
+    const objects = db
+      .prepare(
+        `SELECT type, name, tbl_name AS tableName, sql FROM src.sqlite_master
+          WHERE type IN ('table', 'index') AND sql IS NOT NULL
+          ORDER BY type = 'index', rowid`
+      )
+      .all() as {
+      type: 'table' | 'index'
+      name: string
+      tableName: string
+      sql: string
+    }[]
+    const tables = objects
+      .filter(
+        (object) => object.type === 'table' && isPublishedTable(object.name)
+      )
+      .map((object) => object.name)
+    db.transaction(() => {
+      // 表を先に作って行を写し、索引はそのあとに作る
+      for (const object of objects) {
+        if (object.type !== 'table' || !tables.includes(object.name)) continue
+        db.exec(object.sql)
+        const table = escapeIdentifier(object.name)
+        db.exec(`INSERT INTO main.${table} SELECT * FROM src.${table}`)
+      }
+      for (const object of objects) {
+        if (object.type !== 'index' || !tables.includes(object.tableName))
+          continue
+        db.exec(object.sql)
+      }
+      copySequence(db, tables)
+    })()
+    db.exec(`DETACH DATABASE src`)
+  } finally {
+    db.close()
+  }
+}
+
+/** `AUTOINCREMENT` の値（`sqlite_sequence`）を、写した表の分だけ元のまま写す。 */
+function copySequence(db: Database.Database, tables: readonly string[]): void {
+  const hasSequence = (schema: 'main' | 'src'): boolean =>
+    db
+      .prepare(
+        `SELECT 1 FROM ${schema}.sqlite_master
+          WHERE type = 'table' AND name = 'sqlite_sequence'`
+      )
+      .get() !== undefined
+  // 写した表に `AUTOINCREMENT` が1つも無ければ、写すものも無い
+  if (!hasSequence('main') || !hasSequence('src')) return
+  db.exec(`DELETE FROM main.sqlite_sequence`)
+  const insert = db.prepare(
+    `INSERT INTO main.sqlite_sequence (name, seq)
+     SELECT name, seq FROM src.sqlite_sequence WHERE name = ?`
+  )
+  for (const table of tables) insert.run(table)
 }
 
 /**
@@ -133,8 +221,18 @@ export function listRemoteClients(
 /** 一時コピーを置く既定のディレクトリ名（`os.tmpdir()` 配下）。 */
 const REMOTE_COPY_DIR_NAME = 'sqlite-nas-sync'
 
-/** 一時コピーのファイル名。`remote-<pid>-<時刻ms>-<乱数hex>.sqlite`。 */
-const REMOTE_COPY_NAME = /^remote-(\d+)-(\d+)-[0-9a-f]+\.sqlite$/
+/**
+ * 一時コピーのファイル名。`<種類>-<pid>-<時刻ms>-<乱数hex>.sqlite`。
+ *
+ * 種類は、相手の写しを読むための `remote` と、自分の写しを作るための `publish` の2つ。
+ */
+const REMOTE_COPY_NAME = /^(?:remote|publish)-(\d+)-(\d+)-[0-9a-f]+\.sqlite$/
+
+/** 一時コピーの置き場所を1つ決める（ファイルはまだ作らない）。 */
+function tempCopyPath(tmpDir: string, kind: 'remote' | 'publish'): string {
+  const unique = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+  return path.join(tmpDir, `${kind}-${unique}.sqlite`)
+}
 
 /**
  * 既定の一時ディレクトリを解決する。
@@ -227,7 +325,11 @@ export function sweepStaleRemoteCopies(
 
   for (const file of files) {
     // 副ファイルは本体と一緒に消すので、ここでは本体だけを見る
-    if (!file.startsWith('remote-') || !file.endsWith('.sqlite')) continue
+    if (
+      !(file.startsWith('remote-') || file.startsWith('publish-')) ||
+      !file.endsWith('.sqlite')
+    )
+      continue
 
     const fullPath = path.join(dir, file)
     const match = file.match(REMOTE_COPY_NAME)
@@ -294,8 +396,7 @@ export function openRemoteDbViaLocalCopy(
   try {
     ensureDirectory(effectiveTmpDir)
 
-    const unique = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
-    tmpPath = path.join(effectiveTmpDir, `remote-${unique}.sqlite`)
+    tmpPath = tempCopyPath(effectiveTmpDir, 'remote')
 
     fs.copyFileSync(filePath, tmpPath)
 

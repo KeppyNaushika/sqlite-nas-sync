@@ -35,6 +35,7 @@ import {
   primaryKeyColumn,
   rowsTableName,
   syncedColumns,
+  tableOfRowsTable,
 } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import { strongerSql } from './triggers'
@@ -148,10 +149,14 @@ export function collectPeerKeys(
     keys.push({ table, key })
   }
   const hasTombstone = tableExists(peerDb, '_tombstone')
-  // 相手の綴りではなく**相手の `sqlite_master` の綴り**で引く。前提 P4
-  // （全端末で同じスキーマ）より、畳んだ綴りは自分のものと一致する
-  for (const spec of canonicalTableSpecs(peerDb, tables)) {
-    const name = spec.name
+  // 渡された綴りではなく、**相手の `_sns_rows_<表>` の綴り**で引く。前提 P4
+  // （全端末で同じスキーマ）より、畳んだ綴りは自分のものと一致する。
+  // 相手のアプリの表からは引かない。NAS の写しにはアプリの表が無い（`copyToNas`）
+  for (const table of tables) {
+    const name = peerTableName(
+      peerDb,
+      typeof table === 'string' ? table : table.name
+    )
     const rowsTable = rowsTableName(name)
     if (tableExists(peerDb, rowsTable)) {
       const pk = peerPrimaryKey(peerDb, rowsTable)
@@ -731,6 +736,22 @@ function tableExists(db: Database.Database, name: string): boolean {
       .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`)
       .get(name) !== undefined
   )
+}
+
+/**
+ * 相手の写しでの表の名前の綴り。相手の `_sns_rows_<表>` の名前から取り出す。
+ *
+ * 引くのは `COLLATE NOCASE` で、綴りの違いに備える（`src/rows/table-name.ts`）。
+ * 相手に `_sns_rows_<表>` が無ければ、渡された綴りのまま返す。
+ */
+function peerTableName(peerDb: Database.Database, table: string): string {
+  const row = peerDb
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = ? COLLATE NOCASE`
+    )
+    .get(rowsTableName(table)) as { name: string } | undefined
+  return (row === undefined ? null : tableOfRowsTable(row.name)) ?? table
 }
 
 /** `_sns_rows_<t>` の主キーの列名（相手の表から読む）。 */
