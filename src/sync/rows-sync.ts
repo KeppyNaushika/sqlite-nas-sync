@@ -310,7 +310,12 @@ export async function performRowsSync(
       // 印 → 写し → 取り合いの確認（§3.10）。**印は写しの前**でなければ、
       // 写しの中に次回比べる値が入らない
       markBeforeCopy(localDb, instanceId)
-      const written = await copyToNas(localDb, config.nasPath, config.clientId)
+      const written = await copyToNas(
+        localDb,
+        config.nasPath,
+        config.clientId,
+        tableNames
+      )
       transfers.uploads += 1
       transfers.bytes += fileSize(selfPath)
       // 上げた覚えは**先に捨てる**。ここから先で落ちたら次の回は必ず上げ直す

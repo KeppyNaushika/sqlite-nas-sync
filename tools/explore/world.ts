@@ -633,23 +633,27 @@ export async function applyTransition(
 }
 
 /**
- * 同期の最中（`copyToNas` の `localDb.backup()` の待ちの間）にアプリが書く（ops.ts の syncWrite）。
+ * 同期の最中（`copyToNas` が写しを作る前後）にアプリが書く（ops.ts の syncWrite）。
  *
- * **`src/` を変えずに窓へ差し込む**ため、同期のあいだだけ、その端末の接続の `backup` を
+ * **`src/` を変えずに窓へ差し込む**ため、同期のあいだだけ、その端末の接続の `exec` を
  * 差し替える（インスタンスに同名の関数を置き、終わったら消して元のメソッドに戻す）。
- * `copyToNas` は `localDb.backup(tempPath)` を1回だけ呼ぶので、差し込みも1回になる。
+ * `copyToNas` は写しの DB を `ATTACH DATABASE` で付けてから写し、`DETACH DATABASE` で外す。
+ * どちらも `exec` で1回だけ実行するので、差し込みも1回になる。
+ * `before-copy` は `ATTACH` の直前に書く。写しは `ATTACH` のあとの読み取りトランザクションで作るので、書き込みは写しに載る。
+ * `after-copy` は `DETACH` の直後に書く。写しはもう作り終えているので、書き込みは写しに載らない。
+ * 写しを作っている間は同じ接続の読み取りトランザクションが開いているので、そこには差し込まない。
  *
  * 書き込みの時刻は、同期の中のそれまでの刻みより後で、同期のそれ以降の刻みより前になるように
  * 取る（時計を印に戻してから名乗り、壁時計が追い越すまで待つ）。こうしないと、書き込みと同期の
  * 刻みが同じミリ秒に収まるかどうかで結果が揺れる。
  *
  * **この同期の前に、その端末の「無駄な転送の抑制」の覚えを空にする**（立ち上げ直した直後と同じ）。
- * 覚えが前に上げたときと同じ印を持っていると、`performSync` は上げる回を省いて `backup` を
+ * 覚えが前に上げたときと同じ印を持っていると、`performSync` は上げる回を省いて `copyToNas` を
  * 呼ばず、書き込みを差し込めない。覚えは状態に入らない（{@link idleMemoryFor}）ので、同じ状態から
  * 来た節でも、世界を開き直したか（覚えが空か）で差し込めたり差し込めなかったりする。空にすれば
  * 必ず上げるので、この遷移は状態だけで決まる。空の覚えは何も落とさない側なので、振る舞いも変えない。
  *
- * @throws `performSync` が `backup` を呼ばずに戻った場合（書き込みが起きていないのに起きた
+ * @throws `performSync` が `copyToNas` を呼ばずに戻った場合（書き込みが起きていないのに起きた
  *   ことにすると、履歴が嘘になる）
  */
 async function syncWithWrite(
@@ -661,9 +665,9 @@ async function syncWithWrite(
   world.idle.delete(transition.client)
   const client = world.clients[transition.client]
   const db = client.db as Database.Database & {
-    backup: Database.Database['backup']
+    exec: Database.Database['exec']
   }
-  const original = Database.prototype.backup
+  const original = Database.prototype.exec
   let status: string | null = null
   // 書き込みの例外（原則2・原則3・原則4 の違反）は、同期の中で飲み込まれないよう、同期のあとで投げ直す
   let failure: unknown = null
@@ -677,17 +681,21 @@ async function syncWithWrite(
     }
     waitPastClock(world)
   }
-  db.backup = async function (
-    this: Database.Database,
-    ...args: Parameters<Database.Database['backup']>
-  ): ReturnType<Database.Database['backup']> {
-    if (transition.point === 'before-copy') {
+  db.exec = function (this: Database.Database, source: string) {
+    if (
+      transition.point === 'before-copy' &&
+      source.startsWith('ATTACH DATABASE ')
+    ) {
       write()
-      return original.apply(this, args)
     }
-    const progress = await original.apply(this, args)
-    write()
-    return progress
+    const out = original.call(this, source)
+    if (
+      transition.point === 'after-copy' &&
+      source.startsWith('DETACH DATABASE ')
+    ) {
+      write()
+    }
+    return out
   }
   let warnings: string[]
   try {
@@ -700,13 +708,13 @@ async function syncWithWrite(
       )
     ).warnings
   } finally {
-    delete (db as Partial<typeof db>).backup
+    delete (db as Partial<typeof db>).exec
   }
   setClock(world, null)
   if (failure !== null) throw failure
   if (status === null) {
     throw new Error(
-      '同期の最中の書き込みを差し込めなかった（performSync が copyToNas の backup を呼ばなかった）'
+      '同期の最中の書き込みを差し込めなかった（performSync が copyToNas を呼ばなかった）'
     )
   }
   return { warnings, status }

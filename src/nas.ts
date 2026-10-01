@@ -12,8 +12,8 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
 import { RemoteClient } from './types'
-import { isPublishedTable } from './rows/schema'
-import { escapeIdentifier } from './setup/sql'
+import { isPublishedTable, quoteLiteral } from './rows/schema'
+import { escapeIdentifier, isSameIdentifier } from './setup/sql'
 
 /**
  * ディレクトリが存在しない場合に再帰的に作成する。
@@ -32,25 +32,35 @@ export function ensureDirectory(dirPath: string): void {
  * **写しに載せるのは、他の端末が読む表だけである**（設計書 §3.1。`isPublishedTable`）。
  * アプリの表とトリガーは載せない。どちらも他の端末は読まず、写しの大きさの大半を占める。
  *
- * 1. better-sqlite3 の `backup()` で、手元の一時領域に DB 全体の一貫した写しを取る
- * 2. 新しい DB に、載せる表を元と同じ `CREATE` 文と索引で作り、行を写す
- * 3. `sqlite_sequence` の値を元のまま写す。`_changelog` の隙間の判定がこの値を読むので、
- *    行から数え直した値（いま残っている最大の id）にしてはいけない
- * 4. NAS の一時ファイルへ置き、`fs.renameSync` でアトミックに差し替える
+ * 1. 手元の一時領域に新しい DB を作り、`localDb` に `ATTACH` する
+ * 2. 1つの読み取りトランザクションの中で、載せる表を元と同じ `CREATE` 文と索引で作り、
+ *    行と `sqlite_sequence` の値を写す（{@link publishSteps}）。区切りごとにイベントループへ戻る
+ * 3. NAS の一時ファイルへ写し、`rename` でアトミックに差し替える
+ *
+ * 写しの DB を `localDb` に `ATTACH` するのは次の理由である。
+ *
+ * - `ATTACH` で新しく作る DB の文字コードは main と同じになる。UTF-16 の DB でも写しを作れる
+ * - `localDb` はスキーマを読み込み済みなので、元の DB の大きなトリガーの SQL を読み直さない
+ * - 元の DB 全体を手元に写さないので、一時領域は写しの大きさで済む
  *
  * 不要な表を `DROP` して作る方法は採らない。アプリの仮想表は、そのモジュールが
  * 登録されていない接続では `DROP` できないからである。
  * ファイル名は `client-{clientId}.sqlite` となる。
  *
+ * **`localDb` は、このあいだ他の処理に使わせてはいけない。** 区切りの間も読み取りトランザクションを開いたままなので、
+ * 同じ接続で書くとそのトランザクションに入ってしまう。`setupSync` の接続は同期だけが使い、同期は同時に1つしか走らない。
+ *
  * @param localDb - 写す元のローカルSQLiteデータベース接続
  * @param nasPath - NAS上の共有ディレクトリパス
  * @param clientId - このクライアントの識別子
+ * @param tables - 同期している表。`_sns_rows_<表>` はこの表の分だけを載せる
  * @throws NASへの書き込みに失敗した場合
  */
 export async function copyToNas(
   localDb: Database.Database,
   nasPath: string,
-  clientId: string
+  clientId: string,
+  tables: readonly string[]
 ): Promise<FileStamp | null> {
   ensureDirectory(nasPath)
 
@@ -60,87 +70,229 @@ export async function copyToNas(
 
   const tmpDir = defaultTmpDir()
   ensureDirectory(tmpDir)
-  const fullPath = tempCopyPath(tmpDir, 'publish')
   const publishedPath = tempCopyPath(tmpDir, 'publish')
+  // 大きなファイルの複製・削除・置き換えは、`fs.promises` で別のスレッドに任せる。
+  // どれも写しの大きさに比例して時間がかかりうる
   try {
-    await localDb.backup(fullPath)
-    writePublishedTables(fullPath, publishedPath)
-    fs.copyFileSync(publishedPath, tempPath)
+    await writePublishedTables(localDb, publishedPath, tables)
+    await fs.promises.copyFile(publishedPath, tempPath)
   } finally {
-    removeRemoteCopyFiles(fullPath)
-    removeRemoteCopyFiles(publishedPath)
+    // 写しの DB はジャーナルを `MEMORY` にするので、副ファイルは作られない
+    await fs.promises.rm(publishedPath, { force: true }).catch(() => {
+      /* 消せなければ、次の起動の `sweepStaleRemoteCopies` が消す */
+    })
   }
   // **印は rename の前に取る。** rename は inode も更新時刻も大きさも持ち越すので、
   // ここで取った印は「いま書いた中身」の印である。rename のあとに取ると、
   // 割り込んだ別の端末が同じ名前へ書いた**相手の**ファイルを印にしてしまう
   // （それでは写しの取り合いを見抜けない。{@link fileStamp}）
   const stamp = fileStamp(tempPath)
-  fs.renameSync(tempPath, destPath)
+  try {
+    await fs.promises.rename(tempPath, destPath)
+  } catch (error) {
+    // 一時ファイルの名前は clientId で決まるので、同じ clientId の端末が同時に置くと、
+    // 先に rename した側がこちらの一時ファイルまで置いてしまう
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(
+        `NAS の一時ファイル ${tempPath} が、置く前に無くなった。` +
+          `同じ clientId（${clientId}）を使う別のクライアントが、同時に写しを置いた可能性がある`,
+        { cause: error }
+      )
+    }
+    throw error
+  }
   return stamp
 }
 
+/** 写しの DB を `localDb` に `ATTACH` するときのスキーマ名。 */
+const PUBLISH_SCHEMA = 'sns_publish'
+
+/** 写しを作る処理を、イベントループへ戻らずに続ける時間の目安（ミリ秒）。 */
+const STEP_MS = 10
+
 /**
- * `sourcePath` の DB から、NAS の写しに載せる表だけを `destPath` の新しい DB へ写す。
+ * `localDb` から、NAS の写しに載せる表だけを `destPath` の新しい DB へ写す。
  *
- * `sourcePath` は `backup()` が作ったこの処理だけのファイルなので、読むあいだに誰も書かない。
+ * **写しは1時点のものである。** 写す処理は `BEGIN` から `COMMIT` までの1つのトランザクションで、
+ * main には読むだけなので、最初に読んだ時点のスナップショットを最後まで読む。
+ * 行の版・`_changelog`・`sqlite_sequence` の値がその時点で揃う。
+ *
+ * **区切りの間にイベントループへ戻るのは、main が WAL のときだけである。**
+ * WAL では読み取りトランザクションがアプリの書き込みを止めないので、
+ * 区切りの間にアプリは書ける。その書き込みは写しに載らず、次の写しに載る。
+ * WAL でないときに戻ると、読み取りトランザクションの共有ロックがアプリの書き込みの `COMMIT` を
+ * `busy_timeout` まで待たせる。そこで、戻らずに続けて写す。
+ * `setupSync` は DB を WAL にするので、WAL でないのはアプリが後から変えたときである。
+ *
+ * 写しの DB はジャーナルを `MEMORY` にし、`synchronous` を切る。
+ * 失敗したら捨てるファイルなので、ジャーナルのファイルも `COMMIT` の `fsync` も要らない。
+ * `COMMIT` のあと、`DETACH` の前に、別のスレッドでファイルを記憶装置へ書き出す（{@link flushFile}）。
  */
-function writePublishedTables(sourcePath: string, destPath: string): void {
-  const db = new Database(destPath)
+async function writePublishedTables(
+  localDb: Database.Database,
+  destPath: string,
+  tables: readonly string[]
+): Promise<void> {
+  const yieldsBetweenSteps =
+    localDb.pragma('main.journal_mode', { simple: true }) === 'wal'
+  const schema = escapeIdentifier(PUBLISH_SCHEMA)
+  localDb.exec(`ATTACH DATABASE ${quoteLiteral(destPath)} AS ${schema}`)
   try {
-    db.prepare(`ATTACH DATABASE ? AS src`).run(sourcePath)
-    const objects = db
-      .prepare(
-        `SELECT type, name, tbl_name AS tableName, sql FROM src.sqlite_master
-          WHERE type IN ('table', 'index') AND sql IS NOT NULL
-          ORDER BY type = 'index', rowid`
-      )
-      .all() as {
-      type: 'table' | 'index'
-      name: string
-      tableName: string
-      sql: string
-    }[]
-    const tables = objects
-      .filter(
-        (object) => object.type === 'table' && isPublishedTable(object.name)
-      )
-      .map((object) => object.name)
-    db.transaction(() => {
-      // 表を先に作って行を写し、索引はそのあとに作る
-      for (const object of objects) {
-        if (object.type !== 'table' || !tables.includes(object.name)) continue
-        db.exec(object.sql)
-        const table = escapeIdentifier(object.name)
-        db.exec(`INSERT INTO main.${table} SELECT * FROM src.${table}`)
-      }
-      for (const object of objects) {
-        if (object.type !== 'index' || !tables.includes(object.tableName))
+    localDb.pragma(`${schema}.journal_mode = MEMORY`)
+    localDb.pragma(`${schema}.synchronous = OFF`)
+    localDb.exec('BEGIN')
+    try {
+      let resumed = performance.now()
+      const steps = publishSteps(localDb, tables)
+      for (let step = steps.next(); step.done !== true; step = steps.next()) {
+        if (!yieldsBetweenSteps || performance.now() - resumed < STEP_MS) {
           continue
-        db.exec(object.sql)
+        }
+        await new Promise((resolve) => setImmediate(resolve))
+        resumed = performance.now()
       }
-      copySequence(db, tables)
-    })()
-    db.exec(`DETACH DATABASE src`)
+      localDb.exec('COMMIT')
+      await flushFile(destPath)
+    } catch (error) {
+      if (localDb.inTransaction) localDb.exec('ROLLBACK')
+      throw error
+    }
   } finally {
-    db.close()
+    localDb.exec(`DETACH DATABASE ${schema}`)
   }
 }
 
-/** `AUTOINCREMENT` の値（`sqlite_sequence`）を、写した表の分だけ元のまま写す。 */
+/**
+ * ファイルに書いた内容を、別のスレッドで記憶装置へ書き出す。
+ *
+ * 記憶装置へ書き出していないページの多いファイルは、閉じる呼び出しが長くかかることがある。
+ * macOS の SSD で 285 MB の写しを `DETACH` したとき 50〜125 ms かかり、
+ * 先にこれで書き出すと 1 ms 未満になった。
+ */
+async function flushFile(filePath: string): Promise<void> {
+  const handle = await fs.promises.open(filePath, 'r')
+  try {
+    await handle.datasync()
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
+ * 写しを作る処理。区切りごとに `yield` する。
+ *
+ * 表ごとに、表と索引を作ってから行を写す。索引を後から作ると、
+ * 大きな表の索引作りが区切れない1回の処理になるからである。
+ */
+function* publishSteps(
+  db: Database.Database,
+  tables: readonly string[]
+): Generator<void, void, void> {
+  const objects = db
+    .prepare(
+      `SELECT type, name, tbl_name AS tableName, sql FROM main.sqlite_master
+        WHERE type IN ('table', 'index') AND sql IS NOT NULL
+        ORDER BY type = 'index', rowid`
+    )
+    .all() as {
+    type: 'table' | 'index'
+    name: string
+    tableName: string
+    sql: string
+  }[]
+  const published: string[] = []
+  for (const table of objects) {
+    if (table.type !== 'table' || !isPublishedTable(table.name, tables)) {
+      continue
+    }
+    db.exec(inPublishSchema(table.sql))
+    for (const index of objects) {
+      if (index.type !== 'index') continue
+      if (!isSameIdentifier(index.tableName, table.name)) continue
+      db.exec(inPublishSchema(index.sql))
+    }
+    published.push(table.name)
+    yield
+    yield* copyRows(db, table.name)
+  }
+  copySequence(db, published)
+}
+
+/**
+ * 表の行を、rowid の順に区切って写す。
+ *
+ * rowid も元のまま写す。写した最後の rowid を写しの側の `MAX(rowid)` で引けるので、
+ * 区切りの境目を探すために元の表を読み直さずに済む。
+ * 区切りの行数は、1つの区切りが {@link STEP_MS} に収まるように増減する。
+ * 載せる表はどれもライブラリが作る rowid の表である。rowid は 2^53 を超えうるので BigInt で持つ。
+ */
+function* copyRows(
+  db: Database.Database,
+  table: string
+): Generator<void, void, void> {
+  const name = escapeIdentifier(table)
+  const columns = (db.pragma(`main.table_info(${name})`) as { name: string }[])
+    .map((column) => escapeIdentifier(column.name))
+    .join(', ')
+  const target = `${escapeIdentifier(PUBLISH_SCHEMA)}.${name}`
+  const copy = db.prepare(
+    `INSERT INTO ${target} (rowid, ${columns})
+     SELECT rowid, ${columns} FROM main.${name}
+      WHERE rowid > ? ORDER BY rowid LIMIT ?`
+  )
+  const lastCopied = db
+    .prepare(`SELECT MAX(rowid) FROM ${target}`)
+    .pluck()
+    .safeIntegers(true)
+  // 最初の区切りの下限。どの rowid よりも小さい
+  let after: bigint | number = -Infinity
+  let rows = 256
+  for (;;) {
+    const started = performance.now()
+    const copied = copy.run(after, rows).changes
+    if (copied < rows) return
+    after = lastCopied.get() as bigint
+    const elapsed = performance.now() - started
+    if (elapsed < STEP_MS / 2) rows *= 2
+    else if (elapsed > STEP_MS) rows = Math.max(1, Math.floor(rows / 2))
+    yield
+  }
+}
+
+/**
+ * `sqlite_master.sql` の `CREATE` 文を、写しの DB に作る文にする。
+ *
+ * SQLite は `sqlite_master.sql` の先頭を `CREATE TABLE ` / `CREATE INDEX ` /
+ * `CREATE UNIQUE INDEX ` にそろえ、スキーマ名を取り除いて持つ。その直後にスキーマ名を足す。
+ */
+function inPublishSchema(sql: string): string {
+  const head = /^CREATE (?:TABLE|INDEX|UNIQUE INDEX) /.exec(sql)
+  if (head === null) {
+    throw new Error(`写しに載せる表の定義を読めない: ${sql}`)
+  }
+  return `${head[0]}${escapeIdentifier(PUBLISH_SCHEMA)}.${sql.slice(head[0].length)}`
+}
+
+/**
+ * `AUTOINCREMENT` の値（`sqlite_sequence`）を、写した表の分だけ元のまま写す。
+ *
+ * `_changelog` の隙間の判定がこの値を読むので、行から数え直した値（いま残っている最大の id）にしてはいけない。
+ */
 function copySequence(db: Database.Database, tables: readonly string[]): void {
-  const hasSequence = (schema: 'main' | 'src'): boolean =>
+  const hasSequence = (schema: string): boolean =>
     db
       .prepare(
         `SELECT 1 FROM ${schema}.sqlite_master
           WHERE type = 'table' AND name = 'sqlite_sequence'`
       )
       .get() !== undefined
+  const target = escapeIdentifier(PUBLISH_SCHEMA)
   // 写した表に `AUTOINCREMENT` が1つも無ければ、写すものも無い
-  if (!hasSequence('main') || !hasSequence('src')) return
-  db.exec(`DELETE FROM main.sqlite_sequence`)
+  if (!hasSequence(target) || !hasSequence('main')) return
+  db.exec(`DELETE FROM ${target}.sqlite_sequence`)
   const insert = db.prepare(
-    `INSERT INTO main.sqlite_sequence (name, seq)
-     SELECT name, seq FROM src.sqlite_sequence WHERE name = ?`
+    `INSERT INTO ${target}.sqlite_sequence (name, seq)
+     SELECT name, seq FROM main.sqlite_sequence WHERE name = ?`
   )
   for (const table of tables) insert.run(table)
 }
@@ -245,20 +397,27 @@ function defaultTmpDir(): string {
   return path.join(os.tmpdir(), REMOTE_COPY_DIR_NAME)
 }
 
+/** 一時コピーの副ファイルの接尾辞。 */
+const SIDE_FILE_SUFFIXES = ['-wal', '-shm', '-journal'] as const
+
 /**
- * 一時コピーの本体と副ファイル（`-wal` / `-shm`）をまとめて消す。
+ * 一時コピーの本体と副ファイル（`-wal` / `-shm` / `-journal`）をまとめて消す。
  *
  * **本体だけ消すと副ファイルが残る。** 読み取り専用で開いても、コピー元が
  * WALモードのDBなら SQLite は `-wal` / `-shm` を作る。しかも読み取り専用接続は
  * WALのチェックポイントができないため、`close()` しても SQLite 自身は
  * 副ファイルを片付けられない。本体のみ `unlink` していた結果、同期1回・相手1人ごとに
  * 2ファイルずつ溜まり続けていた（実測: テスト全件で 5,994 個）。
+ * `-journal` は、0.21.0 が写しを作る途中で落ちたときに残る。
  *
  * 消せなかった場合は黙って諦める。ここでの失敗（既に無い／権限がない）を
  * 例外にすると、同期そのものが止まってしまう。
  */
 function removeRemoteCopyFiles(tmpPath: string): void {
-  for (const target of [tmpPath, `${tmpPath}-wal`, `${tmpPath}-shm`]) {
+  for (const target of [
+    tmpPath,
+    ...SIDE_FILE_SUFFIXES.map((suffix) => `${tmpPath}${suffix}`),
+  ]) {
     try {
       fs.unlinkSync(target)
     } catch {
@@ -304,7 +463,7 @@ function isProcessAlive(pid: number): boolean {
  *
  * @param tmpDir - 掃除するディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync`。本番の呼び出し（`setupRowsLedgers`）は渡さない。試験のための差し込み口。
  * @param maxAgeMs - PIDが読めない残骸を消す年齢のしきい値。既定24時間。本番の呼び出しは渡さない。試験のための差し込み口。
- * @returns 消した一時コピーの数（本体の数。副ファイルは数えない）
+ * @returns 消した一時コピーの数（本体の名前の数。副ファイルは数えない）
  */
 export function sweepStaleRemoteCopies(
   tmpDir?: string,
@@ -323,16 +482,22 @@ export function sweepStaleRemoteCopies(
 
   const now = Date.now()
 
+  // 副ファイルは本体と一緒に消すので、本体の名前ごとに1回だけ見る。
+  // 本体が無く副ファイルだけが残っていることもある。0.21.0 の掃除は `-journal` を消さなかった
+  const copies = new Map<string, string>()
   for (const file of files) {
-    // 副ファイルは本体と一緒に消すので、ここでは本体だけを見る
+    const suffix = SIDE_FILE_SUFFIXES.find((side) => file.endsWith(side))
+    const body = suffix === undefined ? file : file.slice(0, -suffix.length)
     if (
-      !(file.startsWith('remote-') || file.startsWith('publish-')) ||
-      !file.endsWith('.sqlite')
+      !(body.startsWith('remote-') || body.startsWith('publish-')) ||
+      !body.endsWith('.sqlite')
     )
       continue
+    if (!copies.has(body) || suffix === undefined) copies.set(body, file)
+  }
 
-    const fullPath = path.join(dir, file)
-    const match = file.match(REMOTE_COPY_NAME)
+  for (const [body, seen] of copies) {
+    const match = body.match(REMOTE_COPY_NAME)
 
     if (match) {
       const pid = Number(match[1])
@@ -341,14 +506,14 @@ export function sweepStaleRemoteCopies(
       // PIDが読めない → 年齢で判断する。読めないうえに年齢も分からなければ触らない。
       let mtimeMs: number
       try {
-        mtimeMs = fs.statSync(fullPath).mtimeMs
+        mtimeMs = fs.statSync(path.join(dir, seen)).mtimeMs
       } catch {
         continue
       }
       if (now - mtimeMs < maxAgeMs) continue
     }
 
-    removeRemoteCopyFiles(fullPath)
+    removeRemoteCopyFiles(path.join(dir, body))
     removed++
   }
 

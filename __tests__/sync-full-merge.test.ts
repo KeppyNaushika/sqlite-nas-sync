@@ -474,7 +474,12 @@ describe('フルマージ（ギャップ検出時）', () => {
 
     // 掃除後の姿（`MAX(id) = 0` で掃除済み位置だけが残る形）をそのまま NAS へ置く。
     // `performSync` を通すと写しの前に掃除の順が入って形がぶれるので、直接コピーする。
-    await copyToNas(dbA, nasDir, 'client-a')
+    await copyToNas(
+      dbA,
+      nasDir,
+      'client-a',
+      TABLES.map((table) => table.name)
+    )
     dbA.close()
 
     const { db: dbB, dbPath: pathB } = createClientDb('client-b')

@@ -200,7 +200,7 @@ describe('NASが思いどおりでないとき', () => {
       db.exec(`CREATE TABLE t (id TEXT PRIMARY KEY)`)
       const nasDir = path.join(testDir, 'nas', 'deep', 'path')
 
-      return copyToNas(db, nasDir, 'me').then(() => {
+      return copyToNas(db, nasDir, 'me', []).then(() => {
         expect(fs.existsSync(path.join(nasDir, 'client-me.sqlite'))).toBe(true)
         // 一時ファイルは rename 済みで残らない
         expect(
@@ -224,7 +224,7 @@ describe('NASが思いどおりでないとき', () => {
 
         // 押し出しに失敗したことは呼び出し元が知らねばならない。
         // ここを握り潰すと「同期したつもり」で相手に何も届かない状態になる。
-        await expect(copyToNas(db, nasDir, 'me')).rejects.toThrow()
+        await expect(copyToNas(db, nasDir, 'me', [])).rejects.toThrow()
 
         fs.chmodSync(nasDir, 0o755)
         db.close()
@@ -240,7 +240,7 @@ describe('NASが思いどおりでないとき', () => {
       )
       const nasDir = path.join(testDir, 'nas3')
 
-      await copyToNas(db, nasDir, 'me')
+      await copyToNas(db, nasDir, 'me', [])
       db.close()
 
       const handle = openRemoteDbViaLocalCopy(
@@ -281,7 +281,7 @@ describe('NASが思いどおりでないとき', () => {
       db.exec(`DELETE FROM _changelog WHERE id = 3`)
       const nasDir = path.join(testDir, 'nas4')
 
-      await copyToNas(db, nasDir, 'me')
+      await copyToNas(db, nasDir, 'me', ['notes'])
       db.close()
 
       const copy = new Database(path.join(nasDir, 'client-me.sqlite'), {

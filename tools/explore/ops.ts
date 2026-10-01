@@ -121,13 +121,13 @@ export type Transition =
   /**
    * 端末 `client` が `performSync` し、**その最中に**同じ端末のアプリが `op` を書く。
    *
-   * `performSync` は取り込みと作り直しのあとで `await copyToNas(...)`（`localDb.backup()`。非同期にページを写す）を待つ。
-   * その間にアプリが書き込むと、書き込みが NAS のコピーに載るかどうかが、同期の前後に書いた場合と変わる。
+   * `performSync` は取り込みと作り直しのあとで `await copyToNas(...)` を待つ。
+   * 写しを作る前後にアプリが書き込むと、書き込みが NAS のコピーに載るかどうかが、同期の前後に書いた場合と変わる。
    * どちらの時点でも、この回の自己点検・取り込み・作り直しはこの書き込みを見ていない。
    * この窓で事実が変わる種類の不具合は、この遷移が無いと原理的に出ない。
    *
-   * - `before-copy`: `backup()` が呼ばれた直後、写し始める前に書く。書き込みはコピーに載る
-   * - `after-copy`: 写し終えた直後、`copyToNas` が戻る前に書く。書き込みはコピーに載らず、次の同期で上げる
+   * - `before-copy`: 写しの DB を `ATTACH` する直前に書く。書き込みはコピーに載る
+   * - `after-copy`: 写しを作り終えて `DETACH` した直後、`copyToNas` が戻る前に書く。書き込みはコピーに載らず、次の同期で上げる
    *
    * 別の端末への書き込みは、同期する端末が読むのが相手の NAS 上のコピーなので、同期の前か後に
    * 書いた場合と区別が付かない。そこで同期する端末への書き込みだけを持つ
@@ -603,8 +603,8 @@ export function describeTransition(transition: Transition): string {
   if (transition.kind === 'syncWrite') {
     const when =
       transition.point === 'before-copy'
-        ? 'copyToNas の localDb.backup() が呼ばれた直後、写し始める前に（書き込みは NAS のコピーに載る）'
-        : 'copyToNas の localDb.backup() が写し終えた直後に（書き込みは NAS のコピーに載らない）'
+        ? 'copyToNas が写しの DB を ATTACH する直前に（書き込みは NAS のコピーに載る）'
+        : 'copyToNas が写しを作り終えて DETACH した直後に（書き込みは NAS のコピーに載らない）'
     return (
       `${who}: await performSync(${who}.db, ${who}.config, TABLES) の最中、${when} ` +
       describeOp(who, transition.op)

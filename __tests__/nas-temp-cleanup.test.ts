@@ -230,6 +230,22 @@ describe('sweepStaleRemoteCopies（起きたついでの残骸回収）', () => 
     expect(fs.existsSync(path.join(dir, `${name}-shm`))).toBe(false)
   })
 
+  it('写しを作る途中で落ちた残骸は、ジャーナルごと消す', () => {
+    const pid = findDeadPid()
+    const name = `publish-${pid}-1700000000000-aabbccdd.sqlite`
+    for (const ext of ['', '-journal']) {
+      fs.writeFileSync(path.join(dir, `${name}${ext}`), 'x')
+    }
+    // 0.21.0 の掃除は本体だけを消したので、ジャーナルだけが残っていることがある
+    fs.writeFileSync(
+      path.join(dir, `publish-${pid}-1700000000000-eeff0011.sqlite-journal`),
+      'x'
+    )
+
+    expect(sweepStaleRemoteCopies(dir)).toBe(2)
+    expect(fs.readdirSync(dir)).toEqual([])
+  })
+
   it('生きているPIDの残骸は消さない', () => {
     // 自分自身。同期の最中に自分の一時コピーを消すと、読んでいるDBが足元から消える。
     const mine = makeCopy(process.pid, 'aabbccdd')

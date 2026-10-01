@@ -92,7 +92,7 @@ const location = (): { nasPath: string; clientId: string; tmpDir: string } => ({
 /** 写しを書く（印を付けてから `copyToNas`）。 */
 async function publish(db: Database.Database): Promise<void> {
   markBeforeCopy(db)
-  await copyToNas(db, nasPath, CLIENT)
+  await copyToNas(db, nasPath, CLIENT, ['notes'])
 }
 
 /* ================================================================== *
@@ -222,7 +222,7 @@ describe('写しの取り合い', () => {
     await publish(mine)
     // 別の端末が、同じクライアント id を名乗って上書きした
     const other = openLocal(join(workDir, 'other.sqlite'), 'iid-other')
-    await copyToNas(other, nasPath, CLIENT)
+    await copyToNas(other, nasPath, CLIENT, ['notes'])
 
     const report = checkCopyOwnership(mine, location())
     expect(report.taken).toBe(true)
