@@ -109,7 +109,7 @@ export function quoteLiteral(value: string): string {
 }
 
 /**
- * `_sns_rows_<表>` に写す列（設計書 §3.1 の軽微18）。
+ * `_sns_rows_<表>` に写す列（設計書 §3.1）。
  *
  * **生成列は写さない。** `PRAGMA table_xinfo` の `hidden` が 2（VIRTUAL）か
  * 3（STORED）の列は書き込めないので、写すと適用の INSERT がそこで落ちる。
@@ -257,7 +257,7 @@ function createSharedTables(db: Database.Database): void {
   `)
 
   // 作り直しの最中である旗。**行があるあいだ、トリガーは何も事実にしない**
-  // （設計書 §3.7.2・§3.10 の軽微15）。旗が無いと、作り直しの適用そのものが
+  // （設計書 §3.3・§3.7.2）。旗が無いと、作り直しの適用そのものが
   // 削除の版を作り、他端末のデータを消す。
   db.exec(`
     CREATE TABLE IF NOT EXISTS _sns_rebuilding (

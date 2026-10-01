@@ -302,7 +302,7 @@ const CASES: Case[] = [
     expect: [`tags:g1 置く id=g1 name=t1 updatedAt=${T1}`, 'tags:g2 隠れ→g1'],
   },
   {
-    name: '§2.1 削除の版が Max なら、その id は死ぬ',
+    name: '§1.3 削除の版が Max なら、その id は死ぬ',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T0 }, 1, 'a'),
@@ -320,7 +320,7 @@ const CASES: Case[] = [
     expect: [`tags:g1 置く id=g1 name=t1 updatedAt=${T1}`],
   },
   {
-    name: '§2.3(4) 消してから同じ id で作り直す（補題A。引き上げ）',
+    name: '§5 消してから同じ id で作り直す（補題A。引き上げ）',
     schema: FAMILY,
     versions: [
       row('tags', 'g1', { id: 'g1', name: 't1', updatedAt: T1 }, 1, 'a'),
