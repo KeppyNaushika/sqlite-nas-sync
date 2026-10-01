@@ -16,7 +16,13 @@ import prettier from 'eslint-config-prettier'
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'docs/api/**', 'coverage/**', 'node_modules/**'],
+    ignores: [
+      'dist/**',
+      'docs/api/**',
+      'coverage/**',
+      'node_modules/**',
+      '.claude/**',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -38,6 +44,22 @@ export default tseslint.config(
     files: ['__tests__/**/*.ts'],
     rules: {
       '@typescript-eslint/no-explicit-any': 'off',
+      'no-console': 'off',
+    },
+  },
+  {
+    // ビルドせずに Node.js で動かす計測のスクリプト。結果を標準出力に出す
+    files: ['tools/**/*.cjs'],
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: {
+        require: 'readonly',
+        process: 'readonly',
+        console: 'readonly',
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
       'no-console': 'off',
     },
   }
