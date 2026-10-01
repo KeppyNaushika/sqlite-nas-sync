@@ -633,8 +633,12 @@ describe('列の増減へ追従する', () => {
 
   it('列が減ったら `_sns_rows_*` からも落とし、アプリの INSERT が通る', () => {
     const db = migrated()
-    // アプリが表を組み直して列を落とす（`DROP COLUMN` はトリガーが `NEW.body` を
-    // 見ているあいだ通らないので、実際の移行はこの形になる）
+    // 素の `DROP COLUMN` は、トリガーが `NEW.body` を参照しているので SQLite が断る。
+    // README の制限事項はこれを前提に、表を作り直す方法を案内している
+    expect(() => db.exec(`ALTER TABLE notes DROP COLUMN body`)).toThrow(
+      /error in trigger .* after drop column/
+    )
+    // アプリが表を作り直して列を落とす
     db.exec(`CREATE TABLE notes_new (
       id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, updatedAt TEXT)`)
     db.exec(`INSERT INTO notes_new SELECT id, title, updatedAt FROM notes`)
