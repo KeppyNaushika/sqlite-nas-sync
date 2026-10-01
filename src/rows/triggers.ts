@@ -23,7 +23,8 @@
  *    **外側の文の競合解決に置き換えられる**ので使わない。これを守らないと、
  *    `ON DELETE SET NULL` の子を持つ親を消したときに**アプリの DELETE ごと失敗する**
  * 3. **3項の最大**は `ORDER BY … LIMIT 1` で書く（設計書 §3.3 の `NEWTS`）。
- *    `CASE WHEN TSGT …` の入れ子にすると1つで5万文字になる
+ *    `CASE WHEN` の入れ子にすると1つで5万文字になる。値の種類の群の式は長いので、
+ *    `NEWTS` と `STRONGER` の中では1つの値について1回だけ計算する
  * 4. **`_tombstone.recordId` との比較は必ず正規形**（`CAST(… AS TEXT)`。設計書 §1.9〜1.11）
  * 5. **書かなかった列は3分岐**（設計書 §3.4）。`_sns_rows_<表>` に行が無い窓が
  *    あるので、`(SELECT …)` だけにすると NOT NULL の列が NULL になって行が消える
@@ -46,34 +47,11 @@ import {
   rowsTableName,
   syncedColumns,
 } from './schema'
-import { ISO_SHAPE_GLOBS } from './versions'
+import { TIME_GROUP, timeGroupSql } from './versions'
 
 /* ------------------------------------------------------------------ *
  * §3.3 生成に使う式
  * ------------------------------------------------------------------ */
-
-/**
- * 値の種類の群（設計書 §1.2.3）。0 ＜ 1 ＜ 2 ＜ 3 ＜ 4。
- *
- * `src/rows/versions.ts` の {@link ValueOrdering.timeGroup} と**同じ規則**で、
- * 字形の一覧（{@link ISO_SHAPE_GLOBS}）はそちらから借りている。片方だけ直すと、
- * トリガーが書いた順序と作り直しが読む順序が食い違う。
- */
-function timeGroupSql(value: string): string {
-  const shape = ISO_SHAPE_GLOBS.map((glob) => `${value} GLOB '${glob}'`).join(
-    ' OR '
-  )
-  return `(CASE typeof(${value})
-      WHEN 'null' THEN 0
-      WHEN 'integer' THEN 1
-      WHEN 'real' THEN 1
-      WHEN 'blob' THEN 4
-      ELSE (CASE WHEN julianday(${value}) IS NOT NULL AND (${shape}) THEN 3 ELSE 2 END)
-    END)`
-}
-
-/** ISO 8601 の字形の文字列の群（{@link timeGroupSql} の 3）。 */
-const ISO_TEXT_GROUP = 3
 
 /**
  * 値が ISO 8601 の文字列（群3）かどうかを答える SQL の式。真なら 1、偽なら 0 で、
@@ -85,37 +63,7 @@ const ISO_TEXT_GROUP = 3
  * @internal
  */
 export function isIsoTimeSql(value: string): string {
-  return `(${timeGroupSql(value)} = ${ISO_TEXT_GROUP})`
-}
-
-/**
- * `TSGT(a, b)` —— 順序用の時刻として `a` が `b` より強いか（設計書 §3.3）。
- *
- * 群が違えば群の順。同じ群なら、群0 は同着、群3 は `julianday`、
- * それ以外は素の比較（群1 は数値、群2・群4 は `COLLATE BINARY`）。
- *
- * **`COLLATE BINARY` を明示する。** 時刻列が `COLLATE NOCASE` で宣言されていると、
- * 素の比較では `'ABC'` と `'abc'` が同着になり、値が違うのに前後が付かない。
- */
-function tsGreaterSql(a: string, b: string): string {
-  const groupA = timeGroupSql(a)
-  const groupB = timeGroupSql(b)
-  return `(${groupA} > ${groupB} OR (${groupA} = ${groupB} AND (CASE
-      WHEN ${groupA} = 0 THEN 0
-      WHEN ${groupA} = 3 THEN julianday(${a}) > julianday(${b})
-      ELSE ${a} > ${b} COLLATE BINARY
-    END)))`
-}
-
-/** `a` と `b` が順序用の時刻として同着か（設計書 §1.2.3）。 */
-function tsEqualSql(a: string, b: string): string {
-  const groupA = timeGroupSql(a)
-  const groupB = timeGroupSql(b)
-  return `(${groupA} = ${groupB} AND (CASE
-      WHEN ${groupA} = 0 THEN 1
-      WHEN ${groupA} = 3 THEN julianday(${a}) = julianday(${b})
-      ELSE ${a} = ${b} COLLATE BINARY
-    END))`
+  return `(${timeGroupSql(value)} = ${TIME_GROUP.isoText})`
 }
 
 /** 版の3つ組（順序用の時刻・lamport・端末）。 */
@@ -126,35 +74,48 @@ interface VersionRefs {
 }
 
 /**
+ * 版の順序の鍵（設計書 §1.2.3〜1.2.5）。`(群, 群の中の値, L, iid)` の4列を1行で返すスカラー副問い合わせである。
+ *
+ * 群の中の値は、群0 では 0、群3 では `julianday`、それ以外では値そのもの（群1 は数値、群2・群4 は `COLLATE BINARY`）。
+ * 群の式は長いので、副問い合わせの中で1回だけ計算する。比べる式の中で何度も書き写すと、トリガーの SQL が大きくなる。
+ *
+ * **`COLLATE BINARY` を明示する。** 時刻列が `COLLATE NOCASE` で宣言されていると、
+ * 素の比較では `'ABC'` と `'abc'` が同着になり、値が違うのに前後が付かない。
+ */
+function versionKeySql(version: VersionRefs): string {
+  return `(SELECT "g", (CASE "g" WHEN ${TIME_GROUP.null} THEN 0 WHEN ${TIME_GROUP.isoText} THEN julianday("v") ELSE "v" END) COLLATE BINARY,
+         ${version.lamport}, ${version.instance} COLLATE BINARY
+       FROM (SELECT "v", ${timeGroupSql('"v"')} AS "g" FROM (SELECT ${version.ts} AS "v")))`
+}
+
+/**
  * `STRONGER(a, b)` —— 版 `a` が版 `b` より強いか（設計書 §3.3）。
  *
- * `( _sns_ts, L, iid )` の辞書順。`iid` の比較は `COLLATE BINARY`。
+ * `( _sns_ts, L, iid )` の辞書順を、{@link versionKeySql} の行値どうしの `>` で比べる。
+ * 行値の比較は左の列から順に比べ、最初に等しくない列で決まる。
+ * そこまでに NULL との比較があれば NULL になるので、L や iid が NULL のときの答えは、列ごとに `>` と `=` を組み合わせた式と同じである。
  */
 export function strongerSql(a: VersionRefs, b: VersionRefs): string {
-  return `(${tsGreaterSql(a.ts, b.ts)} OR (${tsEqualSql(a.ts, b.ts)} AND (
-      ${a.lamport} > ${b.lamport}
-      OR (${a.lamport} = ${b.lamport} AND ${a.instance} > ${b.instance} COLLATE BINARY)
-    )))`
+  return `(${versionKeySql(a)} > ${versionKeySql(b)})`
 }
 
 /**
  * 順序用の時刻の引き上げ（設計書 §1.2.1）。**3項の最大**。
  *
- * `CASE WHEN TSGT(…)` を入れ子にすると、項が増えるたびに式が二乗で膨らみ、
+ * `CASE WHEN` で2項ずつ比べて入れ子にすると、項が増えるたびに式が二乗で膨らみ、
  * 3項で5万文字を超える。**並べ替えて1行取る**形にすれば、項の数だけ線形に伸びる。
  *
  * 並べ替えの鍵は §1.2.3 の順序そのもの: 群 → 群3 なら `julianday` →
  * 同じ群の中の `COLLATE BINARY`。群1（数値）では照合順序は無視され、
- * SQLite が数値として比べる。
+ * SQLite が数値として比べる。群は副問い合わせの中で1回だけ計算する。
  */
 export function maxTsSql(terms: string[]): string {
   const branches = terms
     .map((term, at) => (at === 0 ? `SELECT ${term} AS "v"` : `SELECT ${term}`))
     .join(' UNION ALL ')
-  const group = timeGroupSql('"v"')
-  return `(SELECT "v" FROM (${branches})
-     ORDER BY ${group} DESC,
-              (CASE WHEN ${group} = 3 THEN julianday("v") END) DESC,
+  return `(SELECT "v" FROM (SELECT "v", ${timeGroupSql('"v"')} AS "g" FROM (${branches}))
+     ORDER BY "g" DESC,
+              (CASE WHEN "g" = ${TIME_GROUP.isoText} THEN julianday("v") END) DESC,
               "v" COLLATE BINARY DESC
      LIMIT 1)`
 }
@@ -312,11 +273,13 @@ function tombstoneExistsSql(parts: TableParts, keyText: string): string {
  * (1) アプリの表の時刻列の新しい値、(2) `_sns_rows_<表>` の `_sns_ts`、
  * (3) `_tombstone` の `_sns_ts`。**(3) を落とすと、消してから作り直した行が
  * 作り直せない**（設計書 §5）。
+ *
+ * `heldTs` は (2) を読む式で、呼び出し側が決める。
  */
 function rowTsSql(
   parts: TableParts,
   side: 'NEW' | 'OLD',
-  trueId: string,
+  heldTs: string,
   keyText: string
 ): string {
   const written =
@@ -325,7 +288,7 @@ function rowTsSql(
       : `${side}.${escapeIdentifier(parts.timestampColumn)}`
   return maxTsSql([
     written,
-    rowsValueSql(parts, VERSION_COLUMNS.ts, trueId),
+    heldTs,
     tombstoneValueSql(parts, VERSION_COLUMNS.ts, keyText),
   ])
 }
@@ -383,11 +346,17 @@ function deleteTsSql(
     END)`
 }
 
-/** `_sns_rows_<表>` へ行の版を書く upsert（値の式は呼び出し側が決める）。 */
+/**
+ * `_sns_rows_<表>` へ行の版を書く upsert（値の式は呼び出し側が決める）。
+ *
+ * `from` を渡したときは、値の式をその `FROM` 句から1行選ぶ `INSERT … SELECT` の形にする。
+ * `ON CONFLICT` の前に `WHERE` が無いと、結合の `ON` と取り違えて構文の誤りになるので、`WHERE true` を足す。
+ */
 function upsertRowSql(
   parts: TableParts,
   values: Map<string, string>,
-  ts: string
+  ts: string,
+  from: string | null = null
 ): string {
   const names = [
     ...parts.columns.map((column) => escapeIdentifier(column.name)),
@@ -422,8 +391,12 @@ function upsertRowSql(
     lamport: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
     instance: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
   }
+  const source =
+    from === null
+      ? `VALUES (${expressions.join(', ')})`
+      : `SELECT ${expressions.join(', ')} ${from} WHERE true`
   return `INSERT INTO ${parts.rows} (${names.join(', ')})
-       VALUES (${expressions.join(', ')})
+       ${source}
        ON CONFLICT (${escapeIdentifier(parts.primaryKey.name)}) DO UPDATE SET
          ${assignments.join(',\n         ')}
        WHERE ${strongerSql(excluded, held)};`
@@ -609,7 +582,7 @@ function insertTrigger(parts: TableParts): string {
     BEGIN
       ${timestampCheckSql(parts)}
       ${tickSql(parts)}
-      ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', trueId, keyText))}
+      ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', rowsValueSql(parts, VERSION_COLUMNS.ts, trueId), keyText))}
       ${changelogSql(parts, keyText, 'INSERT', null)}
       ${dirtySql(parts)}
     END`
@@ -624,8 +597,14 @@ function insertTrigger(parts: TableParts): string {
  * NOT NULL の列がある表はその行が**全端末の画面から決定的に消える**。
  */
 function updateSameTrigger(parts: TableParts): string {
-  const trueId = trueIdSql(parts, 'NEW')
-  const keyText = keyTextSql(parts, 'NEW')
+  const pk = escapeIdentifier(parts.primaryKey.name)
+  // 真の id と `_sns_rows_<表>` の行は、upsert の `FROM` 句で1回だけ引く。
+  // 主キーは一意なので、結合の結果はいつも1行である。`"r".<主キー>` は、
+  // 結合の条件の `=` を満たす行があるときだけ NULL でないので、行があるかどうかを表す
+  const trueId = `"x"."k"`
+  const keyText = `CAST(${trueId} AS TEXT)`
+  const from = `FROM (SELECT ${trueIdSql(parts, 'NEW')} AS "k") AS "x"
+       LEFT JOIN ${parts.rows} AS "r" ON "r".${pk} = ${trueId}`
   const values = new Map<string, string>()
   for (const column of parts.columns) {
     if (isSameIdentifier(column.name, parts.primaryKey.name)) {
@@ -635,22 +614,24 @@ function updateSameTrigger(parts: TableParts): string {
     const quoted = escapeIdentifier(column.name)
     values.set(
       column.name,
-      `(CASE
-         WHEN NEW.${quoted} IS NOT OLD.${quoted} COLLATE BINARY THEN NEW.${quoted}
-         WHEN ${rowsExistsSql(parts, trueId)} THEN ${rowsValueSql(parts, column.name, trueId)}
-         ELSE OLD.${quoted}
-       END)`
+      `(CASE WHEN NEW.${quoted} IS NOT OLD.${quoted} COLLATE BINARY THEN NEW.${quoted}
+         WHEN "r".${pk} IS NOT NULL THEN "r".${quoted} ELSE OLD.${quoted} END)`
     )
   }
-  const pk = escapeIdentifier(parts.primaryKey.name)
+  const ts = rowTsSql(
+    parts,
+    'NEW',
+    `"r".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+    keyText
+  )
   return `CREATE TRIGGER ${escapeIdentifier(`_sns_after_update_same_${parts.name}`)}
     AFTER UPDATE ON ${parts.quoted} FOR EACH ROW
     WHEN NEW.${pk} IS OLD.${pk} AND ${GUARD}
     BEGIN
       ${timestampCheckSql(parts)}
       ${tickSql(parts)}
-      ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', trueId, keyText))}
-      ${changelogSql(parts, keyText, 'UPDATE', null)}
+      ${upsertRowSql(parts, values, ts, from)}
+      ${changelogSql(parts, keyTextSql(parts, 'NEW'), 'UPDATE', null)}
       ${dirtySql(parts)}
     END`
 }
@@ -714,7 +695,7 @@ function updateMoveTrigger(parts: TableParts): string {
                WHERE "tb"."tableName" = ${parts.literal}
                  AND "tb"."recordId" = ${oldKeyText}
                  AND ${strongerSql(tombstone, held)});
-      ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', newTrueId, newKeyText))}
+      ${upsertRowSql(parts, values, rowTsSql(parts, 'NEW', rowsValueSql(parts, VERSION_COLUMNS.ts, newTrueId), newKeyText))}
       ${changelogSql(parts, oldKeyText, 'DELETE', moved)}
       ${changelogSql(parts, newKeyText, 'UPDATE', null)}
       ${dirtySql(parts)}
