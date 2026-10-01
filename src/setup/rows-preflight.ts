@@ -13,6 +13,7 @@
  * | 親のいない子（P5） | 警告 | 親を置けない行はアプリの表に出ないので、導入前から壊れていた行が静かに消える |
  * | 時刻列に ISO-8601 の文字列でない値（P15） | 例外 | 削除は実行した時刻で比べるので、数値や NULL などの時刻とは比べられない |
  * | 大きく未来の時刻 | 警告 | 引き上げは下がらないので、その行の順序が以後ほぼ書き込み順だけで決まる |
+ * | 内部テーブルと同じ名前の表やビューで、ライブラリが読む列が無い | 例外 | ライブラリはその表を自分の表として読み書きし、列が無いという例外で止まるか、アプリの表を消す |
  *
  * @module setup/rows-preflight
  * @internal
@@ -20,6 +21,7 @@
 import Database from 'better-sqlite3'
 import { escapeIdentifier, foldIdentifier, isSameIdentifier } from './sql'
 import { parseCreateIndex } from '../rows/index-parse'
+import { VERSION_COLUMNS, tableOfRowsTable } from '../rows/schema'
 import { assertDeterministicSql } from '../rows/sql-functions'
 import { isIsoTimeSql } from '../rows/triggers'
 import { DEFAULTS } from '../types'
@@ -66,6 +68,8 @@ export function checkRowsPreconditions(
   options: RowsPreflightOptions = {}
 ): RowsPreflightResult {
   const warnings: string[] = []
+  // 内部テーブルは移行が書き換えるので、ほかの検査より先に見る
+  assertInternalTablesAreOurs(db)
   const custom = readCustomRegistrations(db)
 
   for (const table of tables) {
@@ -81,6 +85,79 @@ export function checkRowsPreconditions(
   // 同期しない表から同期する表への違反を取りこぼす
   warnings.push(...checkForeignKeys(db, tables))
   return { warnings }
+}
+
+/* ------------------------------------------------------------------ *
+ * 内部テーブルの名前
+ * ------------------------------------------------------------------ */
+
+/**
+ * 内部テーブルの名前と、ライブラリがその表から読む列。
+ *
+ * 以前の版が作り、移行が撤去する `_id_merge` と `_heartbeat` も含める。
+ * 列は、その表を作ったすべての版にある列だけを並べる。後の版で足した列は移行が足すので、ここでは求めない。
+ */
+const INTERNAL_TABLE_COLUMNS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['_sync_meta', ['key', 'value']],
+  ['_sync_state', ['remoteClientId', 'lastSeenId']],
+  ['_changelog', ['id', 'tableName', 'recordId', 'operation']],
+  ['_changelog_prune', ['onlyRow', 'prunedThroughId']],
+  ['_tombstone', ['tableName', 'recordId']],
+  ['_id_merge', ['tableName', 'losingId', 'winningId']],
+  ['_heartbeat', ['id', 'updatedAt']],
+  ['_sns_clock', ['onlyRow', 'lamport', 'instanceId']],
+  ['_sns_tick', ['tableName', 'tick']],
+  ['_sns_dirty', ['tableName']],
+  ['_sns_shown', ['tableName', 'trueId', 'shownId']],
+  ['_sns_hidden', ['tableName', 'trueId', 'winnerId']],
+  ['_sns_unplaceable', ['tableName', 'trueId']],
+  ['_sns_rebuilding', ['onlyRow']],
+])
+
+/** 内部テーブルの名前なら、ライブラリがその表から読む列。そうでなければ `null`。 */
+function internalTableColumns(name: string): readonly string[] | null {
+  const folded = foldIdentifier(name)
+  if (tableOfRowsTable(folded) !== null) return Object.values(VERSION_COLUMNS)
+  return INTERNAL_TABLE_COLUMNS.get(folded) ?? null
+}
+
+/**
+ * 内部テーブルの名前を持つ表とビューが、ライブラリの作った形であること。
+ *
+ * `_` で始まる表は同期の対象にならないが、内部テーブルと名前が同じなら、ライブラリはその表を自分の表として読み書きする。
+ * そのままでは、列が無いという SQLite の例外で止まるか、移行が `_sync_state` の行を消し、`_id_merge` などを `DROP` する。
+ * ライブラリが読む列が1つでも無ければ、アプリの表とみなして、DB に触る前に例外にする。
+ * 列がすべてそろっている表は、ライブラリが作った表と区別できないので通す。
+ */
+function assertInternalTablesAreOurs(db: Database.Database): void {
+  const entries = db
+    .prepare(
+      `SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view')`
+    )
+    .all() as { type: string; name: string }[]
+  for (const entry of entries) {
+    const required = internalTableColumns(entry.name)
+    if (required === null) continue
+    const advice = 'アプリの表なら名前を変えること'
+    if (entry.type === 'view') {
+      throw new Error(
+        `${entry.name} は sqlite-nas-sync の内部テーブルの名前だが、ビューである。${advice}`
+      )
+    }
+    const present = (
+      db.pragma(`table_xinfo(${escapeIdentifier(entry.name)})`) as {
+        name: string
+      }[]
+    ).map((column) => column.name)
+    const missing = required.filter(
+      (column) => !present.some((name) => isSameIdentifier(name, column))
+    )
+    if (missing.length > 0) {
+      throw new Error(
+        `${entry.name} は sqlite-nas-sync の内部テーブルの名前だが、ライブラリが読む列 ${missing.join(', ')} が無い。${advice}`
+      )
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ *

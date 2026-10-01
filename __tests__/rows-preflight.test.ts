@@ -603,13 +603,17 @@ describe('checkRowsPreconditions —— P5（親のいない子）', () => {
     const db = open([
       `CREATE TABLE tags (id TEXT PRIMARY KEY NOT NULL)`,
       `CREATE TABLE _sns_shown (
-         id    TEXT PRIMARY KEY NOT NULL,
-         tagId TEXT REFERENCES tags(id)
+         tableName TEXT NOT NULL,
+         trueId    TEXT NOT NULL,
+         shownId   TEXT NOT NULL,
+         tagId     TEXT REFERENCES tags(id)
        )`,
     ])
     try {
       db.pragma('foreign_keys = OFF')
-      db.prepare(`INSERT INTO _sns_shown VALUES ('a', 'missing')`).run()
+      db.prepare(
+        `INSERT INTO _sns_shown VALUES ('tags', 'a', 'a', 'missing')`
+      ).run()
       expect(checkRowsPreconditions(db, [{ name: 'tags' }]).warnings).toEqual(
         []
       )
