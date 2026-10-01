@@ -98,6 +98,62 @@ const CHAIN: RowsSchema = {
   ],
 }
 
+/**
+ * 自己参照の外部キーを持つ表（`ON DELETE CASCADE`）。親子が同じ表に入る。
+ * `name` の UNIQUE は、隠れた親を指す子の読み替えを見るためにある。
+ */
+const TREE: RowsSchema = {
+  tables: [
+    {
+      name: 'tree',
+      ddl: `CREATE TABLE tree (
+              id        TEXT PRIMARY KEY NOT NULL,
+              up        TEXT REFERENCES tree(id) ON DELETE CASCADE,
+              name      TEXT UNIQUE,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+  ],
+}
+
+/** 自己参照の外部キーが `ON DELETE SET NULL` の表。 */
+const TREE_SET_NULL: RowsSchema = {
+  tables: [
+    {
+      name: 'tree',
+      ddl: `CREATE TABLE tree (
+              id        TEXT PRIMARY KEY NOT NULL,
+              up        TEXT REFERENCES tree(id) ON DELETE SET NULL,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+  ],
+}
+
+/** 自己参照の外部キーが `ON DELETE SET DEFAULT` の表。既定値は根の `root` を指す。 */
+const TREE_SET_DEFAULT: RowsSchema = {
+  tables: [
+    {
+      name: 'tree',
+      ddl: `CREATE TABLE tree (
+              id        TEXT PRIMARY KEY NOT NULL,
+              up        TEXT DEFAULT 'root' REFERENCES tree(id) ON DELETE SET DEFAULT,
+              updatedAt TEXT NOT NULL
+            )`,
+    },
+  ],
+}
+
+/** 自己参照の表の行の版（`name` は既定で NULL）。 */
+function node(
+  id: string,
+  up: string | null,
+  lamport: number,
+  name: string | null = null
+): RowVersion {
+  return row('tree', id, { id, up, name, updatedAt: T0 }, lamport, 'a')
+}
+
 /** 行の版。`ts` は既定で `content.updatedAt`（引き上げが要らない場合）。 */
 function row(
   table: string,
@@ -538,6 +594,109 @@ const CASES: Case[] = [
       ),
     ],
     expect: ['tags:g1 死', 'tag_notes:n1 親削除→tags:g1'],
+  },
+  {
+    name: '自己参照: 同じ表の親と子がどちらも置かれる',
+    schema: TREE,
+    versions: [node('t1', null, 1), node('t2', 't1', 2)],
+    expect: [
+      `tree:t1 置く id=t1 up=null name=null updatedAt=${T0}`,
+      `tree:t2 置く id=t2 up=t1 name=null updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '自己参照: 深さ4の木は、子が親より強く並んでも全部置かれる',
+    schema: TREE,
+    // 強い順は d → c → b → a で、葉が根より先に来る
+    versions: [
+      node('a', null, 1),
+      node('b', 'a', 2),
+      node('c', 'b', 3),
+      node('d', 'c', 4),
+    ],
+    expect: [
+      `tree:a 置く id=a up=null name=null updatedAt=${T0}`,
+      `tree:b 置く id=b up=a name=null updatedAt=${T0}`,
+      `tree:c 置く id=c up=b name=null updatedAt=${T0}`,
+      `tree:d 置く id=d up=c name=null updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '自己参照 原則4: 親が削除されていれば、子と孫は大元の削除を原因に置かない',
+    schema: TREE,
+    versions: [
+      del('tree', 'a', T1, 5, 'a'),
+      node('b', 'a', 2),
+      node('c', 'b', 3),
+    ],
+    expect: ['tree:a 死', 'tree:b 親削除→tree:a', 'tree:c 親削除→tree:a'],
+  },
+  {
+    name: '自己参照: 親が届いていなければ、子も孫も置かない',
+    schema: TREE,
+    versions: [node('b', 'a', 2), node('c', 'b', 3)],
+    expect: ['tree:b 置かない', 'tree:c 置かない'],
+  },
+  {
+    name: '自己参照 原則4: 隠れた親を指す子は、勝者の子になる',
+    schema: TREE,
+    versions: [
+      node('p1', null, 5, 'same'),
+      node('p2', null, 1, 'same'),
+      node('c', 'p2', 3),
+    ],
+    expect: [
+      `tree:p1 置く id=p1 up=null name=same updatedAt=${T0}`,
+      'tree:p2 隠れ→p1',
+      `tree:c 置く id=c up=p1 name=null updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '自己参照: 輪になった行は置かず、輪に繋がる子も置かない（設計書 §6.5 の8）',
+    schema: TREE,
+    versions: [
+      node('a', 'b', 1),
+      node('b', 'a', 2),
+      node('s', 's', 3),
+      node('c', 'a', 4),
+      node('r', null, 5),
+    ],
+    expect: [
+      'tree:a 置かない',
+      'tree:b 置かない',
+      'tree:s 置かない',
+      'tree:c 置かない',
+      `tree:r 置く id=r up=null name=null updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '自己参照 原則4: SET NULL なら、親が削除された子は列を NULL にして置く',
+    schema: TREE_SET_NULL,
+    versions: [
+      del('tree', 'a', T1, 5, 'a'),
+      row('tree', 'b', { id: 'b', up: 'a', updatedAt: T0 }, 2, 'a'),
+      row('tree', 'c', { id: 'c', up: 'b', updatedAt: T0 }, 3, 'a'),
+    ],
+    expect: [
+      'tree:a 死',
+      `tree:b 置く id=b up=null updatedAt=${T0}`,
+      `tree:c 置く id=c up=b updatedAt=${T0}`,
+    ],
+  },
+  {
+    name: '自己参照 原則4: SET DEFAULT なら、親が削除された子は既定値の指す行の子として置く',
+    schema: TREE_SET_DEFAULT,
+    // 強い順は b → root で、既定値の指す root が子より後に並ぶ
+    versions: [
+      row('tree', 'root', { id: 'root', up: null, updatedAt: T0 }, 1, 'a'),
+      del('tree', 'a', T1, 5, 'a'),
+      row('tree', 'b', { id: 'b', up: 'a', updatedAt: T0 }, 2, 'a'),
+    ],
+    expect: [
+      `tree:root 置く id=root up=null updatedAt=${T0}`,
+      'tree:a 死',
+      `tree:b 置く id=b up=root updatedAt=${T0}`,
+    ],
   },
 ]
 

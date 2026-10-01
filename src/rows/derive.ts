@@ -216,7 +216,8 @@ function deriveWith(
   /**
    * 削除されている id と、親が削除されているので置かない id（原則4・付則3）。
    * 表 → 真の id の正規形 → 大元の削除（`<表>:<id>`）。
-   * 親が先に並んでいるので（`model.order`）、子を見るときには親のぶんが揃っている。
+   * 親の表が先に並んでいるので（`model.order`）、子を見るときには親のぶんが揃っている。
+   * 同じ表の親は、深さの順に決めるので先に揃う（{@link selfReferenceLevels}）。
    */
   const gone = new Map<string, Map<string, string>>()
 
@@ -228,6 +229,13 @@ function deriveWith(
     const tableRows: Record<string, SqlValue>[] = []
     const tableDead = new Set<string>()
     const tableGone = new Map<string, string>()
+    // 処理の途中から載せておく。自己参照の外部キーでは、同じ表の親の `Res` と
+    // 削除をこの表の処理の中で引く
+    candidates.set(name, tableCandidates)
+    res.set(name, tableRes)
+    rows.set(name, tableRows)
+    dead.set(name, tableDead)
+    gone.set(name, tableGone)
     /** 判定用の DB に置いた行の「同一性の列の値」→ どの候補か */
     const placedByIdentity = new Map<string, PlacedRow>()
 
@@ -249,117 +257,130 @@ function deriveWith(
       return values.compareIdKeys(values.idKey(a.id), values.idKey(b.id))
     })
 
-    const hidden: { key: string; display: Record<string, SqlValue> }[] = []
-
-    for (const version of living) {
+    // 自己参照の外部キーがある表では、根から深さの順に決める（設計書 §3.7.1）。
+    // 同じ深さの中は強い順のまま。自己参照の無い表は深さ0の1段だけになる
+    const { levels, cyclic } = selfReferenceLevels(values, model, table, living)
+    for (const version of cyclic) {
       const key = values.idKey(version.id)
-      const shown = displayValues(values, model, table, version, res, gone)
-      if (shown.kind === 'parentDeleted') {
-        // 親が削除されている間は置かない（原則4・付則3）。版は残す
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'parentDeleted',
-          display: { ...(version.content ?? {}) },
-          reason: `親が削除されている（${shown.cause.table}:${shown.cause.key}）`,
-          cause: shown.cause,
-        })
-        tableRes.set(key, null)
-        // この行を親とする孫も、同じ大元の削除で置かない（連鎖）
-        tableGone.set(key, `${shown.cause.table}:${shown.cause.key}`)
-        continue
-      }
-      if (shown.kind === 'unplaceable') {
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'unplaceable',
-          display: { ...(version.content ?? {}) },
-          reason:
-            '外部キーが指す親の行がユーザーテーブルに入っていない（親の行がまだ届いていないか、親の行自体が制約で入らない）',
-        })
-        tableRes.set(key, null)
-        continue
-      }
-      const display = shown.display
-      // 主キーが NULL の候補は置かない行にする。`INTEGER PRIMARY KEY` に NULL を
-      // 入れると SQLite が rowid を割り当ててしまい、**ライブラリが id を捏造する**
-      // ことになる（目標 (c) に反する）
-      if (
-        table.primaryKey.some((column) => (display[column] ?? null) === null)
-      ) {
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'unplaceable',
-          display,
-          reason: '主キーが NULL',
-        })
-        tableRes.set(key, null)
-        continue
-      }
-      const outcome = model.insertIntoJudge(table, display)
-      if (outcome.outcome === 'unplaceable') {
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'unplaceable',
-          display,
-          reason: outcome.reason,
-        })
-        tableRes.set(key, null)
-        continue
-      }
-      // ここから先は、行に閉じた制約は通っている。使い捨ての DB へ1行だけ置いて、
-      // 生成列の値・宣言された型への寄せ・索引の項を SQLite に計算させる
-      model.placeOnProbe(table, display)
-      if (outcome.outcome === 'placed') {
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'placed',
-          display,
-        })
-        tableRows.push(model.probeRow(table))
-        tableRes.set(
-          key,
-          table.primaryKey.map((column) => display[column] ?? null)
-        )
-        placedByIdentity.set(model.probeIdentity(table), {
-          key,
-          order: placedByIdentity.size,
-        })
-      } else {
-        hidden.push({ key, display })
-        tableCandidates.set(key, {
-          table: name,
-          key,
-          placement: 'hidden',
-          display,
-          reason: outcome.reason,
-        })
-      }
+      tableCandidates.set(key, {
+        table: name,
+        key,
+        placement: 'unplaceable',
+        display: { ...(version.content ?? {}) },
+        reason:
+          '自己参照の外部キーが輪になっていて、根から辿れない（設計書 §6.5 の8）',
+      })
+      tableRes.set(key, null)
     }
 
-    // 5. 勝者（設計書 §1.5）—— 索引ごとに「その候補の表示値の組」で判定用の DB を引き、
-    //    引けた置く行のうち §1.6 の順で最も強いもの
-    for (const row of hidden) {
-      const winner = findWinner(model, table, row.display, placedByIdentity)
-      const entry = tableCandidates.get(row.key) as CandidateResult
-      if (winner === null) {
-        // かぶる相手が見つからない。設計書 §1.6 の表の「それ以外」に落とし、`Res` は ⊥
-        tableRes.set(row.key, null)
-        continue
-      }
-      entry.winner = winner
-      tableRes.set(row.key, tableRes.get(winner) ?? null)
-    }
+    for (const level of levels) {
+      const hidden: { key: string; display: Record<string, SqlValue> }[] = []
 
-    candidates.set(name, tableCandidates)
-    res.set(name, tableRes)
-    rows.set(name, tableRows)
-    dead.set(name, tableDead)
-    gone.set(name, tableGone)
+      for (const version of level) {
+        const key = values.idKey(version.id)
+        const shown = displayValues(values, model, table, version, res, gone)
+        if (shown.kind === 'parentDeleted') {
+          // 親が削除されている間は置かない（原則4・付則3）。版は残す
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'parentDeleted',
+            display: { ...(version.content ?? {}) },
+            reason: `親が削除されている（${shown.cause.table}:${shown.cause.key}）`,
+            cause: shown.cause,
+          })
+          tableRes.set(key, null)
+          // この行を親とする孫も、同じ大元の削除で置かない（連鎖）
+          tableGone.set(key, `${shown.cause.table}:${shown.cause.key}`)
+          continue
+        }
+        if (shown.kind === 'unplaceable') {
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'unplaceable',
+            display: { ...(version.content ?? {}) },
+            reason:
+              '外部キーが指す親の行がユーザーテーブルに入っていない（親の行がまだ届いていないか、親の行自体が制約で入らない）',
+          })
+          tableRes.set(key, null)
+          continue
+        }
+        const display = shown.display
+        // 主キーが NULL の候補は置かない行にする。`INTEGER PRIMARY KEY` に NULL を
+        // 入れると SQLite が rowid を割り当ててしまい、**ライブラリが id を捏造する**
+        // ことになる（目標 (c) に反する）
+        if (
+          table.primaryKey.some((column) => (display[column] ?? null) === null)
+        ) {
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'unplaceable',
+            display,
+            reason: '主キーが NULL',
+          })
+          tableRes.set(key, null)
+          continue
+        }
+        const outcome = model.insertIntoJudge(table, display)
+        if (outcome.outcome === 'unplaceable') {
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'unplaceable',
+            display,
+            reason: outcome.reason,
+          })
+          tableRes.set(key, null)
+          continue
+        }
+        // ここから先は、行に閉じた制約は通っている。使い捨ての DB へ1行だけ置いて、
+        // 生成列の値・宣言された型への寄せ・索引の項を SQLite に計算させる
+        model.placeOnProbe(table, display)
+        if (outcome.outcome === 'placed') {
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'placed',
+            display,
+          })
+          tableRows.push(model.probeRow(table))
+          tableRes.set(
+            key,
+            table.primaryKey.map((column) => display[column] ?? null)
+          )
+          placedByIdentity.set(model.probeIdentity(table), {
+            key,
+            order: placedByIdentity.size,
+          })
+        } else {
+          hidden.push({ key, display })
+          tableCandidates.set(key, {
+            table: name,
+            key,
+            placement: 'hidden',
+            display,
+            reason: outcome.reason,
+          })
+        }
+      }
+
+      // 5. 勝者（設計書 §1.5）—— 索引ごとに「その候補の表示値の組」で判定用の DB を引き、
+      //    引けた置く行のうち §1.6 の順で最も強いもの。次の深さの子が隠れた親の
+      //    `Res` を引けるように、深さごとに決める
+      for (const row of hidden) {
+        const winner = findWinner(model, table, row.display, placedByIdentity)
+        const entry = tableCandidates.get(row.key) as CandidateResult
+        if (winner === null) {
+          // かぶる相手が見つからない。設計書 §1.6 の表の「それ以外」に落とし、`Res` は ⊥
+          tableRes.set(row.key, null)
+          continue
+        }
+        entry.winner = winner
+        tableRes.set(row.key, tableRes.get(winner) ?? null)
+      }
+    }
   }
 
   return { candidates, rows, dead }
@@ -498,6 +519,112 @@ function displayValues(
     }
   }
   return { kind: 'values', display }
+}
+
+/**
+ * 自己参照の外部キーでの深さ（設計書 §3.7.1）。
+ *
+ * 同じ表の候補を親に持たない候補が深さ0で、親の深さの最大に1を足したものが子の深さになる。
+ * 親が死んでいる・届いていない候補も深さ0で、{@link displayValues} がそれぞれ
+ * 親削除・置かない行に分ける。深さの順に決めれば、子を見るときには同じ表の親の
+ * `Res` と削除が揃っている。各段の中は `living` の並び、つまり強い順のまま返す。
+ *
+ * 輪の上にある候補と、輪に繋がる候補は深さが決まらないので `cyclic` に返す。
+ * 輪の行の `Res` は、互いの `Res` が決まらないと決まらないからである。
+ *
+ * `SET DEFAULT` の外部キーでは、列が NULL でなければ、既定値が指す候補も親に数える。
+ * 親が置かれなければ既定値の指す行を引くからである。
+ */
+function selfReferenceLevels(
+  values: ValueOrdering,
+  model: SchemaModel,
+  table: TableMeta,
+  living: RowVersion[]
+): { levels: RowVersion[][]; cyclic: RowVersion[] } {
+  const selfKeys = table.foreignKeys
+    .filter((key) => key.parentTable === table.name)
+    .map((key) => {
+      if (missingParentAction(key.onDelete) !== 'setDefault') {
+        return { key, defaults: null }
+      }
+      const defaults = key.columns.map((column) =>
+        literalDefault(model, table, column)
+      )
+      return defaults.some((value) => value === undefined)
+        ? { key, defaults: null }
+        : { key, defaults: defaults as SqlValue[] }
+    })
+  if (selfKeys.length === 0) return { levels: [living], cyclic: [] }
+
+  const livingKeys = new Map<string, RowVersion>()
+  for (const version of living)
+    livingKeys.set(values.idKey(version.id), version)
+  /** 候補 → 同じ表の候補のうち、その候補が指すもの */
+  const parents = new Map<string, Set<string>>()
+  /** 候補 → その候補を指す、同じ表の候補 */
+  const children = new Map<string, string[]>()
+  for (const [key, version] of livingKeys) {
+    const referenced = new Set<string>()
+    for (const { key: foreignKey, defaults } of selfKeys) {
+      const trueValues = foreignKey.columns.map(
+        (column) => version.content?.[column] ?? null
+      )
+      // 1列でも NULL なら SQLite は検査せず、既定値も使わない（displayValues と同じ）
+      if (trueValues.some((value) => value === null)) continue
+      for (const target of defaults === null
+        ? [trueValues]
+        : [trueValues, defaults]) {
+        if (target.some((value) => value === null)) continue
+        const parentKey = values.idKey(target[0])
+        if (livingKeys.has(parentKey)) referenced.add(parentKey)
+      }
+    }
+    parents.set(key, referenced)
+    for (const parentKey of referenced) {
+      const list = children.get(parentKey) ?? []
+      list.push(key)
+      children.set(parentKey, list)
+    }
+  }
+
+  // 親の決まっていない数が0になった候補から深さを決める（入次数による位相ソート）
+  const remaining = new Map<string, number>()
+  const depth = new Map<string, number>()
+  let frontier: string[] = []
+  for (const [key, referenced] of parents) {
+    remaining.set(key, referenced.size)
+    if (referenced.size === 0) {
+      depth.set(key, 0)
+      frontier.push(key)
+    }
+  }
+  while (frontier.length > 0) {
+    const next: string[] = []
+    for (const key of frontier) {
+      for (const child of children.get(key) ?? []) {
+        const left = (remaining.get(child) as number) - 1
+        remaining.set(child, left)
+        if (left === 0) {
+          depth.set(child, (depth.get(key) as number) + 1)
+          next.push(child)
+        }
+      }
+    }
+    frontier = next
+  }
+
+  const levels: RowVersion[][] = []
+  const cyclic: RowVersion[] = []
+  for (const version of living) {
+    const at = depth.get(values.idKey(version.id))
+    if (at === undefined) {
+      cyclic.push(version)
+      continue
+    }
+    while (levels.length <= at) levels.push([])
+    levels[at].push(version)
+  }
+  return { levels, cyclic }
 }
 
 /**

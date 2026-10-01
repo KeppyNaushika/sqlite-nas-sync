@@ -2,7 +2,7 @@
 
 2026-09-30 時点。対象は main の a9067d6（npm 0.21.0、タグ `v0.21.0`）である。
 
-0.21.0 は完全ではない。0.21.0 で入った重大な後退が1件、以前からあるデータ喪失の不具合が1件あり、どちらも再現を確かめた。
+0.21.0 は完全ではない。0.21.0 で入った重大な後退が1件あり、再現を確かめた。以前からあるデータ喪失の不具合も1件あったが、直した。
 この文書は 0.21.1 で直すものの一覧で、直したら該当する行を消す。すべて直したらこの文書を消す。
 
 ## 検証の方法
@@ -20,11 +20,10 @@
 
 ## 修正が必要な問題
 
-| 重大度 | 問題                                                                                                                                                                          | 原因                                                                                                                                        | 由来          |
-| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| 致命   | 自己参照の外部キーを持つ表で、子行がアプリの表から消える。同じ端末で親と子を書いて1回同期すると、書いた端末からも子が消える。導入前からある木構造も、最初の同期で根だけになる | `src/rows/derive.ts` の `deriveWith` が表ごとの結果を表の処理の最後に `res` と `gone` へ入れるので、同じ表の親を `resolveParent` で引けない | 0.20.0 から   |
-| 重大   | UTF-16 の DB では、同期が毎回 `attached databases must use the same text encoding as main database` で止まり、行が1つも届かない                                               | `src/nas.ts` の `writePublishedTables` が写しの DB を UTF-8 で作り、そこへ元の DB を `ATTACH` する                                          | 0.21.0 の後退 |
-| 重大   | STRICT 表の `ANY` 列に書いた文字列 `'123'` が、同期のあと整数 `123` になる。同期がアプリの値を書き換えるので原則1に反する                                                     | `_sns_rows_<表>` が STRICT でなく、型名 `ANY` で NUMERIC 親和性が効く                                                                       | 0.20.0 から   |
+| 重大度 | 問題                                                                                                                            | 原因                                                                                               | 由来          |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------- |
+| 重大   | UTF-16 の DB では、同期が毎回 `attached databases must use the same text encoding as main database` で止まり、行が1つも届かない | `src/nas.ts` の `writePublishedTables` が写しの DB を UTF-8 で作り、そこへ元の DB を `ATTACH` する | 0.21.0 の後退 |
+| 重大   | STRICT 表の `ANY` 列に書いた文字列 `'123'` が、同期のあと整数 `123` になる。同期がアプリの値を書き換えるので原則1に反する       | `_sns_rows_<表>` が STRICT でなく、型名 `ANY` で NUMERIC 親和性が効く                              | 0.20.0 から   |
 
 どれも1台だけで再現する。再現手順は末尾にある。
 
@@ -81,7 +80,7 @@ NAS の写しを小さくした代わりに、手元の一時領域とスレッ�
 | `peerTableName` が常に渡された綴りを返す | ありうる。端末ごとに表名の綴りが違う場合を守る試験が無い     |
 | 仕掛けの取り付け直しのあとに上げ直さない | 限られる。次に何かを書くか取り込めば解消する                 |
 
-自己参照の外部キー、UTF-16、STRICT の `ANY` 列を扱う試験も無い。
+UTF-16、STRICT の `ANY` 列を扱う試験も無い。
 
 ## 問題が無かったこと
 
@@ -112,24 +111,21 @@ NAS の写しを小さくした代わりに、手元の一時領域とスレッ�
 0.21.1 として、公開済みの版で入った後退とデータを失う不具合から直す。
 
 1. UTF-16 の後退を直す。写しの DB の文字コードを元に合わせる
-2. 自己参照の外部キーで子行が消える不具合を直す
-3. 写しの作り方を見直し、一時領域とスレッドが止まる時間の悪化を抑える
-4. STRICT 表の `ANY` 列の型の問題を直す
-5. 軽微な問題と文書を直し、試験を足す。対象は上で見つかった壊れ方と、人工バグで気づかなかった3つ
+2. 写しの作り方を見直し、一時領域とスレッドが止まる時間の悪化を抑える
+3. STRICT 表の `ANY` 列の型の問題を直す
+4. 軽微な問題と文書を直し、試験を足す。対象は上で見つかった壊れ方と、人工バグで気づかなかった3つ
 
 ## 再現手順
 
 どれも `npm run build` のあとにリポジトリの直下で動く。`TMPDIR` には空のディレクトリを渡す。
 
 ```js
-// repro.js — 使い方: TMPDIR=<空のディレクトリ> node repro.js selfref|utf16|strict
+// repro.js — 使い方: TMPDIR=<空のディレクトリ> node repro.js utf16|strict
 const path = require('path')
 const Database = require('better-sqlite3')
 const { setupSync } = require('./dist/index.js')
 
 const DDL = {
-  selfref: `CREATE TABLE tree (id TEXT PRIMARY KEY NOT NULL,
-              up TEXT REFERENCES tree(id) ON DELETE CASCADE, updatedAt TEXT NOT NULL)`,
   utf16: `CREATE TABLE notes (id TEXT PRIMARY KEY NOT NULL, body TEXT, updatedAt TEXT NOT NULL)`,
   strict: `CREATE TABLE s (id TEXT PRIMARY KEY NOT NULL, v ANY, updatedAt TEXT NOT NULL) STRICT`,
 }
@@ -150,15 +146,12 @@ const T = '2026-01-01T00:00:00.000Z'
     schemaVersion: '1',
   })
   const app = new Database(dbPath)
-  if (kind === 'selfref') {
-    app.prepare(`INSERT INTO tree VALUES ('t1', NULL, ?)`).run(T)
-    app.prepare(`INSERT INTO tree VALUES ('t2', 't1', ?)`).run(T)
-  } else if (kind === 'utf16') {
+  if (kind === 'utf16') {
     app.prepare(`INSERT INTO notes VALUES ('x', 'hello', ?)`).run(T)
   } else {
     app.prepare(`INSERT INTO s VALUES ('k', '123', ?)`).run(T)
   }
-  const table = { selfref: 'tree', utf16: 'notes', strict: 's' }[kind]
+  const table = { utf16: 'notes', strict: 's' }[kind]
   const show = () =>
     app
       .prepare(
@@ -177,8 +170,7 @@ const T = '2026-01-01T00:00:00.000Z'
 })()
 ```
 
-| 引数      | 正しい結果                         | 0.21.0 の結果                                                                |
-| --------- | ---------------------------------- | ---------------------------------------------------------------------------- |
-| `selfref` | `t1` と `t2` が残る                | `t2` が消え、`Unplaceable tree:t2` の警告が出る。0.20.0 でも同じ             |
-| `utf16`   | 例外が出ない                       | `attached databases must use the same text encoding as main database` の例外 |
-| `strict`  | `v` は `'123'`、`typeof` は `text` | `v` は `123`、`typeof` は `integer`                                          |
+| 引数     | 正しい結果                         | 0.21.0 の結果                                                                |
+| -------- | ---------------------------------- | ---------------------------------------------------------------------------- |
+| `utf16`  | 例外が出ない                       | `attached databases must use the same text encoding as main database` の例外 |
+| `strict` | `v` は `'123'`、`typeof` は `text` | `v` は `123`、`typeof` は `integer`                                          |
