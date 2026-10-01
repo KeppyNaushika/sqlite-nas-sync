@@ -11,21 +11,21 @@
  * | `_sns_before_delete_<表>` | BEFORE DELETE | 削除の版を1つ作る |
  *
  * UPDATE を2本に分けるのは、SQLite のトリガー本体に**条件分岐が無い**からである
- * （設計書 §3.4.1 の軽微17）。
+ * （設計書 §3.4）。
  *
  * ここで守っている決まりごと:
  *
  * 1. **番人**（`GUARD`）。4本すべての `WHEN` に
  *    `NOT EXISTS (SELECT 1 FROM _sns_rebuilding)` を AND で足す。これが無いと
  *    **作り直しの適用そのものが削除の版を作り、他端末のデータを消す**
- * 2. **書き込みはすべて `ON CONFLICT` の形**（設計書 §3.4.0 の必須1）。
+ * 2. **書き込みはすべて `ON CONFLICT` の形**（設計書 §3.4）。
  *    `INSERT OR IGNORE` / `INSERT OR REPLACE` / 競合解決を書かない `INSERT` は
  *    **外側の文の競合解決に置き換えられる**ので使わない。これを守らないと、
  *    `ON DELETE SET NULL` の子を持つ親を消したときに**アプリの DELETE ごと失敗する**
  * 3. **3項の最大**は `ORDER BY … LIMIT 1` で書く（設計書 §3.3 の `NEWTS`）。
  *    `CASE WHEN TSGT …` の入れ子にすると1つで5万文字になる
- * 4. **`_tombstone.recordId` との比較は必ず正規形**（`CAST(… AS TEXT)`。§1.11 の必須7）
- * 5. **書かなかった列は3分岐**（§3.4.3 の必須2）。`_sns_rows_<表>` に行が無い窓が
+ * 4. **`_tombstone.recordId` との比較は必ず正規形**（`CAST(… AS TEXT)`。設計書 §1.9〜1.11）
+ * 5. **書かなかった列は3分岐**（設計書 §3.4）。`_sns_rows_<表>` に行が無い窓が
  *    あるので、`(SELECT …)` だけにすると NOT NULL の列が NULL になって行が消える
  * 6. **時刻列は ISO 8601 の文字列だけ**（前提 P15。原則2 のため）。INSERT と UPDATE の
  *    3本は、本体の先頭で `NEW.<時刻列>` を確かめ、違えば `RAISE(ABORT)` で
@@ -138,7 +138,7 @@ export function strongerSql(a: VersionRefs, b: VersionRefs): string {
 }
 
 /**
- * 順序用の時刻の引き上げ（設計書 §1.2.1 の必須3）。**3項の最大**。
+ * 順序用の時刻の引き上げ（設計書 §1.2.1）。**3項の最大**。
  *
  * `CASE WHEN TSGT(…)` を入れ子にすると、項が増えるたびに式が二乗で膨らみ、
  * 3項で5万文字を超える。**並べ替えて1行取る**形にすれば、項の数だけ線形に伸びる。
@@ -198,7 +198,7 @@ function readParts(db: Database.Database, table: RowsTableSpec): TableParts {
 }
 
 /**
- * **番人**（設計書 §3.7.2・§3.10 の軽微15）。
+ * **番人**（設計書 §3.3・§3.7.2）。
  *
  * 作り直しの適用は、アプリの表から行を消し、行を入れ直す。その書き込みが
  * トリガーを通って事実になると、**適用そのものが削除の版を作り、
@@ -213,7 +213,7 @@ const CLOCK_LAMPORT = `(SELECT "lamport" FROM "_sns_clock")`
 const CLOCK_INSTANCE = `(SELECT "instanceId" FROM "_sns_clock")`
 
 /**
- * `TICK(t)`（設計書 §3.3・訂正6）。**本体の先頭**（時刻列の確かめの直後）に置く。
+ * `TICK(t)`（設計書 §3.3）。**本体の先頭**（時刻列の確かめの直後）に置く。
  *
  * `_sns_clock` の `instanceId` を `(SELECT instanceId FROM _sns_clock)` から
  * 取っているのは、**行が無いときに行を作らせないため**である。作ってしまうと
@@ -254,7 +254,7 @@ function timestampCheckSql(parts: TableParts): string {
 }
 
 /**
- * `TRUE_ID`（設計書 §3.3・訂正2）。**`_sns_shown` を shownId 側から引く。**
+ * `TRUE_ID`（設計書 §3.3）。**`_sns_shown` を shownId 側から引く。**
  *
  * 引けなければ主キーそのもの。1:1 の表では、表示している id とは別に
  * 「真の id」があり、削除の版も行の版も真の id で記録しなければならない
@@ -269,7 +269,7 @@ function trueIdSql(parts: TableParts, side: 'NEW' | 'OLD'): string {
        WHERE "tableName" = ${parts.literal} AND "shownId" = CAST(${key} AS TEXT)), ${key})`
 }
 
-/** `KEY_TEXT`（設計書 §1.11 の必須7）。`_tombstone.recordId` と突き合わせる形。 */
+/** `KEY_TEXT`（設計書 §1.9〜1.11）。`_tombstone.recordId` と突き合わせる形。 */
 function keyTextSql(parts: TableParts, side: 'NEW' | 'OLD'): string {
   return `CAST(${trueIdSql(parts, side)} AS TEXT)`
 }
@@ -311,7 +311,7 @@ function tombstoneExistsSql(parts: TableParts, keyText: string): string {
  *
  * (1) アプリの表の時刻列の新しい値、(2) `_sns_rows_<表>` の `_sns_ts`、
  * (3) `_tombstone` の `_sns_ts`。**(3) を落とすと、消してから作り直した行が
- * 作り直せない**（§2.3 の場面4）。
+ * 作り直せない**（設計書 §5）。
  */
 function rowTsSql(
   parts: TableParts,
@@ -350,7 +350,7 @@ function deletedAtSql(parts: TableParts): string {
 }
 
 /**
- * 削除の版の `_sns_ts`（設計書 §3.4.4 の必須3・訂正3、原則2）。
+ * 削除の版の `_sns_ts`（設計書 §3.4、原則2）。
  *
  * 削除を実行した時刻（{@link deletedAtSql}）を、手元の版の時刻まで引き上げた値にする（単調化）。
  * `_sns_rows_<表>` か `_tombstone` にその id の版があれば、実行した時刻とその版の `_sns_ts` の最大を取る。
@@ -430,7 +430,7 @@ function upsertRowSql(
 }
 
 /**
- * `_tombstone` へ削除の版を書く upsert（設計書 §3.4.4）。
+ * `_tombstone` へ削除の版を書く upsert（設計書 §3.4）。
  *
  * `guard` が渡されたときは `INSERT … SELECT … WHERE` の形にする
  * （トリガー本体には条件分岐が無いので、文ごと条件で消すしかない）。
@@ -579,7 +579,7 @@ function changelogSql(
        ON CONFLICT DO NOTHING;`
 }
 
-/** `_sns_dirty` への登録。**`OR IGNORE` では書かない**（必須1）。 */
+/** `_sns_dirty` への登録。**`OR IGNORE` では書かない**（冒頭の決まりごとの2）。 */
 function dirtySql(parts: TableParts): string {
   return `INSERT INTO "_sns_dirty" ("tableName") VALUES (${parts.literal})
        ON CONFLICT ("tableName") DO NOTHING;`
@@ -589,7 +589,7 @@ function dirtySql(parts: TableParts): string {
  * 4本のトリガー
  * ------------------------------------------------------------------ */
 
-/** AFTER INSERT（設計書 §3.4.2）。 */
+/** AFTER INSERT（設計書 §3.4）。 */
 function insertTrigger(parts: TableParts): string {
   const trueId = trueIdSql(parts, 'NEW')
   const keyText = keyTextSql(parts, 'NEW')
@@ -597,7 +597,7 @@ function insertTrigger(parts: TableParts): string {
   for (const column of parts.columns) {
     values.set(
       column.name,
-      // 主キーの列に入れるのは**真の id**（訂正8）
+      // 主キーの列に入れるのは**真の id**
       isSameIdentifier(column.name, parts.primaryKey.name)
         ? trueId
         : `NEW.${escapeIdentifier(column.name)}`
@@ -616,7 +616,7 @@ function insertTrigger(parts: TableParts): string {
 }
 
 /**
- * AFTER UPDATE、主キーが同じ側（設計書 §3.4.3 の必須2）。
+ * AFTER UPDATE、主キーが同じ側（設計書 §3.4）。
  *
  * 書かなかった列を**3分岐**で決めるのがここの肝である。
  * `_sns_rows_<表>` にその行が無い窓（取り込みの COMMIT 〜 作り直しの適用）で
@@ -656,7 +656,7 @@ function updateSameTrigger(parts: TableParts): string {
 }
 
 /**
- * AFTER UPDATE、主キーが違う側（設計書 §3.4.1・訂正2）。
+ * AFTER UPDATE、主キーが違う側（設計書 §3.4）。
  *
  * 1回の書き込みで **2つの版**を作る —— 古い真の id の削除の版と、
  * 新しい真の id の行の版（全列に `NEW` を使う）。
@@ -726,7 +726,7 @@ function updateMoveTrigger(parts: TableParts): string {
 }
 
 /**
- * BEFORE DELETE（設計書 §3.4.4 の必須3・必須7）。
+ * BEFORE DELETE（設計書 §3.4）。
  *
  * `BEFORE` なのは、`_sns_rows_<表>` と `_tombstone` を引くときに
  * アプリの行がまだ在ってほしいからではなく、**`OLD` の値で版を作る**のに
@@ -800,7 +800,7 @@ function rowsTriggerSql(db: Database.Database, table: RowsTableSpec): string[] {
  * 見比べて、**違うときだけ**落として作り直す（同じなら DB は動かない）。
  *
  * あわせて `PRAGMA recursive_triggers` を立てる。既定では **`INSERT OR REPLACE` が
- * 消した行の DELETE トリガーが発火しない**ので、設計書 §2.2 の R0
+ * 消した行の DELETE トリガーが発火しない**ので、設計書 §2 の R0
  * （アプリの接続で起きた変化は原因によらずすべて事実になる）が破れる。
  * これは接続ごとの設定なので、アプリが開き直したら立て直す必要がある。
  */

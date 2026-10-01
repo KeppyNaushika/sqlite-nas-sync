@@ -71,7 +71,7 @@ export interface RowVersion {
 }
 
 /**
- * ISO 8601 の字形かどうかを見る `GLOB`（設計書 §1.2.3 の軽微15）。
+ * ISO 8601 の字形かどうかを見る `GLOB`（設計書 §1.2.3）。
  *
  * **`julianday` が値を返すかどうかでは決めない。** `julianday` は `'now'`・`'12:00'`・
  * `'123'`・`'2460676.5'` も受け取るので、返るかどうかだけで群3 に入れると、
@@ -175,7 +175,7 @@ export class ValueOrdering {
         return 0
       case TIME_GROUP.number:
         // 数値としてそのまま比べる。`CAST` を挟むと、整数と実数のあいだで
-        // 桁が落ちたり字面へ化けたりする（設計書 §1.2.3 の軽微19）
+        // 桁が落ちたり字面へ化けたりする（設計書 §1.2.3）
         return compareNumeric(a, b)
       case TIME_GROUP.isoText:
         return compareNumbers(left.julian as number, right.julian as number)
