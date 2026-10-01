@@ -2,7 +2,7 @@
 
 2026-09-30 時点。対象は main の a9067d6（npm 0.21.0、タグ `v0.21.0`）である。
 
-0.21.0 は完全ではない。0.21.0 で入った重大な後退が1件あり、再現を確かめた。以前からあるデータ喪失の不具合も1件あったが、直した。
+0.21.0 は完全ではない。0.21.0 で入った重大な後退が1件あり、再現を確かめた。0.20.0 からあった不具合2件、自己参照の外部キーで子行が消えることと STRICT 表の `ANY` 列の値の型が変わることは直した。
 この文書は 0.21.1 で直すものの一覧で、直したら該当する行を消す。すべて直したらこの文書を消す。
 
 ## 検証の方法
@@ -23,9 +23,8 @@
 | 重大度 | 問題                                                                                                                            | 原因                                                                                               | 由来          |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------- |
 | 重大   | UTF-16 の DB では、同期が毎回 `attached databases must use the same text encoding as main database` で止まり、行が1つも届かない | `src/nas.ts` の `writePublishedTables` が写しの DB を UTF-8 で作り、そこへ元の DB を `ATTACH` する | 0.21.0 の後退 |
-| 重大   | STRICT 表の `ANY` 列に書いた文字列 `'123'` が、同期のあと整数 `123` になる。同期がアプリの値を書き換えるので原則1に反する       | `_sns_rows_<表>` が STRICT でなく、型名 `ANY` で NUMERIC 親和性が効く                              | 0.20.0 から   |
 
-どれも1台だけで再現する。再現手順は末尾にある。
+1台だけで再現する。再現手順は末尾にある。
 
 混在中の時刻の問題は、コードでは直さないと決めた。
 0.20.0 の端末が時刻列に ISO-8601 でない値を書くと、その値が 0.21.0 の端末に届き、届いた端末は次の `setupSync` で例外になる。
@@ -80,7 +79,7 @@ NAS の写しを小さくした代わりに、手元の一時領域とスレッ�
 | `peerTableName` が常に渡された綴りを返す | ありうる。端末ごとに表名の綴りが違う場合を守る試験が無い     |
 | 仕掛けの取り付け直しのあとに上げ直さない | 限られる。次に何かを書くか取り込めば解消する                 |
 
-UTF-16、STRICT の `ANY` 列を扱う試験も無い。
+UTF-16 を扱う試験も無い。
 
 ## 問題が無かったこと
 
@@ -112,32 +111,28 @@ UTF-16、STRICT の `ANY` 列を扱う試験も無い。
 
 1. UTF-16 の後退を直す。写しの DB の文字コードを元に合わせる
 2. 写しの作り方を見直し、一時領域とスレッドが止まる時間の悪化を抑える
-3. STRICT 表の `ANY` 列の型の問題を直す
-4. 軽微な問題と文書を直し、試験を足す。対象は上で見つかった壊れ方と、人工バグで気づかなかった3つ
+3. 軽微な問題と文書を直し、試験を足す。対象は上で見つかった壊れ方と、人工バグで気づかなかった3つ
 
 ## 再現手順
 
-どれも `npm run build` のあとにリポジトリの直下で動く。`TMPDIR` には空のディレクトリを渡す。
+`npm run build` のあとにリポジトリの直下で動く。`TMPDIR` には空のディレクトリを渡す。
 
 ```js
-// repro.js — 使い方: TMPDIR=<空のディレクトリ> node repro.js utf16|strict
+// repro.js — 使い方: TMPDIR=<空のディレクトリ> node repro.js
 const path = require('path')
 const Database = require('better-sqlite3')
 const { setupSync } = require('./dist/index.js')
 
-const DDL = {
-  utf16: `CREATE TABLE notes (id TEXT PRIMARY KEY NOT NULL, body TEXT, updatedAt TEXT NOT NULL)`,
-  strict: `CREATE TABLE s (id TEXT PRIMARY KEY NOT NULL, v ANY, updatedAt TEXT NOT NULL) STRICT`,
-}
 const T = '2026-01-01T00:00:00.000Z'
 
 ;(async () => {
-  const kind = process.argv[2]
   const dir = process.env.TMPDIR
   const dbPath = path.join(dir, 'a.sqlite')
   const db = new Database(dbPath)
-  if (kind === 'utf16') db.pragma(`encoding = 'UTF-16le'`)
-  db.exec(DDL[kind])
+  db.pragma(`encoding = 'UTF-16le'`)
+  db.exec(
+    `CREATE TABLE notes (id TEXT PRIMARY KEY NOT NULL, body TEXT, updatedAt TEXT NOT NULL)`
+  )
   db.close()
   const sync = setupSync({
     dbPath,
@@ -146,18 +141,8 @@ const T = '2026-01-01T00:00:00.000Z'
     schemaVersion: '1',
   })
   const app = new Database(dbPath)
-  if (kind === 'utf16') {
-    app.prepare(`INSERT INTO notes VALUES ('x', 'hello', ?)`).run(T)
-  } else {
-    app.prepare(`INSERT INTO s VALUES ('k', '123', ?)`).run(T)
-  }
-  const table = { utf16: 'notes', strict: 's' }[kind]
-  const show = () =>
-    app
-      .prepare(
-        `SELECT *, typeof(${kind === 'strict' ? 'v' : 'id'}) AS t FROM ${table}`
-      )
-      .all()
+  app.prepare(`INSERT INTO notes VALUES ('x', 'hello', ?)`).run(T)
+  const show = () => app.prepare(`SELECT * FROM notes`).all()
   console.log('before', show())
   try {
     await sync.syncNow()
@@ -170,7 +155,4 @@ const T = '2026-01-01T00:00:00.000Z'
 })()
 ```
 
-| 引数     | 正しい結果                         | 0.21.0 の結果                                                                |
-| -------- | ---------------------------------- | ---------------------------------------------------------------------------- |
-| `utf16`  | 例外が出ない                       | `attached databases must use the same text encoding as main database` の例外 |
-| `strict` | `v` は `'123'`、`typeof` は `text` | `v` は `123`、`typeof` は `integer`                                          |
+正しい結果は例外が出ないこと。0.21.0 では `attached databases must use the same text encoding as main database` の例外になる。

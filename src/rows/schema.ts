@@ -362,10 +362,8 @@ function ensureUnplaceableCauseColumns(db: Database.Database): void {
 /**
  * `_sns_rows_<表>` を作る（冪等）。
  *
- * アプリの列の**宣言された型名だけ**を写す。NOT NULL も DEFAULT も UNIQUE も
- * 外部キーも CHECK も写さない（§3.1）。型名を写すのは、主キーの突き合わせで
- * 親和性が食い違うと `_sns_shown` から引いた文字列の id が整数の id と
- * 一致しなくなるからである。
+ * 列の宣言は {@link rowsColumnsSql} が決める。NOT NULL も DEFAULT も UNIQUE も
+ * 外部キーも CHECK も写さない（§3.1）。
  */
 function createRowsTable(db: Database.Database, table: string): void {
   const columns = syncedColumns(db, table)
@@ -378,14 +376,42 @@ function createRowsTable(db: Database.Database, table: string): void {
       )
     }
   }
-  const declarations = columns.map((column) => {
-    const type = column.type.trim()
-    const suffix = isSameIdentifier(column.name, primaryKey.name)
-      ? ' PRIMARY KEY'
-      : ''
-    return `${escapeIdentifier(column.name)}${type === '' ? '' : ` ${type}`}${suffix}`
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS ${escapeIdentifier(rowsTableName(table))} (
+       ${rowsColumnsSql(
+         columns.map((column) => column.name),
+         primaryKey
+       )}
+     )`
+  )
+}
+
+/**
+ * `_sns_rows_<表>` の列の宣言（`CREATE TABLE` の括弧の中）。
+ *
+ * 主キーの列だけはアプリの列の型名を写す。主キーの突き合わせで親和性が
+ * 食い違うと、`_sns_shown` から引いた文字列の id が整数の id と一致しなくなるからである。
+ *
+ * **主キー以外のアプリの列には型名を書かない。** 型名の無い列は BLOB 親和性で、
+ * 入れた値をそのまま持つ。型名を写すと、アプリの表と違う変換が起きうる。
+ * STRICT 表の `ANY` 列は値をそのまま持つが、`_sns_rows_<表>` は STRICT でないので、
+ * そこに `ANY` と書くと NUMERIC 親和性になり、文字列 `'123'` が整数 `123` に変わる。
+ * STRICT でないアプリの表では、`_sns_rows_<表>` に入るのはアプリの表が親和性で
+ * 変換したあとの値で、作り直しで同じ親和性をもう一度当てても値は変わらない。
+ *
+ * @param columns 写すアプリの列の名前（主キーを含む）
+ * @param primaryKey アプリの表の主キーの列
+ */
+export function rowsColumnsSql(
+  columns: readonly string[],
+  primaryKey: RowsColumn
+): string {
+  const declarations = columns.map((name) => {
+    if (!isSameIdentifier(name, primaryKey.name)) return escapeIdentifier(name)
+    const type = primaryKey.type.trim()
+    return `${escapeIdentifier(name)}${type === '' ? '' : ` ${type}`} PRIMARY KEY`
   })
-  // `_sns_ts` は型名を書かない（値の種類をそのまま保つ）。lamport と instance は
+  // `_sns_ts` も型名を書かない。lamport と instance は
   // NOT NULL —— `_sns_clock` の行が無いまま書き込まれたら、ここで落ちてほしい
   declarations.push(escapeIdentifier(VERSION_COLUMNS.ts))
   declarations.push(
@@ -394,11 +420,7 @@ function createRowsTable(db: Database.Database, table: string): void {
   declarations.push(
     `${escapeIdentifier(VERSION_COLUMNS.instance)} TEXT NOT NULL`
   )
-  db.exec(
-    `CREATE TABLE IF NOT EXISTS ${escapeIdentifier(rowsTableName(table))} (
-       ${declarations.join(',\n       ')}
-     )`
-  )
+  return declarations.join(',\n       ')
 }
 
 /**

@@ -18,6 +18,7 @@
  * | `_changelog` | **刈らない** | 旧版の端末が残っている間に刈ると、その端末へ渡すべき事実が消える |
  * | 旧方式の `_heartbeat` | **表とトリガーを落とす**（トリガーが先） | `_changelog` が空でも `_changelog_prune.prunedThroughId` で隙間は判る。残すと無変更の日にも転送が起き続ける |
  * | 旧方式の `_id_merge` | **落とす**（案A の形の DB でも毎回） | 旧「畳み」の帳簿で、案A では誰も読まない |
+ * | `_sns_rows_<t>` の主キー以外のアプリの列の型名 | **あれば外す**（表を作り直して行をそのまま写す） | 型名を写すと、STRICT の表の `ANY` 列の値が NUMERIC 親和性で変わる（{@link dropRowsColumnTypes}） |
  * | 誰も読まない内部の列（{@link UNUSED_COLUMNS}） | **あれば落とす**（`_heartbeat` のトリガーを落としたあと） | `CREATE TABLE IF NOT EXISTS` では既存の DB から消えない。使わない列を利用者の DB に残さない |
  *
  * `_sns_rebuilding` の残りは、呼び出し側が `clearRebuildingFlag`（`src/rows/restore-detect.ts`）で先に消す（`setupSync` と同期の段階0）。
@@ -45,6 +46,7 @@ import {
   createRowsTables,
   primaryKeyColumn,
   quoteLiteral,
+  rowsColumnsSql,
   rowsTableName,
   syncedColumns,
 } from './schema'
@@ -55,6 +57,7 @@ import {
   isIsoTimeSql,
   maxTsSql,
 } from './triggers'
+import { SqlValue } from './versions'
 
 /** {@link migrateToRows} の設定。 */
 interface RowsMigrationOptions {
@@ -190,6 +193,7 @@ export function migrateToRows(
     for (const spec of specs) {
       const report = droppedOf(result, spec.name)
       if (existed.get(spec.name) === true) {
+        dropRowsColumnTypes(db, spec)
         const shape = reconcileColumns(db, spec, result)
         report.addedColumns = shape.added
         report.removedColumns = shape.removed
@@ -716,20 +720,20 @@ function reconcileColumns(
 
   const orphans = hasOrphanRows(db, spec, appPk)
   for (const column of added) {
-    const type = column.type.trim()
+    // 型名は書かない（`rowsColumnsSql`）
     db.exec(
       `ALTER TABLE ${escapeIdentifier(rows)} ADD COLUMN ${escapeIdentifier(
         column.name
-      )}${type === '' ? '' : ` ${type}`}`
+      )}`
     )
     // アプリの表に居ない行（隠れた行・置かない行）は、アプリの表から
     // 埋め直せない。埋められるのは**定数の既定値だけ** —— 評価のたびに
     // 変わる既定値を1回評価して埋めると、端末ごとに違う値が同じ版の鍵で入る
     const constant = constantDefaultSql(column.dflt_value)
     if (constant !== null) {
-      db.exec(
-        `UPDATE ${escapeIdentifier(rows)} SET ${escapeIdentifier(column.name)} = ${constant}`
-      )
+      db.prepare(
+        `UPDATE ${escapeIdentifier(rows)} SET ${escapeIdentifier(column.name)} = ?`
+      ).run(storedValueOf(db, spec.name, column, constant))
     } else if (column.notnull === 1 && orphans) {
       throw new Error(
         `同期する表 ${spec.name} に増えた列 ${column.name} が NOT NULL で、既定値が定数でない。` +
@@ -752,6 +756,103 @@ function reconcileColumns(
   return {
     added: added.map((column) => column.name),
     removed: removed.map((column) => column.name),
+  }
+}
+
+/**
+ * 定数の字面を、アプリの表のその列に入れたときに持つ値にする。
+ *
+ * `_sns_rows_<t>` の列には型名が無い（`rowsColumnsSql`）ので、字面をそのまま
+ * 入れると、アプリの列の親和性や STRICT の型による変換が起きない。
+ * アプリの表に入る値と違うと、作り直しがその行を毎回「違う」と数える。
+ * そこで、列の型名と STRICT かどうかを写した一時の表に入れて読み直す。
+ */
+function storedValueOf(
+  db: Database.Database,
+  table: string,
+  column: RowsColumn,
+  constant: string
+): SqlValue {
+  const strict = db
+    .prepare(
+      `SELECT "strict" AS "strict" FROM pragma_table_list
+        WHERE "schema" = 'main' AND "name" = ?`
+    )
+    .get(table) as { strict: number } | undefined
+  const type = column.type.trim()
+  db.exec(
+    `CREATE TEMP TABLE "_sns_default_probe" ("value"${type === '' ? '' : ` ${type}`})${
+      strict?.strict === 1 ? ' STRICT' : ''
+    }`
+  )
+  try {
+    db.exec(`INSERT INTO temp."_sns_default_probe" VALUES (${constant})`)
+    const read = db.prepare(`SELECT "value" FROM temp."_sns_default_probe"`)
+    read.safeIntegers(true)
+    return (read.get() as { value: SqlValue }).value
+  } finally {
+    db.exec(`DROP TABLE temp."_sns_default_probe"`)
+  }
+}
+
+/**
+ * 0.21.0 までに作った `_sns_rows_<t>` の、主キー以外のアプリの列から型名を外す。
+ *
+ * 0.21.0 までは、アプリの列の型名を写していた。STRICT の表の `ANY` 列では、
+ * それが NUMERIC 親和性になって値を変える（`rowsColumnsSql`）。型名は
+ * `ALTER TABLE` で変えられないので、型名の無い表を作って行をそのまま写し、
+ * 元の表と置き換える。行も版も変えないので、他の端末から見て何も変わらない。
+ * 既に変換された値は元に戻らない。
+ *
+ * その表のトリガーを落とす。作り直すのは呼び出し側（手順6）である。
+ * 型名を外す列が無ければ何もしない。
+ */
+function dropRowsColumnTypes(db: Database.Database, spec: RowsTableSpec): void {
+  const rows = rowsTableName(spec.name)
+  const held = db.pragma(
+    `table_info(${escapeIdentifier(rows)})`
+  ) as RowsColumn[]
+  const heldPk = held.find((column) => column.pk === 1)
+  // 主キーの列が無い表は、続く `reconcileColumns` が例外にする
+  if (heldPk === undefined) return
+  const versionNames = new Set(
+    Object.values(VERSION_COLUMNS).map((name) => foldIdentifier(name))
+  )
+  const appColumns = held
+    .filter((column) => !versionNames.has(foldIdentifier(column.name)))
+    .map((column) => column.name)
+  const typed = held.some(
+    (column) =>
+      column.pk === 0 &&
+      !versionNames.has(foldIdentifier(column.name)) &&
+      column.type.trim() !== ''
+  )
+  if (!typed) return
+
+  dropRowsTriggers(db, [spec])
+  const replacement = `_sns_untyped_${spec.name}`
+  const names = held.map((column) => escapeIdentifier(column.name)).join(', ')
+  db.exec(
+    `CREATE TABLE ${escapeIdentifier(replacement)} (
+       ${rowsColumnsSql(appColumns, heldPk)}
+     )`
+  )
+  db.exec(
+    `INSERT INTO ${escapeIdentifier(replacement)} (${names})
+     SELECT ${names} FROM ${escapeIdentifier(rows)}`
+  )
+  db.exec(`DROP TABLE ${escapeIdentifier(rows)}`)
+  // `rebuildLedgers` と同じく `legacy_alter_table` を立てる。素の `RENAME TO` は
+  // DB のすべてのトリガーとビューを読み直すので、アプリのスキーマ次第で落ちうる。
+  // 付け替える名前を指しているものは無いので、書き換えは要らない
+  const previousLegacy = db.pragma('legacy_alter_table', { simple: true })
+  db.pragma('legacy_alter_table = ON')
+  try {
+    db.exec(
+      `ALTER TABLE ${escapeIdentifier(replacement)} RENAME TO ${escapeIdentifier(rows)}`
+    )
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacy === 1 ? 'ON' : 'OFF'}`)
   }
 }
 
