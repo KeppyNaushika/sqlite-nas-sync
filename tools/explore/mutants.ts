@@ -315,7 +315,7 @@ export const MUTANTS: Mutant[] = [
         file: 'rows/triggers.ts',
         find: `  return maxTsSql([
     written,
-    rowsValueSql(parts, VERSION_COLUMNS.ts, trueId),
+    heldTs,
     tombstoneValueSql(parts, VERSION_COLUMNS.ts, keyText),
   ])`,
         replace: '  return written',

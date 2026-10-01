@@ -4,7 +4,7 @@
  * 同じ順序は SQL にも書いてある。
  * トリガーと取り込みの upsert は `src/rows/triggers.ts` の SQL（`strongerSql`・`maxTsSql`）で比べ、単調化の引き上げ（§1.2.1 の `NEWTS`）もトリガーの SQL が計算する。
  * ここは JS の側で、取り込み（`src/rows/import.ts`）と作り直しの計算（`src/rows/derive.ts`）が使う。
- * 群の字形は {@link ISO_SHAPE_GLOBS} を両方で共有し、順序が SQL と JS で食い違わないようにしてある。
+ * 群の判定は {@link timeGroupSql} を両方で共有し、順序が SQL と JS で食い違わないようにしてある。
  *
  * | 何 | どこ |
  * | --- | --- |
@@ -71,12 +71,23 @@ export interface RowVersion {
 }
 
 /**
- * ISO 8601 の字形かどうかを見る `GLOB`（設計書 §1.2.3）。
+ * 値の種類の群（{@link TIME_GROUP}）を返す SQL の式（設計書 §1.2.3）。
+ *
+ * トリガー（`src/rows/triggers.ts`）と {@link ValueOrdering} の両方がこの式を使い、順序が SQL と JS で食い違わないようにしてある。
+ * `value` は式の中で何度も現れるので、列の名前のような短い式を渡すこと。
  *
  * **`julianday` が値を返すかどうかでは決めない。** `julianday` は `'now'`・`'12:00'`・
  * `'123'`・`'2460676.5'` も受け取るので、返るかどうかだけで群3 に入れると、
  * **評価するたびに変わる値**や時刻でない値が「ISO の文字列」として最強の群に入ってしまう。
  * 字形を満たし、なおかつ `julianday` が値を返すものだけを群3 にする。
+ *
+ * 字形は設計書 §1.2.3 の6つの `GLOB` のどれかに合うことである。
+ * 6つとも、先頭の10文字が日付、11〜16文字目が `[T ]` と時と分の形で、違うのは17文字目から後だけである。
+ * そこで、先頭の10文字と11〜16文字目をそれぞれ1回だけ確かめ、17文字目から後を残りの形と比べる。
+ * `GLOB` のパターンの `*` 以外の要素はちょうど1文字に合い、`substr` と `length` も文字を単位に数えるので、どの文字列にも6つの `GLOB` と同じ答えを返す。
+ * 文字列が NUL 文字を含むときも、`GLOB`・`substr`・`length` は最初の NUL 文字の手前までを読むので、答えは変わらない。
+ * 試験（`__tests__/rows-trigger-sql.test.ts`）が、6つの `GLOB` を並べた式と答えを突き合わせている。
+ * 群の判定は全端末で同じ答えを返さなければならないので、書き方を変えるときもこの性質を保つこと。
  *
  * 通る/通らないの境目のうち、意外なもの:
  *
@@ -85,15 +96,25 @@ export interface RowVersion {
  * - `'2026-01-01T24:00:00'` も群3（翌日として読まれる）
  * - `'2026-01-01 '`（末尾に空白）は字形に合わないので群2
  * - `'2026-13-01'` は字形に合うが `julianday` が NULL なので群2
+ * @internal
  */
-export const ISO_SHAPE_GLOBS = [
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]',
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]',
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]',
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9].*',
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]*Z',
-  '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]',
-]
+export function timeGroupSql(value: string): string {
+  const date = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+  const hourMinute = '[T ][0-9][0-9]:[0-9][0-9]'
+  const rest = `substr(${value}, 17)`
+  const isoShape = `substr(${value}, 1, 10) GLOB '${date}' AND (length(${value}) = 10
+       OR (substr(${value}, 11, 6) GLOB '${hourMinute}' AND (length(${value}) = 16
+         OR ${rest} GLOB ':[0-9][0-9]' OR ${rest} GLOB ':[0-9][0-9].*'
+         OR ${rest} GLOB '*Z' OR ${rest} GLOB '*[+-][0-9][0-9]:[0-9][0-9]')))`
+  return `(CASE typeof(${value})
+      WHEN 'null' THEN ${TIME_GROUP.null}
+      WHEN 'integer' THEN ${TIME_GROUP.number}
+      WHEN 'real' THEN ${TIME_GROUP.number}
+      WHEN 'blob' THEN ${TIME_GROUP.blob}
+      ELSE (CASE WHEN julianday(${value}) IS NOT NULL AND ${isoShape}
+        THEN ${TIME_GROUP.isoText} ELSE ${TIME_GROUP.text} END)
+    END)`
+}
 
 /** 1つの値について SQLite に尋ねた結果。 */
 interface ValueFacts {
@@ -126,20 +147,7 @@ export class ValueOrdering {
    */
   private readonly facts = this.db.prepare(
     `WITH v(x) AS (VALUES (?))
-     SELECT CASE typeof(x)
-              WHEN 'null'    THEN ${TIME_GROUP.null}
-              WHEN 'integer' THEN ${TIME_GROUP.number}
-              WHEN 'real'    THEN ${TIME_GROUP.number}
-              WHEN 'blob'    THEN ${TIME_GROUP.blob}
-              ELSE CASE
-                WHEN julianday(x) IS NOT NULL AND (
-                  ${ISO_SHAPE_GLOBS.map((glob) => `x GLOB '${glob}'`).join(
-                    '\n                  OR '
-                  )}
-                ) THEN ${TIME_GROUP.isoText}
-                ELSE ${TIME_GROUP.text}
-              END
-            END AS "group",
+     SELECT ${timeGroupSql('x')} AS "group",
             julianday(x) AS julian,
             CAST(x AS TEXT) AS text
      FROM v`
