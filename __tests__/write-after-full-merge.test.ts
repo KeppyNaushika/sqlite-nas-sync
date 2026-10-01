@@ -198,7 +198,7 @@ describe('フルマージへ切り替わったクライアントがあとから�
       await syncAll()
 
       // 状態が動かなくなるまで回す。
-      // 1回の `performSync` は自分の写しを上げてから相手の写しを読むので、1周では届かない変更がある。
+      // 1回の `performSync` が相手の写しから読めるのは、相手が前に同期したときまでの変更だけなので、1周では届かない変更がある。
       for (let round = 0; round < 6; round += 1) await syncAll()
 
       expect(

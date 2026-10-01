@@ -779,14 +779,6 @@ function runtimeFor(lib: Library, world: World, index: number): RuntimeIn {
  *
  * つまり抑制の有無は、同じ節から**同じ正準の後継**を生む。覚えを状態に足すと、
  * 振る舞いの同じ状態が別物に見えて探索が無駄に広がるだけになる。
- *
- * **ただし例外を1つ実測している**（2026-09-24）。相手を読まない回は、その相手の
- * `_changelog` の隙間も調べないので、`hadChangelogGap` が偽になりうる。すると
- * `performSync` は「上げてから作り直す」順に回り、読んだ回（隙間ありで「作り直してから上げる」）
- * と比べて、NAS の自分の写しに入る `_sns_dirty` が違う（作り直しの前か後か）。
- * 他の端末はその表を読まない（設計書 §3.1）ので振る舞いは変わらないが、状態の直列化には
- * 現れるので、「再生して違う状態に戻った節」として数えられる。範囲の例: `--tables tags --ids 2
- * --keys 1 --times 0 --no-prune --no-tick --sync-write before --depth 4` で2節。
  */
 function idleMemoryFor(lib: Library, world: World, index: number): unknown {
   const kept = world.idle.get(index)
