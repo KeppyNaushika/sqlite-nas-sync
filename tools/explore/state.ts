@@ -50,7 +50,6 @@
  * ## 含めないもの
  *
  * - SQLite の空きページ・ファイルの大きさ —— 論理的な中身だけが振る舞いに効く
- * - NAS 上のコピーの `_sns_dirty`（下の「振る舞いに効かない値」）
  *
  * ## 振る舞いに効かない値
  *
@@ -66,10 +65,6 @@
  *   したがって値の大小も同着も振る舞いに効かない。
  *   値を残すと、1回の同期の中で取り込みが書く2件の通知が同じミリ秒に収まるかどうかで状態が割れる。
  *   他の時刻の順位もずれるので、札を付ける時刻の集合（{@link collectTimes}）からも外す
- * - NAS 上のコピーの `_sns_dirty` —— 他の端末は相手のコピーの `_sns_dirty` を読まない（設計書 §3.1）。
- *   自分のコピーから読むのは `_sync_meta` の印だけである。
- *   無駄な転送の抑制の覚え（状態に入らない）によって「上げてから作り直す」と「作り直してから上げる」が入れ替わり、
- *   コピーに入る `_sns_dirty` だけが揺れる
  *
  * ## 採番値（`_changelog.id` など）は**生のまま**含める
  *
@@ -656,14 +651,11 @@ export function serializeState(
   )
   const serializeDb = (
     db: RawDb | null,
-    generationLabel: string | null,
-    place: 'local' | 'nas'
+    generationLabel: string | null
   ): string => {
     if (db === null) return 'absent'
     const parts: string[] = [`schema ${db.schema}`]
     for (const section of db.sections) {
-      // NAS 上のコピーの `_sns_dirty` は誰も読まない（冒頭の「振る舞いに効かない値」）
-      if (place === 'nas' && section.name === '_sns_dirty') continue
       const dropped = DROPPED_COLUMNS[section.name]
       const keptColumns = section.columns
         .map((column, index) => ({ column, index }))
@@ -731,10 +723,10 @@ export function serializeState(
     // generation の札は「その端末の手元と NAS の写しの関係」なので、両側へ同じものを置く
     const generationLabel = generationLabels[index]
     lines.push(
-      `## local ${clientName(index)}\n${serializeDb(local, generationLabel, 'local')}`
+      `## local ${clientName(index)}\n${serializeDb(local, generationLabel)}`
     )
     lines.push(
-      `## nas ${clientName(index)}\n${serializeDb(raw.nas[index], generationLabel, 'nas')}`
+      `## nas ${clientName(index)}\n${serializeDb(raw.nas[index], generationLabel)}`
     )
   })
   lines.push(`nasExtras ${JSON.stringify(raw.nasExtras)}`)
