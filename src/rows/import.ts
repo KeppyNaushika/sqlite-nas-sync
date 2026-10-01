@@ -35,7 +35,6 @@ import {
   primaryKeyColumn,
   rowsTableName,
   syncedColumns,
-  tableOfRowsTable,
 } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import { strongerSql } from './triggers'
@@ -149,14 +148,10 @@ export function collectPeerKeys(
     keys.push({ table, key })
   }
   const hasTombstone = tableExists(peerDb, '_tombstone')
-  // 渡された綴りではなく、**相手の `_sns_rows_<表>` の綴り**で引く。前提 P4
-  // （全端末で同じスキーマ）より、畳んだ綴りは自分のものと一致する。
-  // 相手のアプリの表からは引かない。NAS の写しにはアプリの表が無い（`copyToNas`）
+  // 自分の綴りで引く。前提 P4（全端末で同じスキーマ）より、相手の帳簿の綴りも同じである。
+  // 相手の `_sns_rows_<表>` の綴りが違えば、`ImportIo` がその表を読まずに知らせる
   for (const table of tables) {
-    const name = peerTableName(
-      peerDb,
-      typeof table === 'string' ? table : table.name
-    )
+    const name = typeof table === 'string' ? table : table.name
     const rowsTable = rowsTableName(name)
     if (tableExists(peerDb, rowsTable)) {
       const pk = peerPrimaryKey(peerDb, rowsTable)
@@ -420,10 +415,23 @@ class ImportIo {
       })
       return null
     }
+    // 表名の大文字と小文字が相手と違えば、前提 P4 の外である。相手の版と削除の版は
+    // 別の綴りの鍵で書かれているので、この表は読まずに知らせる。`schemaVersion` を
+    // 明示していると、ここでしか気づけない
+    const peerRowsTable = peerRowsTableName(this.peerDb, rowsTable)
+    if (peerRowsTable !== null && peerRowsTable !== rowsTable) {
+      this.skippedTables.push({
+        table: spec.name,
+        reason:
+          `相手の内部テーブルが ${peerRowsTable} で、表名の大文字と小文字が違う。` +
+          `すべてのクライアントで表名をそろえるまで、この相手からは取り込まない`,
+      })
+      return null
+    }
     const columns = syncedColumns(this.db, spec.name)
     const primaryKey = primaryKeyColumn(this.db, spec.name)
     let peerColumns: Set<string> | null = null
-    if (tableExists(this.peerDb, rowsTable)) {
+    if (peerRowsTable !== null) {
       peerColumns = new Set(
         (
           this.peerDb.pragma(
@@ -739,19 +747,21 @@ function tableExists(db: Database.Database, name: string): boolean {
 }
 
 /**
- * 相手の写しでの表の名前の綴り。相手の `_sns_rows_<表>` の名前から取り出す。
+ * 相手の `_sns_rows_<表>` の名前を、大文字と小文字を区別せずに引く。無ければ `null`。
  *
- * 引くのは `COLLATE NOCASE` で、綴りの違いに備える（`src/rows/table-name.ts`）。
- * 相手に `_sns_rows_<表>` が無ければ、渡された綴りのまま返す。
+ * 綴りが自分と違えば、相手の帳簿は別の鍵で書かれている（`src/rows/table-name.ts`）。
  */
-function peerTableName(peerDb: Database.Database, table: string): string {
+function peerRowsTableName(
+  peerDb: Database.Database,
+  rowsTable: string
+): string | null {
   const row = peerDb
     .prepare(
       `SELECT name FROM sqlite_master
         WHERE type = 'table' AND name = ? COLLATE NOCASE`
     )
-    .get(rowsTableName(table)) as { name: string } | undefined
-  return (row === undefined ? null : tableOfRowsTable(row.name)) ?? table
+    .get(rowsTable) as { name: string } | undefined
+  return row === undefined ? null : row.name
 }
 
 /** `_sns_rows_<t>` の主キーの列名（相手の表から読む）。 */
