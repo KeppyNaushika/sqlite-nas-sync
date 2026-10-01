@@ -68,7 +68,7 @@ export type ExploreConfig = {
   /** `pruneChangelog`（相手をフルマージへ落とす）を範囲に入れるか */
   prune: boolean
   /**
-   * 同期の最中（copyToNas の待ちの間）に書く遷移（ops.ts の syncWrite）をどちらの時点で入れるか。
+   * 同期の最中（copyToNas が写しを作る前後）に書く遷移（ops.ts の syncWrite）をどちらの時点で入れるか。
    * `both` は写し始める前と写し終えた後の両方
    */
   syncWrite: 'both' | 'before' | 'after' | 'none'
@@ -199,7 +199,7 @@ export function usage(): string {
     '  --keep-time-updates 時刻列を変えない UPDATE を範囲に入れる（案A の新しい操作）',
     '  --recreate          消してすぐ同じ id で作り直す操作を範囲に入れる（案A の新しい操作）',
     '  --no-prune          pruneChangelog（相手をフルマージへ落とす）を範囲に入れない',
-    '  --sync-write WHEN   同期の最中（copyToNas の待ちの間）に書く遷移: both|before|after|none（既定 both）',
+    '  --sync-write WHEN   同期の最中（copyToNas が写しを作る前後）に書く遷移: both|before|after|none（既定 both）',
     '',
     '実行:',
     '  --workers N         ワーカーの数（既定 os.availableParallelism()）',
