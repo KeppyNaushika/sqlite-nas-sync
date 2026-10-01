@@ -20,6 +20,7 @@
  * | 旧方式の `_id_merge` | **落とす**（案A の形の DB でも毎回） | 旧「畳み」の帳簿で、案A では誰も読まない |
  * | `_sns_rows_<t>` の主キー以外のアプリの列の型名 | **あれば外す**（表を作り直して行をそのまま写す） | 型名を写すと、STRICT の表の `ANY` 列の値が NUMERIC 親和性で変わる（{@link dropRowsColumnTypes}） |
  * | 誰も読まない内部の列（{@link UNUSED_COLUMNS}） | **あれば落とす**（`_heartbeat` のトリガーを落としたあと） | `CREATE TABLE IF NOT EXISTS` では既存の DB から消えない。使わない列を利用者の DB に残さない |
+ * | 表名の大文字と小文字だけが変わった表 | **内部テーブルの表名をそろえる**（{@link respellTable}） | 古い綴りが残ると、新しい綴りの版と別の鍵になり、取り込みがその表を読まない |
  *
  * `_sns_rebuilding` の残りは、呼び出し側が `clearRebuildingFlag`（`src/rows/restore-detect.ts`）で先に消す（`setupSync` と同期の段階0）。
  * 残ったままトリガーを作ると、番人が効いてアプリの書き込みが版にならない。
@@ -49,6 +50,7 @@ import {
   rowsColumnsSql,
   rowsTableName,
   syncedColumns,
+  tableOfRowsTable,
 } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import {
@@ -56,6 +58,7 @@ import {
   dropRowsTriggers,
   isIsoTimeSql,
   maxTsSql,
+  strongerSql,
 } from './triggers'
 import { SqlValue } from './versions'
 
@@ -182,6 +185,18 @@ export function migrateToRows(
     //      トリガーが残っていると `error in trigger …` で落ちる
     dropUnusedColumns(db)
 
+    // 3.7. アプリが表名の大文字と小文字だけを変えて表を作り直していたら、
+    //      内部テーブルの綴りを新しい綴りにそろえる。下の 4 が `_sns_rows_<表>` の有無を字面で見るので、その前に行う
+    for (const spec of specs) {
+      const previous = respellTable(db, spec)
+      if (previous !== null) {
+        result.warnings.push(
+          `表名が ${previous} から ${spec.name} に変わったので、同期の内部テーブルの表名をそろえた。` +
+            `大文字と小文字が違うクライアントからは、この表を取り込まない`
+        )
+      }
+    }
+
     // 4. 案A の表を作る（`_sns_clock` の行・`_sns_tick` の行も）
     const existed = new Map<string, boolean>()
     for (const spec of specs) {
@@ -267,6 +282,121 @@ function writeRowsSchemaVersion(
       .filter((field) => field.split('=')[0].trim() !== 'sns-format')
       .join(';')
   writeSnsMeta(db, 'schemaVersion', `${base};sns-format=${ROWS_FORMAT}`)
+}
+
+/* ------------------------------------------------------------------ *
+ * 表名の大文字と小文字
+ * ------------------------------------------------------------------ */
+
+/** 表名を値として持つ内部テーブルの列のうち、主キーに含まれないもの。 */
+const TABLE_NAME_COLUMNS: readonly { table: string; column: string }[] = [
+  { table: '_changelog', column: 'tableName' },
+  { table: '_sns_unplaceable', column: 'causeTable' },
+]
+
+/** 表名を主キーに含む内部テーブル。作り直しが書く表で、`_tombstone` は別に扱う。 */
+const TABLE_NAME_KEYED: readonly string[] = [
+  '_sns_tick',
+  '_sns_dirty',
+  '_sns_shown',
+  '_sns_hidden',
+  '_sns_unplaceable',
+]
+
+/**
+ * `_sns_rows_<表>` の綴りが `sqlite_master` の綴りと大文字小文字だけ違えば、内部テーブルの綴りを `sqlite_master` の綴りにそろえる。
+ *
+ * アプリが表名の大文字と小文字だけを変えて表を作り直すと、SQLite は同じ表として扱うが、内部テーブルには古い綴りが残る。
+ * 残すと、新しいトリガーが新しい綴りで書く版と古い綴りの版が別の鍵になり、`_sns_rows_<表>` の有無を字面で見る取り込みはその表を読まない。
+ * そろえるのは `_sns_rows_<表>` の名前、トリガー、表名を値として持つ内部テーブルの行である。
+ * `_tombstone` に同じ id の版が両方の綴りであれば、強い方を残す。
+ * 作り直しが書く表で両方の綴りが重なれば、新しい綴りの行を残す。新しい綴りの行は、作り直しのあとに書かれたものだからである。
+ *
+ * @returns そろえる前の綴り。そろえなかったときは `null`
+ */
+function respellTable(
+  db: Database.Database,
+  spec: RowsTableSpec
+): string | null {
+  const rowsTable = rowsTableName(spec.name)
+  const found = db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = ? COLLATE NOCASE`
+    )
+    .get(rowsTable) as { name: string } | undefined
+  if (found === undefined || found.name === rowsTable) return null
+
+  // トリガーの名前も古い綴りのままなので、先に落とす。移行の 6 が作り直す
+  dropRowsTriggers(db, [spec])
+  // 大文字と小文字だけ違う名前へは `RENAME` できないので、別の名前を1回挟む
+  const interim = `${rowsTable}_respelled`
+  db.exec(
+    `ALTER TABLE ${escapeIdentifier(found.name)} RENAME TO ${escapeIdentifier(interim)}`
+  )
+  db.exec(
+    `ALTER TABLE ${escapeIdentifier(interim)} RENAME TO ${escapeIdentifier(rowsTable)}`
+  )
+
+  const matches = (column: string): string =>
+    `${column} = ? COLLATE NOCASE AND ${column} <> ?`
+  const name = spec.name
+  if (tableExists(db, '_tombstone')) {
+    const columns = (db.pragma(`table_info("_tombstone")`) as RowsColumn[]).map(
+      (column) => escapeIdentifier(column.name)
+    )
+    const version = (table: string) => ({
+      ts: `${table}.${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+      lamport: `${table}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+      instance: `${table}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+    })
+    const spellings = (
+      db
+        .prepare(
+          `SELECT DISTINCT "tableName" AS name FROM "_tombstone" WHERE ${matches('"tableName"')}`
+        )
+        .all(name, name) as { name: string }[]
+    ).map((row) => row.name)
+    for (const spelling of spellings) {
+      db.prepare(
+        `INSERT INTO "_tombstone" (${columns.join(', ')})
+         SELECT ${columns
+           .map((column) => (column === '"tableName"' ? '?' : column))
+           .join(', ')}
+           FROM "_tombstone" WHERE "tableName" = ?
+         ON CONFLICT ("tableName", "recordId") DO UPDATE SET
+           ${columns
+             .filter(
+               (column) => column !== '"tableName"' && column !== '"recordId"'
+             )
+             .map((column) => `${column} = "excluded".${column}`)
+             .join(', ')}
+         WHERE ${strongerSql(version('"excluded"'), version('"_tombstone"'))}`
+      ).run(name, spelling)
+      db.prepare(`DELETE FROM "_tombstone" WHERE "tableName" = ?`).run(spelling)
+    }
+  }
+  for (const table of TABLE_NAME_KEYED) {
+    if (!tableExists(db, table)) continue
+    db.prepare(
+      `UPDATE OR IGNORE ${escapeIdentifier(table)} SET "tableName" = ?
+        WHERE ${matches('"tableName"')}`
+    ).run(name, name, name)
+    db.prepare(
+      `DELETE FROM ${escapeIdentifier(table)} WHERE ${matches('"tableName"')}`
+    ).run(name, name)
+  }
+  for (const { table, column } of TABLE_NAME_COLUMNS) {
+    const present = (
+      db.pragma(`table_info(${escapeIdentifier(table)})`) as RowsColumn[]
+    ).some((entry) => entry.name === column)
+    if (!present) continue
+    db.prepare(
+      `UPDATE ${escapeIdentifier(table)} SET ${escapeIdentifier(column)} = ?
+        WHERE ${matches(escapeIdentifier(column))}`
+    ).run(name, name, name)
+  }
+  return tableOfRowsTable(found.name)
 }
 
 /* ------------------------------------------------------------------ *
