@@ -98,9 +98,20 @@ const PUBLISHED_LEDGERS: readonly string[] = [
  *
  * 写しにはこれだけを載せる。アプリの表・トリガー・他の端末が読まない帳簿は載せない。
  * `_changelog` の `AUTOINCREMENT` の値は、別に `sqlite_sequence` から写す。
+ *
+ * `_sns_rows_<表>` は、いま同期している表の分だけを載せる。同期をやめた表の
+ * `_sns_rows_<表>` は手元に残るが、更新されないので、載せると古い版を他の端末へ渡す。
+ *
+ * @param tables 同期している表
  */
-export function isPublishedTable(name: string): boolean {
-  return PUBLISHED_LEDGERS.includes(name) || tableOfRowsTable(name) !== null
+export function isPublishedTable(
+  name: string,
+  tables: readonly string[]
+): boolean {
+  return (
+    PUBLISHED_LEDGERS.includes(name) ||
+    tables.some((table) => isSameIdentifier(name, rowsTableName(table)))
+  )
 }
 
 /** SQL の文字列リテラル（表の名前を SQL に埋めるときに通す）。 */
