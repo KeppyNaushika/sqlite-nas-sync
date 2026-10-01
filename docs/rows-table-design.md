@@ -242,15 +242,20 @@ R0: アプリの接続で起きた変化はすべて事実になる。
 
 ### 3.1 表の一覧
 
-| 表                                                                                                                | 他端末が読むか | 中身                                                                                                                                      |
-| ----------------------------------------------------------------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `_sns_rows_<表>`                                                                                                  | 読む           | 生きている id の最強の行の版。アプリの列（生成列を除く）＋ `_sns_ts`（型名なし）・`_sns_lamport`・`_sns_instance`                         |
-| `_tombstone`                                                                                                      | 読む           | 削除の版。`tableName`・`recordId`・`deletedAt` ＋ `_sns_ts`（型名なし）・`_sns_lamport`・`_sns_instance`                                  |
-| `_changelog`                                                                                                      | 読む           | 読み直すキーの通知                                                                                                                        |
-| `_changelog_prune`                                                                                                | 読む           | 掃除した位置 `prunedThroughId`                                                                                                            |
-| `_sync_meta`                                                                                                      | 読む           | `schemaVersion`（`<アプリの版>;sns-format=rows1`）、`sns.instanceId`、**`sns.generation`**、**`sns.lastInstance`**、**`sns.lastLamport`** |
-| `_sync_state`                                                                                                     | 読まない       | 相手ごとの読み位置 `lastSeenId`                                                                                                           |
-| `_sns_clock` / `_sns_tick` / `_sns_shown` / `_sns_hidden` / `_sns_unplaceable` / `_sns_dirty` / `_sns_rebuilding` | 読まない       | 時計・表ごとの tick・作り直しの出力・警告の重複回避・対象・旗                                                                             |
+| 表                                                                                                                | 他端末が読むか | 中身                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_sns_rows_<表>`                                                                                                  | 読む           | 生きている id の最強の行の版。アプリの列（生成列を除く。型名を写すのは主キーだけ）＋ `_sns_ts`（型名なし）・`_sns_lamport`・`_sns_instance` |
+| `_tombstone`                                                                                                      | 読む           | 削除の版。`tableName`・`recordId`・`deletedAt` ＋ `_sns_ts`（型名なし）・`_sns_lamport`・`_sns_instance`                                    |
+| `_changelog`                                                                                                      | 読む           | 読み直すキーの通知                                                                                                                          |
+| `_changelog_prune`                                                                                                | 読む           | 掃除した位置 `prunedThroughId`                                                                                                              |
+| `_sync_meta`                                                                                                      | 読む           | `schemaVersion`（`<アプリの版>;sns-format=rows1`）、`sns.instanceId`、**`sns.generation`**、**`sns.lastInstance`**、**`sns.lastLamport`**   |
+| `_sync_state`                                                                                                     | 読まない       | 相手ごとの読み位置 `lastSeenId`                                                                                                             |
+| `_sns_clock` / `_sns_tick` / `_sns_shown` / `_sns_hidden` / `_sns_unplaceable` / `_sns_dirty` / `_sns_rebuilding` | 読まない       | 時計・表ごとの tick・作り直しの出力・警告の重複回避・対象・旗                                                                               |
+
+`_sns_rows_<表>` の主キー以外のアプリの列には型名を書かない。型名の無い列は BLOB 親和性で、入れた値をそのまま持つ。
+型名を写すと、STRICT の表の `ANY` 列の値が変わる。`_sns_rows_<表>` は STRICT でないので、型名 `ANY` は NUMERIC 親和性になり、文字列 `'123'` が整数 `123` になる。
+STRICT でないアプリの表では、`_sns_rows_<表>` に入るのはアプリの表が親和性で変換したあとの値で、作り直しで同じ親和性をもう一度当てても値は変わらない。
+主キーの列だけは型名を写す。親和性が食い違うと、`_sns_shown` から引いた文字列の id が整数の id と一致しなくなるからである。
 
 NAS の写しには、「他端末が読む」表だけを載せる（§4.1）。
 `_changelog` の `AUTOINCREMENT` の値も、`sqlite_sequence` から元のまま写す。
@@ -460,6 +465,7 @@ k（既定 3）回目は、`busy_timeout` を数十 ms にして `BEGIN IMMEDIAT
 - `_heartbeat` の表とトリガーを落とす。トリガーを先に落とす。表だけ先に消すと、以後の `ALTER TABLE` が DB の全トリガーを読み直すときに落ちる
 - 誰も読まない列を、列があるときだけ `ALTER TABLE … DROP COLUMN` で落とす。対象は `_tombstone.mergedInto` / `revokedAt`、`_sns_unplaceable.reasonKind` / `noticedAt`、`_changelog_prune.prunedAt`、`_sync_state.lastSyncedAt` で、正本は `src/rows/migrate.ts` の `UNUSED_COLUMNS`。`_heartbeat` のトリガーを落としたあとに行う
 - `_sync_meta` の `sns.deleteProtected` の鍵を消す
+- 主キー以外のアプリの列に型名のある `_sns_rows_<表>` は、型名の無い表を作って行をそのまま写し、置き換える。0.21.0 までは型名を写していた（§3.1）。行も版も変えないので、既に変換された値は元に戻らない
 
 撤去を済ませた DB は、撤去前の版のライブラリでは開き直せない。
 落とした列を名指しで書き込むので、`no such column` で失敗する。
@@ -470,6 +476,7 @@ k（既定 3）回目は、`busy_timeout` を数十 ms にして `BEGIN IMMEDIAT
 - **列の増減があった表は、その端末が移行の中で全行を新しい版として書き直す**（E）。アプリの表の現在の内容を使う。`_sns_ts` は §1.2.1 の3項の最大、`_sns_instance` は自分である。`_sns_lamport` は進めた値で、表ごとに1つでよい。鍵は `(t, k, iid, L, 種類)` なので、行が違えば重ならない
 - **「既定値を1回評価して埋める」は採らない**。【確認】評価のたびに変わる既定値では、端末ごとに違う値が同じ版の鍵で入り、永久に食い違う
 - 既定値が評価できず、その列が NOT NULL の場合は `setupSync` で例外にする
+- 増えた列は `_sns_rows_*` に型名なしで足す（§3.1）。アプリの表に居ない行は、既定値が定数ならその定数で埋める。定数はアプリの列と同じ型名で、アプリの表が STRICT なら STRICT の一時の表に入れて読み直した値にする。字面のまま入れると、アプリの表に入る値と型が違い、作り直しがその行を毎回違うと数える
 - `_sns_rows_*` から列を落とす場合、【確認】**主キーの列は `DROP COLUMN` できない**（`cannot drop PRIMARY KEY column`）。索引の張られた列も落とせない。`_sns_rows_*` は主キーにしか索引を張らないので、主キー以外は落とせる
 - **アプリの表の主キーの列名が変わった・消えた場合は `setupSync` で例外にする**。行の同定ができなくなるためである
 - 列の増減があった表は `_sns_dirty` に入れる
