@@ -341,6 +341,79 @@ describe('無駄な転送の抑制', () => {
     expect(relayed).toEqual([{ id: 'n-b' }])
   })
 
+  // root で走らせると chmod が効かない（何でも書けてしまう）ので、その場合は飛ばす
+  const asRoot = typeof process.getuid === 'function' && process.getuid() === 0
+  it.skipIf(asRoot)(
+    '作り直しと写しの両方が例外で止まったら、両方の例外を投げる',
+    async () => {
+      const pathA = createDb('a')
+      const pathB = createDb('b')
+      const syncA = setup(makeConfig(pathA, 'a'))
+      const syncB = setup(makeConfig(pathB, 'b'))
+      await syncA.syncNow()
+      write(pathB, 'n-b', 'from b', '2026-09-01T00:00:00.000Z')
+      await syncB.syncNow()
+
+      // A の作り直しを止め、NAS への書き込みも止める
+      const db = new Database(pathA)
+      db.pragma('foreign_keys = ON')
+      db.pragma('recursive_triggers = ON')
+      fs.chmodSync(nasDir, 0o500)
+      let thrown: unknown
+      try {
+        await performSync(db, makeConfig(pathA, 'a'), [{ name: 'notes' }], {
+          rebuild: createRebuildState(),
+          forceMainThread: true,
+          hooks: {
+            beginImmediate: () => {
+              throw new Error('作り直しの失敗')
+            },
+          },
+        })
+      } catch (error) {
+        thrown = error
+      } finally {
+        fs.chmodSync(nasDir, 0o755)
+        db.close()
+      }
+
+      expect(thrown).toBeInstanceOf(AggregateError)
+      const errors = (thrown as AggregateError).errors as Error[]
+      expect(errors).toHaveLength(2)
+      expect(errors[0].message).toBe('作り直しの失敗')
+      expect((errors[1] as NodeJS.ErrnoException).code).toBe('EACCES')
+    }
+  )
+
+  it('仕掛けを取り付け直したら、印が変わらなくても上げ直す', async () => {
+    const pathA = createDb('a')
+    const syncA = setup(makeConfig(pathA, 'a'))
+    write(pathA, 'n-a', 'from a', '2026-09-01T00:00:00.000Z')
+    await syncA.syncNow()
+    await syncA.syncNow()
+    // 落ち着いた（上げない）
+    expect(transfersOf((await syncA.syncNow()).transfers).uploads).toBe(0)
+
+    // 外でトリガーを1本消す。他の端末が読む表は変わらないので、印も変わらない
+    const db = new Database(pathA)
+    const trigger = db
+      .prepare(
+        `SELECT name FROM sqlite_master
+          WHERE type = 'trigger' AND tbl_name = 'notes' ORDER BY name LIMIT 1`
+      )
+      .get() as { name: string }
+    db.exec(`DROP TRIGGER ${JSON.stringify(trigger.name)}`)
+    db.close()
+
+    const result = await syncA.syncNow()
+    expect(
+      result.warnings.some((warning) =>
+        warning.startsWith('欠けていた同期の仕組みを作り直した')
+      )
+    ).toBe(true)
+    expect(transfersOf(result.transfers).uploads).toBe(1)
+  })
+
   it('自分の写しを自分以外が書いたら、上げない回でも気づいて上げ直す', async () => {
     const pathA = createDb('a')
     const pathB = createDb('b')

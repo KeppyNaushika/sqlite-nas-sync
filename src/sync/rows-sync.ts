@@ -351,7 +351,8 @@ export async function performRowsSync(
     // 中継の通知と一緒にこの回の写しに載る。先に上げると、それが載るのは次の回になり、
     // その回の上げ直しを読んだ相手がさらに次の回に上げ直す、と転送が1巡ずつ後ろへ延びる。
     // 作り直しが例外で止まっても、取り込んだ版と手元の書き込みは上げてから投げ直す。
-    // 作り直しの失敗は版の表を巻き戻さないので、上げる中身は変わらない
+    // 作り直しの失敗は版の表を巻き戻さないので、上げる中身は変わらない。
+    // 上げるのも例外で止まったら、両方の例外を `AggregateError` にまとめて投げる
     importAll(localDb, peers, schemaVersion, specs, idle, result)
     let rebuildFailed = false
     let rebuildError: unknown
@@ -362,7 +363,18 @@ export async function performRowsSync(
       rebuildFailed = true
       rebuildError = error
     }
-    const published = await publish()
+    let published: boolean
+    try {
+      published = await publish()
+    } catch (publishError) {
+      if (!rebuildFailed) throw publishError
+      throw new AggregateError(
+        [rebuildError, publishError],
+        `ユーザーテーブルの作り直しと NAS への写しの両方が失敗した: ` +
+          `${String(rebuildError)} / ${String(publishError)}`,
+        { cause: publishError }
+      )
+    }
     if (rebuildFailed) throw rebuildError
     if (!published) return stop(localDb, config, result)
   } finally {
