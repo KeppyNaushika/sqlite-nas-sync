@@ -167,7 +167,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
   setupWarnings.push(...migration.warnings)
 
   // 表に触らない帳簿（`_sync_state` / `_changelog_prune` / `_sync_meta`）。
-  // 移行が `_sync_state` を空にしたあとで作る
+  // 移行が `_sync_state` を空にすることがあるので、そのあとで作る
   setupRowsLedgers(db)
 
   // `migrateToRows` が書いた `<アプリの版>;sns-format=rows1` をそのまま持ち回る

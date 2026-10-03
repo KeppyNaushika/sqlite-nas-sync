@@ -36,6 +36,7 @@ import {
   TableConfig,
 } from '../types'
 import {
+  announceFullMerge,
   cleanupChangelog,
   describeChangelogPruneWall,
   fullMergeCursor,
@@ -205,6 +206,10 @@ export async function performRowsSync(
       transfers.bytes += fileSize(selfPath)
     }
     restored = restore.restored
+    // 戻した DB は、コピーに載せた通知の id をもう一度振る。
+    // 相手はその id を読み終えたものとして読み飛ばすので、次の読みでフルマージさせる。
+    // 振る id はコピーを読んだ相手の読み位置より大きくする
+    if (restored) announceFullMerge(localDb, restore.copyCursorLimit)
     for (const issue of restore.issues) result.warnings.push(issue.message)
   }
 

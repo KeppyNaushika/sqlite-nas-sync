@@ -26,6 +26,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
+import { fullMergeCursor } from '../changelog'
 import { openRemoteDbViaLocalCopy } from '../nas'
 import { escapeIdentifier } from '../setup/sql'
 import {
@@ -204,6 +205,11 @@ interface RowsRestoreReport {
   localLamport: number | null
   /** NAS 上の自分のコピーの `sns.lastLamport`（読めなければ `null`） */
   copyLastLamport: number | null
+  /**
+   * NAS 上の自分のコピーを読んだ相手の読み位置の上限（コピーの {@link fullMergeCursor}）。
+   * コピーが無い・読めなければ 0
+   */
+  copyCursorLimit: number
 }
 
 /**
@@ -224,6 +230,7 @@ export function checkRestoreBeforeImport(
     copyMissing: false,
     localLamport: readClockLamport(db),
     copyLastLamport: null,
+    copyCursorLimit: 0,
   }
   const filePath = selfCopyPath(location)
   if (!fs.existsSync(filePath)) {
@@ -247,6 +254,7 @@ export function checkRestoreBeforeImport(
       SNS_META_KEYS.lastLamport
     )
     copyGeneration = readSnsMetaNumber(handle.db, SNS_META_KEYS.generation)
+    report.copyCursorLimit = fullMergeCursor(handle.db)
   } finally {
     handle.cleanup()
   }

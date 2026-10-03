@@ -536,7 +536,7 @@ describe('誰も読まない内部の列を落とす', () => {
     expect(db.prepare(`SELECT * FROM _changelog_prune`).all()).toEqual([
       { onlyRow: 0, prunedThroughId: 7 },
     ])
-    // `_sync_state` は移行が毎回空にする（手順7。移行のあとはフルマージさせる）ので、列だけ見る
+    // `_sync_state` は `sns.syncedTables` の無い DB では移行が空にする（手順7）ので、列だけ見る
     expect(columnsOf(db, '_sync_state')).toEqual([
       'remoteClientId',
       'lastSeenId',

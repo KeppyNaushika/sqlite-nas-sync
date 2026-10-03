@@ -17,6 +17,7 @@
  * @internal
  */
 import Database from 'better-sqlite3'
+import { createChangelogPruneTable } from '../changelog'
 import { sweepStaleRemoteCopies } from '../nas'
 
 /**
@@ -35,12 +36,7 @@ export function setupRowsLedgers(db: Database.Database): void {
       lastSeenId     INTEGER NOT NULL DEFAULT 0
     )
   `)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS _changelog_prune (
-      onlyRow         INTEGER PRIMARY KEY CHECK (onlyRow = 0),
-      prunedThroughId INTEGER NOT NULL DEFAULT 0
-    )
-  `)
+  createChangelogPruneTable(db)
   db.exec(`
     CREATE TABLE IF NOT EXISTS _sync_meta (
       key   TEXT PRIMARY KEY,

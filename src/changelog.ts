@@ -70,6 +70,7 @@ export function getMaxChangelogId(db: Database.Database): number {
  * つまり「振られたのに `_changelog` に無い id」は、何かが消した id である。
  * 例外は旧版からの移行（`src/rows/migrate.ts`）で、旧版の id を穴ごと写す。
  * その穴は一度だけ隙間と判断されてフルマージになり、カーソルが振った最大の id へ進むので、二度目は無い。
+ * もう1つの例外は {@link announceFullMerge} が行を書かずに振る id で、相手にフルマージさせるための穴である。
  * {@link hasChangelogGap} はこれを使って、掃除の記録に載らない消え方（生の `DELETE`）も見抜く。
  *
  * **読み取りしかしない**（{@link readChangelogPrunedThroughId} と同じ理由）。
@@ -132,6 +133,21 @@ export function readChangelogPrunedThroughId(db: Database.Database): number {
     // 表が無い（相手が旧版 / 案A の取り付けを通していないDB）
     return 0
   }
+}
+
+/**
+ * `_changelog_prune` が無ければ作る（冪等）。
+ *
+ * @param db - 書き込み対象のSQLiteデータベース接続
+ * @internal
+ */
+export function createChangelogPruneTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _changelog_prune (
+      onlyRow         INTEGER PRIMARY KEY CHECK (onlyRow = 0),
+      prunedThroughId INTEGER NOT NULL DEFAULT 0
+    )
+  `)
 }
 
 /**
@@ -403,4 +419,47 @@ export function describeChangelogPruneWall(
     `The row is kept on purpose: removing it would open a changelog gap. ` +
     `Fix or rewrite that changedAt to let cleanup continue.`
   )
+}
+
+/**
+ * このDBを読む相手に、次の読みでフルマージさせる。
+ *
+ * `_changelog` の id を1つ、行を書かずに振り、その id を掃除済みの位置として記録する。
+ * 振る id は、相手の読み位置になりうるどの値よりも大きくする。
+ * すると相手の読み位置はこの id より小さいので、{@link hasChangelogGap} の第1の規則（`prunedThroughId > lastSeenId`）に当たる。
+ * 振った id の行は無いので、第2の規則（振った id の数と残っている数の比較）にも当たる。
+ * 第1の規則は 0.20.0 以降のどの版の `hasChangelogGap` にもあるので、旧版の相手にも通じる。
+ *
+ * 相手のフルマージのあとの読み位置（{@link fullMergeCursor}）はこの id 以上になり、どの規則も偽になるので、フルマージは1回で終わる。
+ * 以後の通知の id はこの id より大きく、途切れずに並ぶ。
+ *
+ * id は `sqlite_sequence` の `_changelog` の行を書き換えて振る。
+ * `AUTOINCREMENT` の表の次の id は「表の最大の id」と `sqlite_sequence` の値の大きい方に 1 を足した値なので、
+ * 振った id がほかの行に使われることは無い。
+ *
+ * 通知を書かずに版を変えたとき（移行で版を写した・列の増減で書き直した・表名をそろえた）と、復元で通知の id が振り直されたときに使う。
+ *
+ * @param db - 書き込み対象のSQLiteデータベース接続
+ * @param floor - 相手の読み位置になりうる値のうち、このDBからは読めないものの最大。振る id はこれより大きくする。
+ *   復元のときは NAS 上の自分の写しの {@link fullMergeCursor}、旧方式からの移行のときは `_changelog` を作り直す前の `sqlite_sequence` の値
+ * @returns 振った id
+ * @internal
+ */
+export function announceFullMerge(db: Database.Database, floor = 0): number {
+  return db.transaction((): number => {
+    createChangelogPruneTable(db)
+    const announced = Math.max(fullMergeCursor(db), floor) + 1
+    const updated = db
+      .prepare(`UPDATE sqlite_sequence SET seq = ? WHERE name = '_changelog'`)
+      .run(announced).changes
+    if (updated === 0) {
+      // `_changelog` にまだ1件も振っていない。
+      // `_changelog` は `AUTOINCREMENT` なので、表があれば `sqlite_sequence` もある
+      db.prepare(
+        `INSERT INTO sqlite_sequence (name, seq) VALUES ('_changelog', ?)`
+      ).run(announced)
+    }
+    recordChangelogPruned(db, announced)
+    return announced
+  })()
 }
