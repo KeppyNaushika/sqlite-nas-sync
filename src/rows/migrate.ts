@@ -21,6 +21,8 @@
  * | `_sns_rows_<t>` の主キー以外のアプリの列の型名 | **あれば外す**（表を作り直して行をそのまま写す） | 型名を写すと、STRICT の表の `ANY` 列の値が NUMERIC 親和性で変わる（{@link dropRowsColumnTypes}） |
  * | 誰も読まない内部の列（{@link UNUSED_COLUMNS}） | **あれば落とす**（`_heartbeat` のトリガーを落としたあと） | `CREATE TABLE IF NOT EXISTS` では既存の DB から消えない。使わない列を利用者の DB に残さない |
  * | 表名の大文字と小文字だけが変わった表 | **内部テーブルの表名をそろえる**（{@link respellTable}） | 古い綴りが残ると、新しい綴りの版と別の鍵になり、取り込みがその表を読まない |
+ * | `_sync_state` | **手元の読み位置では相手から読むべきものを読めないときだけ空にする**（旧方式から移した・版を写した・表名をそろえた・同期する表が増えた・`sns.syncedTables` が無い） | 起動のたびに空にすると、起動のたびに全員をフルマージで読む |
+ * | 相手の読み位置 | **相手の読み位置では手元から読むべきものを読めないとき、`announceFullMerge` で相手にフルマージさせる**（旧方式から移した・版を写した・書き直した・表名をそろえた・同期する表が増えた） | 写しと書き直しは通知を書かず、表名をそろえると通知の表名が変わる |
  *
  * `_sns_rebuilding` の残りは、呼び出し側が `clearRebuildingFlag`（`src/rows/restore-detect.ts`）で先に消す（`setupSync` と同期の段階0）。
  * 残ったままトリガーを作ると、番人が効いてアプリの書き込みが版にならない。
@@ -29,6 +31,7 @@
  * @internal
  */
 import Database from 'better-sqlite3'
+import { announceFullMerge, readChangelogSequence } from '../changelog'
 import { escapeIdentifier, foldIdentifier, NOW_SQL } from '../setup/sql'
 import { ROWS_FORMAT, readSnsFormat } from './import'
 import {
@@ -154,6 +157,10 @@ export function migrateToRows(
   db.pragma('recursive_triggers = ON')
 
   const run = db.transaction(() => {
+    // 下の 2 が `_changelog` を作り直すと `sqlite_sequence` の値は残っている最大の id まで下がるので、作り直す前の値を覚えておく。
+    // 相手の読み位置はこの値まで進んでいることがある
+    const sequenceBefore = readChangelogSequence(db) ?? 0
+
     // 1. 旧方式のトリガーを落とす。残すと、旧 DELETE トリガーの
     //    `INSERT OR REPLACE INTO _tombstone` が版の3列を NULL で塗り潰す
     if (fromLegacy) {
@@ -187,9 +194,11 @@ export function migrateToRows(
 
     // 3.7. アプリが表名の大文字と小文字だけを変えて表を作り直していたら、
     //      内部テーブルの綴りを新しい綴りにそろえる。下の 4 が `_sns_rows_<表>` の有無を字面で見るので、その前に行う
+    let respelled = false
     for (const spec of specs) {
       const previous = respellTable(db, spec)
       if (previous !== null) {
+        respelled = true
         result.warnings.push(
           `表名が ${previous} から ${spec.name} に変わったので、同期の内部テーブルの表名をそろえた。` +
             `大文字と小文字が違うクライアントからは、この表を取り込まない`
@@ -204,7 +213,9 @@ export function migrateToRows(
     }
     createRowsTables(db, specs, instanceId)
 
-    // 5. 表ごとに、中身を入れる／列の増減へ追従する
+    // 5. 表ごとに、中身を入れる／列の増減へ追従する。どちらも `_changelog` に通知を書かない
+    let seeded = false
+    let rewritten = false
     for (const spec of specs) {
       const report = droppedOf(result, spec.name)
       if (existed.get(spec.name) === true) {
@@ -218,6 +229,7 @@ export function migrateToRows(
           // §3.9 の E: 全行を新しい版として書き直す
           report.rows = rewriteRowsWithNewVersions(db, spec, instanceId)
           report.rewritten = true
+          rewritten = true
         } else {
           report.rows = countOf(
             db,
@@ -226,15 +238,49 @@ export function migrateToRows(
         }
       } else {
         report.rows = seedRowsTable(db, spec, instanceId)
+        seeded = true
       }
     }
 
     // 6. トリガーを作る（落としたものはここで戻る）
     createRowsTriggers(db, specs)
 
-    // 7. `_sync_state` を空にし、`_sync_meta` の鍵を書き、全表を `_sns_dirty` へ
-    if (tableExists(db, '_sync_state')) db.exec(`DELETE FROM _sync_state`)
+    // 7. 必要なときだけ `_sync_state` を空にし、必要なときだけ相手にフルマージさせる。
+    //    `_sync_meta` の鍵を書き、全表を `_sns_dirty` へ
     ensureSyncMetaTable(db)
+    const previousTables = readSyncedTables(db)
+    // 前回の移行で同期していなかった表があるか。表名の大文字と小文字だけを変えた表もここに入る
+    const added =
+      previousTables !== null &&
+      specs.some((spec) => !previousTables.has(spec.name))
+    // 手元の読み位置では、相手から読むべきものを読めないときに空にする。
+    // - 旧方式から移した
+    // - 版を写した表は、それまで相手から受け取った版を失っている
+    // - 同期していなかった表の通知は、取り込みが読み飛ばして読み位置を進めている。綴りの違う表の通知も同じ
+    // - 鍵が無い DB は、前回どの表を同期していたかが分からない
+    if (
+      tableExists(db, '_sync_state') &&
+      (fromLegacy || seeded || added || previousTables === null)
+    ) {
+      db.exec(`DELETE FROM _sync_state`)
+    }
+    // 相手の読み位置では、手元から読むべきものを読めないときに、相手にフルマージさせる。
+    // - 旧方式から移した・版を写した・列の増減で書き直したときは、通知を書かずに版を変えている
+    // - 表名をそろえた表は、綴りが違っていた間の通知を相手が読み飛ばしている
+    // - 同期していなかった表は、`_sns_rows_<表>` が残っていればその間もトリガーが版と通知を書いているが、写しにその `_sns_rows_<表>` を載せていないので、相手はその通知を読み飛ばしている
+    // 表名をそろえたときは鍵があれば `added` も真になるが、鍵が無い DB では `added` が偽なので `respelled` で見る。
+    // 新しい DB はまだ誰にも読まれていないので、相手は初回のフルマージで読む
+    if (
+      result.from !== 'fresh' &&
+      (fromLegacy || seeded || rewritten || respelled || added)
+    ) {
+      announceFullMerge(db, sequenceBefore)
+    }
+    writeSnsMeta(
+      db,
+      SNS_META_KEYS.syncedTables,
+      JSON.stringify(specs.map((spec) => spec.name).sort())
+    )
     writeSnsMeta(db, SNS_META_KEYS.instanceId, instanceId)
     if (fromLegacy || readSnsMeta(db, SNS_META_KEYS.generation) === null) {
       writeSnsMeta(db, SNS_META_KEYS.generation, 0)
@@ -258,6 +304,23 @@ export function migrateToRows(
   })
   run()
   return result
+}
+
+/**
+ * 前回の移行で同期した表の名前（`sns.syncedTables`）を読む。
+ *
+ * @returns 表の名前の集合。鍵が無い、または読めなければ `null`
+ */
+function readSyncedTables(db: Database.Database): Set<string> | null {
+  const text = readSnsMeta(db, SNS_META_KEYS.syncedTables)
+  if (text === null) return null
+  try {
+    const names: unknown = JSON.parse(text)
+    if (!Array.isArray(names)) return null
+    return new Set(names.filter((name) => typeof name === 'string'))
+  } catch {
+    return null
+  }
 }
 
 /* ------------------------------------------------------------------ *

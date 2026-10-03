@@ -7,8 +7,9 @@
  * | `sns.generation` | `copyToNas` の前に +1 する値 |
  * | `sns.lastInstance` | 自分が最後に NAS の写しへ書いたときの `instanceId` |
  * | `sns.lastLamport` | 同じく、そのときの `lamport` |
+ * | `sns.syncedTables` | 前回の移行で同期した表の名前（JSON の配列）。同期する表が増えたかを見る（`src/rows/migrate.ts`） |
  *
- * **鍵の名前は固定**（§3.1 の H）。後ろ2つは §3.10 の「復元・巻き戻り」と
+ * **鍵の名前は固定**（§3.1 の H）。`sns.lastInstance` と `sns.lastLamport` は §3.10 の「復元・巻き戻り」と
  * 「写しの取り合い」の判定に使うので、綴りが端末ごとに違うと検出が効かない。
  *
  * @module rows/meta
@@ -23,6 +24,7 @@ export const SNS_META_KEYS = {
   generation: 'sns.generation',
   lastInstance: 'sns.lastInstance',
   lastLamport: 'sns.lastLamport',
+  syncedTables: 'sns.syncedTables',
 } as const
 
 /** {@link SNS_META_KEYS} の値の型。 */
