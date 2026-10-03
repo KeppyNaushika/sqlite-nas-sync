@@ -314,3 +314,100 @@ describe('src/rows/versions —— 版の順序（設計書 §1.2.5）', () => {
     expect(values.idKey(Buffer.from('ab', 'utf8'))).toBe('ab')
   })
 })
+
+describe('src/rows/versions —— 答えを覚えても、値の種類を取り違えない', () => {
+  /**
+   * 種類だけが違う値と、大文字と小文字だけが違う値を並べる。
+   * 覚えた答えを別の値に返すと、群・正規形・比較のどれかが食い違う。
+   */
+  const NEAR_VALUES: SqlValue[] = [
+    null,
+    '',
+    'null',
+    'n',
+    0,
+    -0,
+    0n,
+    1,
+    1n,
+    1.5,
+    '1',
+    '1.0',
+    'r1',
+    'i1',
+    's1',
+    'ABC',
+    'abc',
+    'Abc',
+    '2026-01-01',
+    '2026-01-01 ',
+    '2026-01-01T00:00:00.000Z',
+    '2026-01-01t00:00:00.000z',
+    2n ** 63n - 1n,
+    9007199254740993n,
+    9007199254740992,
+    Buffer.from('abc', 'utf8'),
+    Buffer.from('ABC', 'utf8'),
+  ]
+
+  it('覚える道具と覚えない道具の答えが、尋ねる順によらず一致する', () => {
+    const plain = new ValueOrdering()
+    // 前から尋ねる道具と後ろから尋ねる道具で、覚える順を変える
+    const forward = new ValueOrdering({ memoize: true })
+    const backward = new ValueOrdering({ memoize: true })
+    try {
+      const cases: [ValueOrdering, SqlValue[]][] = [
+        [forward, NEAR_VALUES],
+        [backward, [...NEAR_VALUES].reverse()],
+      ]
+      for (const [memo, order] of cases) {
+        // 2周する。2周目は覚えた答えを返す
+        for (let round = 0; round < 2; round += 1) {
+          for (const a of order) {
+            expect([a, memo.timeGroup(a)]).toEqual([a, plain.timeGroup(a)])
+            expect([a, memo.idKey(a)]).toEqual([a, plain.idKey(a)])
+            for (const b of order) {
+              expect([a, b, memo.compareTs(a, b)]).toEqual([
+                a,
+                b,
+                plain.compareTs(a, b),
+              ])
+            }
+          }
+        }
+      }
+    } finally {
+      plain.close()
+      forward.close()
+      backward.close()
+    }
+  })
+
+  it('整数の 1 と実数の 1.0、大文字と小文字だけ違う文字列、NULL を区別する', () => {
+    const values = new ValueOrdering({ memoize: true })
+    try {
+      // 整数を先に覚えさせてから実数を尋ねる。JS の 1.0 は実数として SQLite に渡る
+      expect(values.idKey(1n)).toBe('1')
+      expect(values.idKey(1.0)).toBe('1.0')
+      expect(values.idKey(1n)).toBe('1')
+      // 大文字と小文字だけ違う文字列は同着にならない
+      expect(values.compareTs('ABC', 'abc')).toBeLessThan(0)
+      expect(values.compareTs('abc', 'ABC')).toBeGreaterThan(0)
+      expect(values.timeGroup('2026-01-01T00:00:00.000Z')).toBe(
+        TIME_GROUP.isoText
+      )
+      expect(values.timeGroup('2026-01-01t00:00:00.000z')).toBe(TIME_GROUP.text)
+      // NULL と空文字列と 'null' は別の群
+      expect(values.timeGroup(null)).toBe(TIME_GROUP.null)
+      expect(values.timeGroup('')).toBe(TIME_GROUP.text)
+      expect(values.timeGroup('null')).toBe(TIME_GROUP.text)
+      expect(values.timeGroup(null)).toBe(TIME_GROUP.null)
+      // 数値の 1 と文字列の '1' は別の群
+      expect(values.timeGroup(1)).toBe(TIME_GROUP.number)
+      expect(values.timeGroup('1')).toBe(TIME_GROUP.text)
+      expect(values.compareTs(1n, 1.0)).toBe(0)
+    } finally {
+      values.close()
+    }
+  })
+})

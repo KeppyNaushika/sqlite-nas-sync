@@ -126,6 +126,18 @@ interface ValueFacts {
   text: string | null
 }
 
+/** {@link ValueOrdering} の設定。 */
+interface ValueOrderingOptions {
+  /**
+   * SQLite に尋ねた答えを値ごとに覚えて、同じ値をもう一度尋ねない。
+   *
+   * 覚えた答えは {@link ValueOrdering.close} まで残る。
+   * 作り直しの計算（`src/rows/derive.ts` の `derive`）は、1回の計算のあいだに同じ時刻と id を何度も比べるので、これを立てる。
+   * 答えは値だけで決まるので、覚えても結果は変わらない。
+   */
+  memoize?: boolean
+}
+
 /**
  * 版の順序を答える道具。
  *
@@ -135,6 +147,9 @@ interface ValueFacts {
  */
 export class ValueOrdering {
   private readonly db = new Database(':memory:')
+
+  /** 値の種類と値から作った文字列 → SQLite に尋ねた答え。覚えないときは null */
+  private readonly memo: Map<string, ValueFacts> | null
 
   /**
    * 値を1回だけ束縛して、群・`julianday`・`CAST(… AS TEXT)` をまとめて尋ねる。
@@ -153,7 +168,8 @@ export class ValueOrdering {
      FROM v`
   )
 
-  constructor() {
+  constructor(options: ValueOrderingOptions = {}) {
+    this.memo = options.memoize === true ? new Map() : null
     // 作り直しで開く接続はすべて安全な整数で読む。既定では 2^53 を超える整数が
     // 潰れ、別の id や別の時刻が JS 上で同着になり、書き戻すと値が変わる
     this.db.defaultSafeIntegers(true)
@@ -246,9 +262,34 @@ export class ValueOrdering {
   }
 
   private describe(value: SqlValue): ValueFacts {
+    const key = this.memo === null ? null : memoKey(value)
+    if (key !== null) {
+      const known = this.memo?.get(key)
+      if (known !== undefined) return known
+    }
     const row = this.facts.get(value as never) as ValueFacts
-    return { ...row, group: Number(row.group) }
+    const facts = { ...row, group: Number(row.group) }
+    if (key !== null) this.memo?.set(key, facts)
+    return facts
   }
+}
+
+/**
+ * 答えを覚えるときの鍵。値の種類ごとに先頭の1文字を変える。
+ *
+ * 整数の `1n` と実数の `1` は `typeof` も `CAST(… AS TEXT)` も違うので、別の鍵にする。
+ * 文字列は大文字と小文字を区別したまま鍵にする。
+ * `-0` は `String` では `0` と同じ文字列になるので、別の鍵にする。
+ * BLOB は覚えない。鍵にするには中身を全部文字列に直すことになるからである。
+ */
+function memoKey(value: SqlValue): string | null {
+  if (value === null || value === undefined) return 'n'
+  if (typeof value === 'bigint') return `i${value.toString()}`
+  if (typeof value === 'number') {
+    return Object.is(value, -0) ? 'r-0' : `r${String(value)}`
+  }
+  if (typeof value === 'string') return `s${value}`
+  return null
 }
 
 function compareNumbers(a: number, b: number): number {

@@ -171,7 +171,9 @@ export function derive(
   schema: RowsSchema,
   options: DeriveOptions = {}
 ): DerivedRows {
-  const values = new ValueOrdering()
+  // 同じ時刻と id を何度も比べるので、SQLite に尋ねた答えを値ごとに覚える。
+  // 覚えた答えはこの計算の終わりに `close` で捨てる
+  const values = new ValueOrdering({ memoize: true })
   const model = new SchemaModel(schema, options)
   try {
     return deriveWith(values, model, versions)
@@ -345,12 +347,13 @@ function deriveWith(
             placement: 'placed',
             display,
           })
-          tableRows.push(model.probeRow(table))
+          const placed = model.probeRow(table)
+          tableRows.push(placed)
           tableRes.set(
             key,
             table.primaryKey.map((column) => display[column] ?? null)
           )
-          placedByIdentity.set(model.probeIdentity(table), {
+          placedByIdentity.set(identityOf(table, placed), {
             key,
             order: placedByIdentity.size,
           })
@@ -824,9 +827,18 @@ class SchemaModel {
     }
   }
 
-  /** 候補を使い捨ての DB へ1行だけ置く（SQLite に評価させるための足場）。 */
+  /**
+   * 候補を使い捨ての DB へ1行だけ置く（SQLite に評価させるための足場）。
+   *
+   * 候補の数だけ呼ばれるので、`DELETE` と `INSERT` の文は表ごとに1回だけ準備する。
+   */
   placeOnProbe(table: TableMeta, display: Record<string, SqlValue>): void {
-    this.probe.exec(`DELETE FROM ${escapeIdentifier(table.name)}`)
+    cachedStatement(
+      this.probe,
+      'delete',
+      table.name,
+      () => `DELETE FROM ${escapeIdentifier(table.name)}`
+    ).run()
     insertStatement(this.probe, table).run(
       ...table.storedColumns.map((column) => display[column] ?? null)
     )
@@ -834,14 +846,12 @@ class SchemaModel {
 
   /** 使い捨ての DB に置いた候補を `SELECT *` の形で読む（生成列と型への寄せ込み）。 */
   probeRow(table: TableMeta): Record<string, SqlValue> {
-    return this.probe
-      .prepare(`SELECT * FROM ${escapeIdentifier(table.name)}`)
-      .get() as Record<string, SqlValue>
-  }
-
-  /** 使い捨ての DB に置いた候補の「同一性の列」の値を、1本の文字列にする。 */
-  probeIdentity(table: TableMeta): string {
-    return identityOf(table, this.probeRow(table))
+    return cachedStatement(
+      this.probe,
+      'select',
+      table.name,
+      () => `SELECT * FROM ${escapeIdentifier(table.name)}`
+    ).get() as Record<string, SqlValue>
   }
 
   /**
@@ -918,29 +928,46 @@ function identityOf(table: TableMeta, row: Record<string, SqlValue>): string {
     .join(' ')
 }
 
+/** 一時 DB → 文の種類と表の名前 → 準備した文。一時 DB を閉じれば一緒に捨てられる */
 const statementCache = new WeakMap<
   Database.Database,
   Map<string, Database.Statement>
 >()
 
-function insertStatement(
+/**
+ * 一時 DB の文を、文の種類と表ごとに1回だけ準備する。
+ *
+ * 鍵は文の種類と表の名前を `:` でつないだものである。
+ * 文の種類は `:` を含まないので、表の名前が `:` を含んでも、別の組が同じ鍵になることはない。
+ */
+function cachedStatement(
   db: Database.Database,
-  table: TableMeta
+  kind: 'insert' | 'delete' | 'select',
+  table: string,
+  sql: () => string
 ): Database.Statement {
   let perDb = statementCache.get(db)
   if (perDb === undefined) {
     perDb = new Map()
     statementCache.set(db, perDb)
   }
-  const cached = perDb.get(table.name)
+  const key = `${kind}:${table}`
+  const cached = perDb.get(key)
   if (cached !== undefined) return cached
-  const columns = table.storedColumns.map(escapeIdentifier).join(', ')
-  const holes = table.storedColumns.map(() => '?').join(', ')
-  const statement = db.prepare(
-    `INSERT INTO ${escapeIdentifier(table.name)} (${columns}) VALUES (${holes})`
-  )
-  perDb.set(table.name, statement)
+  const statement = db.prepare(sql())
+  perDb.set(key, statement)
   return statement
+}
+
+function insertStatement(
+  db: Database.Database,
+  table: TableMeta
+): Database.Statement {
+  return cachedStatement(db, 'insert', table.name, () => {
+    const columns = table.storedColumns.map(escapeIdentifier).join(', ')
+    const holes = table.storedColumns.map(() => '?').join(', ')
+    return `INSERT INTO ${escapeIdentifier(table.name)} (${columns}) VALUES (${holes})`
+  })
 }
 
 /** 外部キーの依存の順（親が先）。循環していれば例外（設計書の前提 P2）。 */
