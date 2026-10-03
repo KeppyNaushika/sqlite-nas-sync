@@ -126,11 +126,14 @@ export function computeRebuildPlan(
     const known = options.tables.filter(
       (table) => tableExists(db, table) && tableExists(db, rowsTableName(table))
     )
-    const schema = readSchema(db, known)
-    const metas = new Map(known.map((table) => [table, readMeta(db, table)]))
-    const versions = readVersions(db, known, metas)
     const order = dependencyOrder(db, known)
     const targets = resolveTargets(db, known, order, options)
+    // 計算するのは適用する表とその祖先だけ（設計書 §3.7）。
+    // 表の計算は、その表の版と親の表の計算の結果だけで決まるので、残りの表を計算しても答えは変わらない
+    const computed = withAncestors(db, known, targets)
+    const schema = readSchema(db, computed)
+    const metas = new Map(computed.map((table) => [table, readMeta(db, table)]))
+    const versions = readVersions(db, computed, metas)
 
     const derived = derive(versions, schema)
     const values = new ValueOrdering()
@@ -360,6 +363,44 @@ function resolveTargets(
   }
   for (const seed of seeds) visit(seed)
   return new Set(order.filter((name) => targets.has(name)))
+}
+
+/**
+ * 適用する表とその祖先。`tables` の並びのまま返す（設計書 §3.7）。
+ *
+ * `derive`（`src/rows/derive.ts`）が表を計算するときに読むのは、次のものだけである。
+ *
+ * | 読むもの | どこで |
+ * | --- | --- |
+ * | その表の版と削除の版 | `Max` と候補 |
+ * | 外部キーの親の表の `Res` | `resolveParent`。`SET DEFAULT` の既定値の指す親も同じ |
+ * | 外部キーの親の表の削除と、親が削除されているので置かない行 | `goneParent` |
+ * | 同じ表の置く行 | 隠れた行の勝者、自己参照の親 |
+ *
+ * 子の表の結果は読まない。
+ * 親の表が先に計算されるので、適用する表の結果は、その表と祖先の版だけで決まる。
+ *
+ * 親を辿るのは、同期する表のうち `_sns_rows_<表>` のある表だけである。
+ * `derive` は、そうでない表を指す外部キーを読み替えず、真の値のまま置くので、その先の祖先は結果に効かない。
+ * 同期しない表をはさんだ先にある同期する表も辿らない。
+ * 外部キーの親の表の名前は `PRAGMA foreign_key_list` の綴りのまま突き合わせる。
+ * `derive` も同じ綴りで突き合わせるので、突き合わない表は両方で同期しない表として扱われる。
+ * 対象から外した表（`excluded`）も、祖先なら計算する。
+ */
+function withAncestors(
+  db: Database.Database,
+  tables: readonly string[],
+  targets: ReadonlySet<string>
+): string[] {
+  const known = new Set(tables)
+  const computed = new Set<string>()
+  const visit = (name: string): void => {
+    if (!known.has(name) || computed.has(name)) return
+    computed.add(name)
+    for (const key of foreignKeysOf(db, name)) visit(key.parentTable)
+  }
+  for (const target of targets) visit(target)
+  return tables.filter((table) => computed.has(table))
 }
 
 /** 表 → その表を親として参照している同期する表。 */
