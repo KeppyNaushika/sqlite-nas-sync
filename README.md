@@ -161,7 +161,7 @@ Prisma の `@id` は `NOT NULL` を宣言するので、[利用者が守るこ�
 
 ## API リファレンス
 
-公開している関数は `setupSync` と `discoverTables` の2つです。型は `TableConfig`、`TableOptions`、`DiscoverOptions`、`SyncConfig`、`SyncInstance`、`SyncResult`、`SyncTransfers`、`SkippedRemote`、`RecordFold`、`ParentDeletedRecord`、`SyncStatus`、`SyncEvent`、`SyncEventCallback` を公開しています。
+公開している関数は `setupSync`、`discoverTables`、`removeSync` の3つです。型は `TableConfig`、`TableOptions`、`DiscoverOptions`、`SyncConfig`、`SyncInstance`、`SyncResult`、`SyncTransfers`、`SkippedRemote`、`RecordFold`、`ParentDeletedRecord`、`SyncStatus`、`SyncEvent`、`SyncEventCallback` を公開しています。
 
 ### `setupSync(config: SyncConfig): SyncInstance`
 
@@ -233,18 +233,36 @@ const tables = discoverTables(db, {
 | `tableOptions`  | `Record<string, TableOptions>` | `{}`           | テーブルごとの設定                                     |
 | `onWarning`     | `(message: string) => void`    | `console.warn` | 主キーの列はあるが時刻列がないテーブルの警告を受け取る |
 
+### `removeSync(dbPath): string[]`
+
+`setupSync` が DB の中に作ったトリガーと内部の表を取り除きます。同期をやめた DB に残すと、アプリが書き込むたびにトリガーが内部の表を書き、誰も刈らない記録が伸び続けます。
+
+```typescript
+import { removeSync } from 'sqlite-nas-sync'
+
+await sync.close() // この DB に対する SyncInstance を先に閉じる
+const removed = removeSync('./local.sqlite')
+// → 取り除いたトリガーと表の名前
+```
+
+- 取り除くのは、このライブラリが作るトリガーと表だけです。アプリの表とその行には触りません。1つのトランザクションで行うので、途中で失敗したら何も変わりません。
+- このライブラリが使ったことのない DB（`_sync_state`、`_sync_meta`、`_sns_` で始まる表のどれも無い DB）では何もしません。`_changelog` などと同じ名前のアプリの表があっても触りません。
+- 動いている `SyncInstance` は取り除いたものを作り直すので、先に `close()` してください。
+- 取り除いた DB で、同じ `nasPath` に同じ `clientId` のまま `setupSync` し直すと、バックアップから戻した DB として警告が出ます。同期に戻すなら、別の `clientId` を使うか、別の `nasPath` で始めてください。
+
 ### `SyncInstance`
 
 `setupSync` が返すオブジェクトです。
 
-| メソッド                                                  | 説明                                                                            |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `syncNow(): Promise<SyncResult>`                          | 同期を1回実行する。同期の実行中に呼ぶと `Sync already in progress` の例外になる |
-| `start(): void`                                           | `intervalMs` の間隔で `syncNow()` を繰り返す。すでに始めていれば何もしない      |
-| `stop(): void`                                            | 定期同期を止める                                                                |
-| `getStatus(): SyncStatus`                                 | 現在の状態を返す                                                                |
-| `getSyncedTables(): string[]`                             | 同期しているテーブル名の一覧を返す                                              |
-| `on(event: SyncEvent, callback: SyncEventCallback): void` | イベントを受け取る関数を登録する                                                |
+| メソッド                                                  | 説明                                                                                                                                       |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `syncNow(): Promise<SyncResult>`                          | 同期を1回実行する。同期の実行中に呼ぶと `Sync already in progress` の例外になる                                                            |
+| `start(): void`                                           | `intervalMs` の間隔で `syncNow()` を繰り返す。すでに始めていれば何もしない                                                                 |
+| `stop(): void`                                            | 定期同期を止める                                                                                                                           |
+| `close(): Promise<void>`                                  | 定期同期を止め、`setupSync` が開いた DB の接続を閉じる。同期の実行中なら終わるのを待つ。閉じたあとの `syncNow()` と `start()` は例外になる |
+| `getStatus(): SyncStatus`                                 | 現在の状態を返す                                                                                                                           |
+| `getSyncedTables(): string[]`                             | 同期しているテーブル名の一覧を返す                                                                                                         |
+| `on(event: SyncEvent, callback: SyncEventCallback): void` | イベントを受け取る関数を登録する                                                                                                           |
 
 ### `SyncResult`
 
@@ -390,6 +408,7 @@ sync.start()
 process.on('beforeExit', async () => {
   sync.stop()
   await sync.syncNow()
+  await sync.close()
 })
 ```
 

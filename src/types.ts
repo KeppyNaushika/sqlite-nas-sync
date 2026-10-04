@@ -295,6 +295,20 @@ export interface SyncInstance {
    */
   stop(): void
   /**
+   * 定期syncを止め、`setupSync` が開いた DB の接続を閉じる。
+   *
+   * `setupSync` は {@link SyncConfig.dbPath} を自分で開き、その接続はこのインスタンスが
+   * 持ち続ける。閉じないと、プロセスが終わるまでファイルを開いたままになる（Windows では
+   * そのファイルを消せない・置き換えられない）。
+   *
+   * 同期の実行中に呼んだときは、その同期が終わるのを待ってから閉じる。その同期が
+   * 例外で終わっても、閉じることは行う（例外は {@link syncNow} の呼び出し元へ返る）。
+   * 2回目以降の呼び出しは何もしない。
+   *
+   * 閉じたあとの {@link syncNow} と {@link start} は例外を投げる。
+   */
+  close(): Promise<void>
+  /**
    * 現在の同期状態を取得する。
    * @returns 同期状態のスナップショット
    */

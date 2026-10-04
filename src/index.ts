@@ -195,6 +195,9 @@ export function setupSync(config: SyncConfig): SyncInstance {
   // 内部状態
   let intervalHandle: ReturnType<typeof setInterval> | null = null
   let isSyncing = false
+  /** 実行中の同期。`close` が終わりを待つために持つ */
+  let currentSync: Promise<SyncResult> | null = null
+  let isClosed = false
   let lastSyncedAt: Date | null = null
   let lastResult: SyncResult | null = null
   const listeners = new Map<SyncEvent, SyncEventCallback[]>()
@@ -212,6 +215,9 @@ export function setupSync(config: SyncConfig): SyncInstance {
 
   const instance: SyncInstance = {
     async syncNow(): Promise<SyncResult> {
+      if (isClosed) {
+        throw new Error('Sync instance is closed')
+      }
       if (isSyncing) {
         throw new Error('Sync already in progress')
       }
@@ -220,7 +226,8 @@ export function setupSync(config: SyncConfig): SyncInstance {
       emit('sync:start')
 
       try {
-        const result = await performSync(db, resolvedConfig, tables, runtime)
+        currentSync = performSync(db, resolvedConfig, tables, runtime)
+        const result = await currentSync
         // `setupSync` で気づいたことは、最初の1回の結果に載せて持ち主へ渡す
         if (setupWarnings.length > 0) {
           result.warnings.unshift(...setupWarnings)
@@ -235,10 +242,14 @@ export function setupSync(config: SyncConfig): SyncInstance {
         throw error
       } finally {
         isSyncing = false
+        currentSync = null
       }
     },
 
     start(): void {
+      if (isClosed) {
+        throw new Error('Sync instance is closed')
+      }
       if (intervalHandle) return
       const ms = resolvedConfig.intervalMs ?? DEFAULTS.intervalMs
       intervalHandle = setInterval(async () => {
@@ -255,6 +266,20 @@ export function setupSync(config: SyncConfig): SyncInstance {
         clearInterval(intervalHandle)
         intervalHandle = null
       }
+    },
+
+    async close(): Promise<void> {
+      if (isClosed) return
+      isClosed = true
+      instance.stop()
+      if (currentSync) {
+        try {
+          await currentSync
+        } catch {
+          // 同期の例外は syncNow の呼び出し元へ返っている。ここでは閉じることだけを行う
+        }
+      }
+      db.close()
     },
 
     getStatus(): SyncStatus {
@@ -282,6 +307,9 @@ export function setupSync(config: SyncConfig): SyncInstance {
 
 // 公開API: テーブル自動検出
 export { discoverTables } from './validator'
+
+// 公開API: 同期の仕組みを取り除く
+export { removeSync } from './teardown'
 
 // 公開型のre-export
 export type {
