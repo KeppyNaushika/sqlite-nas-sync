@@ -168,9 +168,13 @@ async function writePublishedTables(
  * 記憶装置へ書き出していないページの多いファイルは、閉じる呼び出しが長くかかることがある。
  * macOS の SSD で 285 MB の写しを `DETACH` したとき 50〜125 ms かかり、
  * 先にこれで書き出すと 1 ms 未満になった。
+ *
+ * **書き込みのできる形（`r+`）で開く。** Windows の `FlushFileBuffers` は書き込みの権限を持つ
+ * ハンドルでなければ `ERROR_ACCESS_DENIED` を返し、Node はそれを `EPERM` として投げる。
+ * 読み取り専用（`r`）で開くと、macOS と Linux では通るが Windows では**写しを置くたびに必ず**失敗する。
  */
 async function flushFile(filePath: string): Promise<void> {
-  const handle = await fs.promises.open(filePath, 'r')
+  const handle = await fs.promises.open(filePath, 'r+')
   try {
     await handle.datasync()
   } finally {
