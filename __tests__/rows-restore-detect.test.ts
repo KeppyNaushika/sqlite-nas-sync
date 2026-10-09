@@ -100,9 +100,9 @@ async function publish(db: Database.Database): Promise<void> {
  * ================================================================== */
 
 describe('復元・巻き戻り', () => {
-  it('初回起動（写しが無い）では何も言わない', () => {
+  it('初回起動（写しが無い）では何も言わない', async () => {
     const db = openLocal(join(workDir, 'local.sqlite'), 'iid-1')
-    const report = checkRestoreBeforeImport(db, location())
+    const report = await checkRestoreBeforeImport(db, location())
     expect(report.copyMissing).toBe(true)
     expect(report.restored).toBe(false)
     expect(report.issues).toEqual([])
@@ -117,7 +117,7 @@ describe('復元・巻き戻り', () => {
 
     // `instanceId` は起動のたびに変わる。それだけでは復元ではない
     const second = openLocal(file, 'iid-2')
-    const report = checkRestoreBeforeImport(second, location())
+    const report = await checkRestoreBeforeImport(second, location())
     expect(report.restored).toBe(false)
     expect(report.issues).toEqual([])
     expect(report.copyLastLamport).not.toBeNull()
@@ -151,7 +151,7 @@ describe('復元・巻き戻り', () => {
     copyFileSync(backup, file)
     const restored = new Database(file)
     open.push(restored)
-    const report = checkRestoreBeforeImport(restored, location())
+    const report = await checkRestoreBeforeImport(restored, location())
     expect(report.restored).toBe(true)
     expect(report.issues.map((issue) => issue.kind)).toContain(
       'lamport-behind-copy'
@@ -167,7 +167,7 @@ describe('復元・巻き戻り', () => {
     await publish(db)
     // lamport は据え置きのまま generation だけ巻き戻った形
     writeSnsMeta(db, SNS_META_KEYS.generation, 0)
-    const report = checkRestoreBeforeImport(db, location())
+    const report = await checkRestoreBeforeImport(db, location())
     expect(report.restored).toBe(true)
     expect(report.issues.map((issue) => issue.kind)).toEqual([
       'generation-behind-copy',
@@ -184,19 +184,21 @@ describe('復元・巻き戻り', () => {
     ).lamport
     // 巻き戻った手元を作る
     db.prepare(`UPDATE _sns_clock SET lamport = 0`).run()
-    expect(checkRestoreBeforeImport(db, location()).restored).toBe(true)
+    expect((await checkRestoreBeforeImport(db, location())).restored).toBe(true)
     // 取り込みが lamport を引き上げたあとでは、同じ DB でも言えなくなる
     db.prepare(`UPDATE _sns_clock SET lamport = ?`).run(copyLamport + 10)
-    expect(checkRestoreBeforeImport(db, location()).restored).toBe(false)
+    expect((await checkRestoreBeforeImport(db, location())).restored).toBe(
+      false
+    )
   })
 
-  it('写しが読めないときは、復元とは言わずに知らせるだけ', () => {
+  it('写しが読めないときは、復元とは言わずに知らせるだけ', async () => {
     const db = openLocal(join(workDir, 'local.sqlite'), 'iid-1')
     const path = selfCopyPath(location())
     rmSync(nasPath, { recursive: true, force: true })
     mkdirSync(nasPath, { recursive: true })
     writeFileSync(path, 'これは SQLite の DB ではない')
-    const report = checkRestoreBeforeImport(db, location())
+    const report = await checkRestoreBeforeImport(db, location())
     expect(report.restored).toBe(false)
     expect(report.issues.map((issue) => issue.kind)).toEqual([
       'copy-unreadable',
@@ -212,7 +214,7 @@ describe('写しの取り合い', () => {
   it('自分が書いた直後の写しは、自分のものだと分かる', async () => {
     const db = openLocal(join(workDir, 'local.sqlite'), 'iid-1')
     await publish(db)
-    const report = checkCopyOwnership(db, location())
+    const report = await checkCopyOwnership(db, location())
     expect(report.taken).toBe(false)
     expect(report.copyInstanceId).toBe('iid-1')
   })
@@ -224,15 +226,15 @@ describe('写しの取り合い', () => {
     const other = openLocal(join(workDir, 'other.sqlite'), 'iid-other')
     await copyToNas(other, nasPath, CLIENT, ['notes'])
 
-    const report = checkCopyOwnership(mine, location())
+    const report = await checkCopyOwnership(mine, location())
     expect(report.taken).toBe(true)
     expect(report.copyInstanceId).toBe('iid-other')
     expect(report.message).toContain('同期を止めた')
   })
 
-  it('写しがまだ無ければ何も言わない（初回起動）', () => {
+  it('写しがまだ無ければ何も言わない（初回起動）', async () => {
     const db = openLocal(join(workDir, 'local.sqlite'), 'iid-1')
-    expect(checkCopyOwnership(db, location()).taken).toBe(false)
+    expect((await checkCopyOwnership(db, location())).taken).toBe(false)
   })
 })
 

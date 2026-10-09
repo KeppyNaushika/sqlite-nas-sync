@@ -12,6 +12,8 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
 import { RemoteClient } from './types'
+import { checkIntegrity } from './integrity'
+import type { SyncWorker } from './worker-host'
 import { isPublishedTable, quoteLiteral } from './rows/schema'
 import { escapeIdentifier, isSameIdentifier } from './setup/sql'
 
@@ -551,39 +553,88 @@ export interface RemoteDbHandle {
  * 戻り値の `cleanup()` を呼ぶことで、接続のクローズと一時ファイルの削除が行われる。
  * 呼び忘れると一時ファイルが残り続けるため、必ず `try/finally` で囲むこと。
  *
+ * 中身は {@link copyRemoteToLocal}（写す）と {@link openLocalCopy}（検査して開く）の
+ * 2段である。相手を何人も読む同期は、2段を分けて呼び、写しと検査を重ねる。
+ *
  * @param filePath - NAS上のオリジナルDBファイルパス
  * @param tmpDir - 一時ファイルを置くディレクトリ。未指定なら `os.tmpdir()/sqlite-nas-sync` を使う。本番の同期は渡さない。試験のための差し込み口。
+ * @param worker - 整合性検査を頼むワーカー。未指定なら呼んだスレッドで検査する。
  * @returns ハンドル。コピー失敗・オープン失敗・整合性NG時は `null`。
  */
-export function openRemoteDbViaLocalCopy(
+export async function openRemoteDbViaLocalCopy(
+  filePath: string,
+  tmpDir?: string,
+  worker?: SyncWorker
+): Promise<RemoteDbHandle | null> {
+  const tmpPath = await copyRemoteToLocal(filePath, tmpDir)
+  return tmpPath === null ? null : openLocalCopy(tmpPath, worker)
+}
+
+/**
+ * NAS 上のファイルを手元の一時ファイルへ写す。
+ *
+ * **呼んだスレッドを止めない。** `fs.promises.copyFile` は `copyFileSync` と同じ
+ * `uv_fs_copyfile` を libuv のスレッドプールで行う。開き方も読み方も同じで、
+ * NAS 上のファイルを開いている時間も変わらない。自前で区切って読む形にはしない ——
+ * NAS 上のファイルを長く開いたままにすると、相手が写しを置き換える `rename` を
+ * Windows の SMB が拒みうる。
+ *
+ * @param filePath - NAS上のオリジナルDBファイルパス
+ * @param tmpDir - 一時ファイルを置くディレクトリ（{@link openRemoteDbViaLocalCopy} と同じ）
+ * @returns 一時ファイルの位置。写せなければ `null`（書きかけの一時ファイルは残さない）。例外は投げない
+ */
+export async function copyRemoteToLocal(
   filePath: string,
   tmpDir?: string
-): RemoteDbHandle | null {
+): Promise<string | null> {
   const effectiveTmpDir = tmpDir ?? defaultTmpDir()
   let tmpPath: string | null = null
-
   try {
     ensureDirectory(effectiveTmpDir)
-
     tmpPath = tempCopyPath(effectiveTmpDir, 'remote')
+    await fs.promises.copyFile(filePath, tmpPath)
+    return tmpPath
+  } catch {
+    if (tmpPath) removeRemoteCopyFiles(tmpPath)
+    return null
+  }
+}
 
-    fs.copyFileSync(filePath, tmpPath)
-
-    const db = new Database(tmpPath, { readonly: true })
-    db.pragma('query_only = ON')
-
-    const integrity = db.pragma('integrity_check', { simple: true }) as string
+/**
+ * 手元へ写した DB を検査して、読み取り専用で開く。
+ *
+ * 整合性検査は `worker` で行い、呼んだスレッドを止めない（`src/integrity.ts`）。
+ * 開けなかった・検査に通らなかったときは、一時ファイルを消して `null` を返す。
+ * 例外は投げない。
+ *
+ * @param tmpPath - {@link copyRemoteToLocal} が返した一時ファイル。この関数が持ち主になる
+ * @param worker - 整合性検査を頼むワーカー。未指定なら呼んだスレッドで検査する。
+ */
+export async function openLocalCopy(
+  tmpPath: string,
+  worker?: SyncWorker
+): Promise<RemoteDbHandle | null> {
+  try {
+    // 検査は開く前に済ませる。ワーカーとこのスレッドが同じ写しを同時に開かない
+    const integrity = await checkIntegrity(tmpPath, worker)
     if (integrity !== 'ok') {
-      try {
-        db.close()
-      } catch {
-        /* ignore */
-      }
       removeRemoteCopyFiles(tmpPath)
       return null
     }
 
-    const fileToCleanup = tmpPath
+    const db = new Database(tmpPath, { readonly: true })
+    db.pragma('query_only = ON')
+    // 最初に取ったロックを閉じるまで持ち続ける。写しはロールバックジャーナルの DB で、
+    // 既定（NORMAL）では文を1つ実行するたびにロックを取って放し、ファイルの見出しを
+    // 読み直す。取り込みはキーの数だけ文を実行するので、Windows ではこの出し入れだけで
+    // フルマージが数倍遅くなっていた（N100・相手6台・9,000 行で 17.5 秒 → 4.9 秒）。
+    // 写しはこのプロセスだけが使う一時ファイルなので、持ち続けても誰も待たせない。
+    // WAL の写し（いまの `copyToNas` は置かないが、試験などで作られうる）には当てない。読み取り専用の
+    // WAL の接続を排他にすると、SQLite は `disk I/O error` を返す
+    if (db.pragma('journal_mode', { simple: true }) !== 'wal') {
+      db.pragma('locking_mode = EXCLUSIVE')
+    }
+
     return {
       db,
       cleanup: () => {
@@ -594,13 +645,11 @@ export function openRemoteDbViaLocalCopy(
         } catch {
           /* ignore */
         }
-        removeRemoteCopyFiles(fileToCleanup)
+        removeRemoteCopyFiles(tmpPath)
       },
     }
   } catch {
-    if (tmpPath) {
-      removeRemoteCopyFiles(tmpPath)
-    }
+    removeRemoteCopyFiles(tmpPath)
     return null
   }
 }

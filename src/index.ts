@@ -59,6 +59,7 @@ import { clearRebuildingFlag } from './rows/restore-detect'
 import { createRebuildState } from './rows/rebuild'
 import { RowsSyncRuntime, performSync } from './sync'
 import { createIdleMemory } from './sync/idle'
+import { createSyncWorker } from './worker-host'
 
 /**
  * 同期インスタンスを作成する。
@@ -183,10 +184,12 @@ export function setupSync(config: SyncConfig): SyncInstance {
   // 作り直すと、見送りがいくら続いても k 回目の合流経路へ入れない
   // 無駄な転送を落とすための覚えも、`SyncInstance` が1つ持つ（`src/sync/idle.ts`）。
   // **プロセスの中にしか無い**ので、立ち上げ直せば必ず1回は読み・上げる
+  // ワーカーも1つ持ち、同期をまたいで使い回す（起動は最初に使うとき。`close` で止める）
   const runtime: RowsSyncRuntime = {
     rebuild: createRebuildState(),
     instanceId,
     idle: createIdleMemory(config.suppressIdleSync ?? true),
+    worker: createSyncWorker(),
   }
 
   // 検出済みテーブル名のスナップショット
@@ -279,6 +282,7 @@ export function setupSync(config: SyncConfig): SyncInstance {
           // 同期の例外は syncNow の呼び出し元へ返っている。ここでは閉じることだけを行う
         }
       }
+      await runtime.worker?.close()
       db.close()
     },
 

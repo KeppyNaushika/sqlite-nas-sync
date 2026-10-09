@@ -26,7 +26,6 @@
  */
 import Database from 'better-sqlite3'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
 import {
   DEFAULTS,
   RecordFold,
@@ -47,12 +46,13 @@ import {
 import {
   FileStamp,
   RemoteDbHandle,
+  copyRemoteToLocal,
   copyToNas,
   ensureDirectory,
   fileSize,
   fileStamp,
   listRemoteClients,
-  openRemoteDbViaLocalCopy,
+  openLocalCopy,
 } from '../nas'
 import {
   IdleMemory,
@@ -71,7 +71,6 @@ import {
   RowsRebuildHooks,
   RowsRebuildState,
   createRebuildState,
-  rebuildOnce,
   rebuildOnceInWorker,
 } from '../rows/rebuild'
 import {
@@ -90,6 +89,8 @@ import {
   rowsTableName,
 } from '../rows/schema'
 import { escapeIdentifier } from '../setup/sql'
+import { SyncWorker, createSyncWorker } from '../worker-host'
+import { KeyLookup, keyLookup } from '../rows/key-lookup'
 import { SNS_META_KEYS, readSnsMeta } from '../rows/meta'
 
 /**
@@ -103,9 +104,17 @@ export interface RowsSyncRuntime {
   rebuild: RowsRebuildState
   /** この `setupSync` の端末の id（`sns.instanceId`） */
   instanceId?: string
-  /** 試験のための差し込み口。作り直しの計算に使うワーカーの位置（省略すると `dist` の隣） */
-  workerPath?: string
-  /** 試験のための差し込み口。ワーカーを使わず主スレッドで計算する（試験・検査器） */
+  /**
+   * 写しの整合性検査と作り直しの計算を頼むワーカー（`src/worker-host.ts`）。
+   * 同期をまたいで使い回し、`SyncInstance.close()` で止める。
+   *
+   * **渡さなければ、同期1回ごとに作って、終わりに止める**
+   */
+  worker?: SyncWorker
+  /**
+   * 試験のための差し込み口。ワーカーを使わず主スレッドで計算する（試験・検査器）。
+   * `worker` を渡さないときだけ効く。写しの整合性検査と作り直しの計算の両方に効く
+   */
   forceMainThread?: boolean
   /**
    * 無駄な転送を落とすための覚え（`sync/idle`）。同期をまたいで持ち回る。
@@ -122,12 +131,34 @@ export interface RowsSyncRuntime {
   hooks?: RowsRebuildHooks
 }
 
-/** 同期を1回行う。 */
+/**
+ * 同期を1回行う。
+ *
+ * ワーカーは `runtime.worker` を使い、この回に使わなかったら止める。
+ * `runtime.worker` が無ければこの回だけのものを作り、例外で抜けても必ず止める。
+ */
 export async function performRowsSync(
   localDb: Database.Database,
   config: SyncConfig,
   tables: TableConfig[],
   runtime?: RowsSyncRuntime
+): Promise<SyncResult> {
+  const shared = runtime?.worker
+  const worker =
+    shared ?? createSyncWorker({ forceMainThread: runtime?.forceMainThread })
+  try {
+    return await performRowsSyncWith(localDb, config, tables, runtime, worker)
+  } finally {
+    await (shared === undefined ? worker.close() : worker.endSync())
+  }
+}
+
+async function performRowsSyncWith(
+  localDb: Database.Database,
+  config: SyncConfig,
+  tables: TableConfig[],
+  runtime: RowsSyncRuntime | undefined,
+  worker: SyncWorker
 ): Promise<SyncResult> {
   const state = runtime ?? { rebuild: createRebuildState() }
   const configuredRetentionDays =
@@ -200,7 +231,7 @@ export async function performRowsSync(
   let restored = false
   if (!canSkipRestoreCheck(idle, selfStamp)) {
     const hadCopy = existsSync(selfPath)
-    const restore = checkRestoreBeforeImport(localDb, location)
+    const restore = await checkRestoreBeforeImport(localDb, location, worker)
     if (hadCopy) {
       transfers.selfReads += 1
       transfers.bytes += fileSize(selfPath)
@@ -263,15 +294,31 @@ export async function performRowsSync(
    * -------------------------------------------------------------- */
   ensureDirectory(config.nasPath)
   const remoteClients = listRemoteClients(config.nasPath, config.clientId)
+  // 写すかどうかは、写し始める前に全員ぶん決める。決め手はファイルの印（`stat`）と
+  // 手元の読み位置で、どちらも段階1 のあいだは変わらない（読み位置を進めるのは段階2）。
+  // 印は写すより前に見るので、写した中身より古いことはあっても新しいことは無い
+  const plans = remoteClients.map((remote) => {
+    const stamp = fileStamp(remote.filePath)
+    const lastSeenId = getSyncState(localDb, remote.clientId)
+    return {
+      remote,
+      stamp,
+      lastSeenId,
+      // 前に読んだときと同じファイル・同じ読み位置。読んでも何も起きないことは
+      // そのとき確かめてある（`readWouldBeNoOp`）ので、写さない
+      skipped: canSkipRemoteRead(idle, remote.clientId, stamp, lastSeenId),
+    }
+  })
+  const opening = openPeerCopies(
+    plans.map((plan) => (plan.skipped ? null : plan.remote.filePath)),
+    worker
+  )
   const peers: PeerSlot[] = []
   let hasAnyGap = false
   try {
-    for (const remote of remoteClients) {
-      const stamp = fileStamp(remote.filePath)
-      const lastSeenId = getSyncState(localDb, remote.clientId)
-      if (canSkipRemoteRead(idle, remote.clientId, stamp, lastSeenId)) {
-        // 前に読んだときと同じファイル・同じ読み位置。読んでも何も起きないことは
-        // そのとき確かめてある（`readWouldBeNoOp`）ので、写さない
+    for (const [index, plan] of plans.entries()) {
+      const { remote, stamp, lastSeenId } = plan
+      if (plan.skipped) {
         transfers.peerReadsSkipped += 1
         peers.push({
           remote,
@@ -283,7 +330,7 @@ export async function performRowsSync(
         })
         continue
       }
-      const handle = openRemoteDbViaLocalCopy(remote.filePath)
+      const handle = await opening.handles[index]
       transfers.peerReads += 1
       transfers.bytes += fileSize(remote.filePath)
       // 読みに行った相手の覚えは捨てる。取り込みまで通ったときだけ覚え直す
@@ -331,7 +378,12 @@ export async function performRowsSync(
       // そのときだけ、中身を読みに行かずに済ませる（§3.10 の判定は変わらない）
       const mine = written !== null && nowStamp !== null && written === nowStamp
       if (!mine) {
-        const ownership = checkCopyOwnership(localDb, location, instanceId)
+        const ownership = await checkCopyOwnership(
+          localDb,
+          location,
+          instanceId,
+          worker
+        )
         transfers.selfReads += 1
         transfers.bytes += fileSize(selfPath)
         if (ownership.taken) {
@@ -362,7 +414,7 @@ export async function performRowsSync(
     let rebuildFailed = false
     let rebuildError: unknown
     try {
-      await rebuild(localDb, config, tableNames, state, result)
+      await rebuild(localDb, config, tableNames, state, worker, result)
       reportHiddenChanges(localDb, hiddenBefore, unplaceableBefore, result)
     } catch (error) {
       rebuildFailed = true
@@ -383,7 +435,10 @@ export async function performRowsSync(
     if (rebuildFailed) throw rebuildError
     if (!published) return stop(localDb, config, result)
   } finally {
-    for (const peer of peers) peer.handle?.cleanup()
+    // 例外で抜けたときも、まだ写していない相手は写さず、写しかけ・検査待ちの写しは
+    // 終わるのを待って片付ける
+    opening.stop()
+    for (const handle of await Promise.all(opening.handles)) handle?.cleanup()
   }
 
   /* -------------------------------------------------------------- *
@@ -416,6 +471,49 @@ function stop(
 /* ------------------------------------------------------------------ *
  * 取り込み（§4.3）
  * ------------------------------------------------------------------ */
+
+/** {@link openPeerCopies} の結果。 */
+export interface PeerCopies {
+  /** 渡した並びの、それぞれの写しを開いた手（写さない位置と、開けなかった位置は `null`）。どれも reject しない */
+  handles: Promise<RemoteDbHandle | null>[]
+  /** まだ写し始めていない相手を写さない（片付けの前に呼ぶ） */
+  stop: () => void
+}
+
+/**
+ * 相手の写しを1人ずつ順に手元へ写し、写し終えたものから検査して開く。
+ *
+ * NAS から読むのはいつも1つずつで、写す順も読み方も以前と同じである。そのうえで、
+ * ある相手の整合性検査（ワーカー）は、次の相手を写している間に進む。1人ずつ
+ * 「写す → 検査を待つ」を繰り返すと、同期にかかる時間は全員の写しと検査の和になる。
+ * こうすると、ほぼ写しの和で済む。NAS から同時に何本も読む形にはしない。相手が
+ * 写しを置き換える `rename` を Windows の SMB が拒みうる時間が延びるからである。
+ *
+ * @param paths 相手の写しの位置。`null` の位置は写さない
+ */
+export function openPeerCopies(
+  paths: (string | null)[],
+  worker: SyncWorker
+): PeerCopies {
+  let stopped = false
+  let copying: Promise<unknown> = Promise.resolve()
+  const handles = paths.map((filePath) => {
+    if (filePath === null) return Promise.resolve(null)
+    const copied = copying.then(() =>
+      stopped ? null : copyRemoteToLocal(filePath)
+    )
+    copying = copied
+    return copied.then((tmpPath) =>
+      tmpPath === null ? null : openLocalCopy(tmpPath, worker)
+    )
+  })
+  return {
+    handles,
+    stop: () => {
+      stopped = true
+    },
+  }
+}
 
 /** 相手1人ぶんの、この回の段取り（段階1 で決めて段階2 で使う）。 */
 interface PeerSlot {
@@ -661,24 +759,18 @@ async function rebuild(
   config: SyncConfig,
   tableNames: string[],
   runtime: RowsSyncRuntime,
+  worker: SyncWorker,
   result: SyncResult
 ): Promise<void> {
-  const workerPath =
-    runtime.workerPath ?? join(__dirname, '..', 'rows', 'rebuild-worker.js')
-  // ワーカーの入口が組み上がっていない（TypeScript のまま走らせている・
-  // 束ねられている）ときは、主スレッドで計算する。黙って落ちるより、
-  // 遅くても作り直しが進むほうがよい
-  const useWorker = runtime.forceMainThread !== true && existsSync(workerPath)
-  const options = {
+  // ワーカーが答えを返さなければ（入口の JS が無い・起動できない・落ちた）、
+  // 主スレッドで計算する。黙って落ちるより、遅くても作り直しが進むほうがよい
+  const outcome = await rebuildOnceInWorker(localDb, {
     tables: tableNames,
     state: runtime.rebuild,
     dbPath: config.dbPath,
-    workerPath,
+    worker,
     hooks: runtime.hooks,
-  }
-  const outcome = useWorker
-    ? await rebuildOnceInWorker(localDb, options)
-    : rebuildOnce(localDb, options)
+  })
 
   result.inserted += outcome.counts.inserted
   result.updated += outcome.counts.updated
@@ -828,20 +920,27 @@ function contentLookup(
   db: Database.Database
 ): (tableName: string, trueId: string) => Record<string, unknown> {
   const hidden = new Set<string>(Object.values(VERSION_COLUMNS))
-  const statements = new Map<string, Database.Statement>()
+  const statements = new Map<
+    string,
+    { statement: Database.Statement; lookup: KeyLookup }
+  >()
   return (tableName, trueId) => {
     const rows = rowsTableName(tableName)
     if (!tableExists(db, rows)) return {}
-    let statement = statements.get(tableName)
-    if (statement === undefined) {
-      const primaryKey = escapeIdentifier(primaryKeyColumn(db, tableName).name)
-      statement = db.prepare(
-        `SELECT * FROM ${escapeIdentifier(rows)}
-          WHERE CAST(${primaryKey} AS TEXT) = ? LIMIT 1`
-      )
-      statements.set(tableName, statement)
+    let prepared = statements.get(tableName)
+    if (prepared === undefined) {
+      const lookup = keyLookup(db, rows, primaryKeyColumn(db, tableName).name)
+      prepared = {
+        statement: db.prepare(
+          `SELECT * FROM ${escapeIdentifier(rows)}
+            WHERE ${lookup.sql} LIMIT 1`
+        ),
+        lookup,
+      }
+      statements.set(tableName, prepared)
     }
-    const row = statement.get(trueId) as Record<string, unknown> | undefined
+    const row = prepared.statement.get(...prepared.lookup.bind(trueId)) as
+      Record<string, unknown> | undefined
     const picked: Record<string, unknown> = {}
     for (const [column, value] of Object.entries(row ?? {})) {
       if (!hidden.has(column)) picked[column] = value
@@ -872,23 +971,28 @@ function placedLookup(
   const shownByOther = db.prepare(
     `SELECT 1 FROM "_sns_shown" WHERE "tableName" = ? AND "shownId" = ?`
   )
-  const rowExists = new Map<string, Database.Statement>()
+  const rowExists = new Map<string, (key: string) => boolean>()
   return (tableName, trueId) => {
     if (!tableExists(db, tableName)) return false
     let exists = rowExists.get(tableName)
     if (exists === undefined) {
-      const primaryKey = escapeIdentifier(primaryKeyColumn(db, tableName).name)
-      exists = db.prepare(
-        `SELECT 1 FROM ${escapeIdentifier(tableName)}
-          WHERE CAST(${primaryKey} AS TEXT) = ? LIMIT 1`
+      const lookup = keyLookup(
+        db,
+        tableName,
+        primaryKeyColumn(db, tableName).name
       )
+      const statement = db.prepare(
+        `SELECT 1 FROM ${escapeIdentifier(tableName)}
+          WHERE ${lookup.sql} LIMIT 1`
+      )
+      exists = (key) => statement.get(...lookup.bind(key)) !== undefined
       rowExists.set(tableName, exists)
     }
     const shown = shownOf.get(tableName, trueId) as
       { shownId: string } | undefined
-    if (shown !== undefined) return exists.get(shown.shownId) !== undefined
+    if (shown !== undefined) return exists(shown.shownId)
     if (shownByOther.get(tableName, trueId) !== undefined) return false
-    return exists.get(trueId) !== undefined
+    return exists(trueId)
   }
 }
 

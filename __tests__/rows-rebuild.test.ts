@@ -28,9 +28,11 @@ import {
   createRebuildState,
   rebuildDiffCount,
   rebuildOnce,
+  rebuildOnceInWorker,
 } from '../src/rows/rebuild'
 import { RowsTableSpec, createRowsTables } from '../src/rows/schema'
 import { createRowsTriggers } from '../src/rows/triggers'
+import { createSyncWorker } from '../src/worker-host'
 
 const NOTES = `CREATE TABLE notes (
   id        TEXT PRIMARY KEY NOT NULL,
@@ -704,7 +706,8 @@ describe('作り直し —— worker_threads で計算する', () => {
       [
         'tsc',
         '--ignoreConfig',
-        'src/rows/rebuild-worker.ts',
+        'src/worker.ts',
+        'src/worker-host.ts',
         '--outDir',
         build,
         '--module',
@@ -718,8 +721,9 @@ describe('作り直し —— worker_threads で計算する', () => {
       ],
       { cwd: process.cwd(), stdio: 'pipe' }
     )
-    const workerPath = join(build, 'rows', 'rebuild-worker.js')
+    const workerPath = join(build, 'worker.js')
     expect(existsSync(workerPath)).toBe(true)
+    const worker = createSyncWorker({ workerPath })
 
     const path = join(dir, 'mine.sqlite')
     const mine = openClient('aaaa', { path })
@@ -734,11 +738,14 @@ describe('作り直し —— worker_threads で計算する', () => {
       peer.prepare(`DELETE FROM notes WHERE id = 'k2'`).run()
       seedFromPeer(mine, peer)
 
-      const fromWorker = await computeRebuildPlanInWorker({
+      const computed = await computeRebuildPlanInWorker({
         dbPath: path,
         tables: ['notes'],
-        workerPath,
+        worker,
       })
+      // ワーカーが答えている（主スレッドへ落ちていない）
+      expect(computed).not.toBeNull()
+      const fromWorker = computed!
       const fromMain = computeRebuildPlan(mine, { tables: ['notes'] })
       expect(fromWorker.token).toEqual(fromMain.token)
       expect(fromWorker.apply).toEqual(fromMain.apply)
@@ -747,10 +754,36 @@ describe('作り直し —— worker_threads で計算する', () => {
       // アプリの表は空のまま（ワーカーは読むだけ）
       expect(notesOf(mine)).toEqual([])
     } finally {
+      await worker.close()
       mine.close()
       peer.close()
     }
   }, 60000)
+
+  it('ワーカーが答えを返さなければ、主スレッドで計算して作り直す', async () => {
+    const dir = scratchDir()
+    const path = join(dir, 'mine.sqlite')
+    const mine = openClient('aaaa', { path })
+    const peer = openClient('bbbb')
+    const worker = createSyncWorker({ workerPath: join(dir, 'no-such.js') })
+    try {
+      peer
+        .prepare(`INSERT INTO notes VALUES ('k1', '相手', 'x', '2026-02-01')`)
+        .run()
+      seedFromPeer(mine, peer)
+      const outcome = await rebuildOnceInWorker(mine, {
+        tables: ['notes'],
+        dbPath: path,
+        worker,
+      })
+      expect(outcome.status).toBe('applied')
+      expect(notesOf(mine).map((row) => row.id)).toEqual(['k1'])
+    } finally {
+      await worker.close()
+      mine.close()
+      peer.close()
+    }
+  })
 })
 
 /* ================================================================== *

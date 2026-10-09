@@ -28,8 +28,6 @@
  * @internal
  */
 import Database from 'better-sqlite3'
-import { join } from 'node:path'
-import { Worker } from 'node:worker_threads'
 import { escapeIdentifier, foldIdentifier } from '../setup/sql'
 import { missingParentAction } from './on-delete'
 import {
@@ -45,6 +43,7 @@ import {
 import { RowsColumn } from './schema'
 import { canonicalTableSpecs } from './table-name'
 import { SqlValue, ValueOrdering } from './versions'
+import type { SyncWorker } from '../worker-host'
 
 /** 合流経路に落ちるまでの見送りの回数（設計書 §3.7.4 の k）。 */
 const MERGE_AFTER_SKIPS = 3
@@ -231,11 +230,8 @@ interface RebuildWorkerOptions {
   dbPath: string
   tables: string[]
   excluded?: readonly string[]
-  /**
-   * ワーカーの入口の位置。既定は同じ場所の `rebuild-worker.js`
-   * （`dist/` では隣にある。試験からは、組み上げた JS を指す）
-   */
-  workerPath?: string
+  /** 計算を頼むワーカー（`src/worker-host.ts`） */
+  worker: SyncWorker
 }
 
 /**
@@ -243,51 +239,32 @@ interface RebuildWorkerOptions {
  *
  * 計算のあいだ主スレッドは空くので、アプリの書き込みは待たされない。その代わり
  * 計算中の書き込みは token で捕まえて見送る。
+ *
+ * @returns 計画。ワーカーが答えを返さなかったら `null`（呼ぶ側が主スレッドで計算し直す）
  */
-export function computeRebuildPlanInWorker(
+export async function computeRebuildPlanInWorker(
   options: RebuildWorkerOptions
-): Promise<RebuildPlan> {
-  const workerPath = options.workerPath ?? join(__dirname, 'rebuild-worker.js')
-  const input = {
+): Promise<RebuildPlan | null> {
+  const outcome = await options.worker.run({
+    kind: 'rebuild-plan',
     dbPath: options.dbPath,
     options: {
       tables: options.tables,
       excluded:
         options.excluded === undefined ? undefined : [...options.excluded],
     },
-  }
-  return new Promise<RebuildPlan>((resolve, reject) => {
-    const worker = new Worker(workerPath, { workerData: input })
-    let settled = false
-    worker.on('message', (message: unknown) => {
-      settled = true
-      const output = message as
-        { ok: true; plan: RebuildPlan } | { ok: false; message: string }
-      void worker.terminate()
-      if (output.ok) {
-        // BLOB は構造化複製で `Uint8Array` になる。`Buffer` へ戻さないと
-        // better-sqlite3 の束縛が BLOB として受け取らない
-        resolve(reviveRebuildPlan(output.plan))
-        return
-      }
-      reject(new Error(`作り直しの計算がワーカーで失敗した: ${output.message}`))
-    })
-    worker.on('error', (error) => {
-      settled = true
-      reject(error)
-    })
-    worker.on('exit', (code) => {
-      if (settled) return
-      reject(new Error(`作り直しのワーカーが ${String(code)} で終わった`))
-    })
   })
+  // BLOB は構造化複製で `Uint8Array` になる。`Buffer` へ戻さないと
+  // better-sqlite3 の束縛が BLOB として受け取らない
+  return outcome.done ? reviveRebuildPlan(outcome.value) : null
 }
 
 /**
  * ワーカーで計算して、主スレッドで適用する（本番の経路）。
  *
  * 見送りが続いたときは、**計算も適用も主スレッドの1つのトランザクション**で
- * 行う経路（合流経路）へ落ちる（設計書 §3.7.4）。
+ * 行う経路（合流経路）へ落ちる（設計書 §3.7.4）。ワーカーが答えを返さなかった
+ * ときは、主スレッドで計算して適用する（{@link rebuildOnce}）。
  */
 export async function rebuildOnceInWorker(
   db: Database.Database,
@@ -311,6 +288,7 @@ export async function rebuildOnceInWorker(
     tables,
     excluded: [...state.excluded],
   })
+  if (plan === null) return rebuildOnce(db, { ...options, state })
   return applyRebuild(
     db,
     tables,

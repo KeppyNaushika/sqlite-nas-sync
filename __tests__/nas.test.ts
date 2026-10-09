@@ -10,12 +10,12 @@ import {
   openRemoteDbViaLocalCopy,
 } from '../src/nas'
 
-describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
+describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', async () => {
   const testDir = path.join(__dirname, 'test-data-nas')
   const tmpDir = path.join(testDir, 'tmp')
   const srcPath = path.join(testDir, 'remote.sqlite')
 
-  beforeEach(() => {
+  beforeEach(async () => {
     fs.mkdirSync(testDir, { recursive: true })
     const db = new Database(srcPath)
     db.exec(`CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)`)
@@ -23,14 +23,14 @@ describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
     db.close()
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     if (fs.existsSync(testDir)) {
       fs.rmSync(testDir, { recursive: true })
     }
   })
 
-  it('リモートDBファイルをローカルtmpにコピーしてから開く', () => {
-    const handle = openRemoteDbViaLocalCopy(srcPath, tmpDir)
+  it('リモートDBファイルをローカルtmpにコピーしてから開く', async () => {
+    const handle = await openRemoteDbViaLocalCopy(srcPath, tmpDir)
     expect(handle).not.toBeNull()
     const row = handle!.db.prepare(`SELECT v FROM t WHERE id = ?`).get('a') as {
       v: string
@@ -51,8 +51,8 @@ describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
     expect(tmpAfter.length).toBe(0)
   })
 
-  it('読み取り中にオリジナルが置き換わってもローカルコピーは影響を受けない', () => {
-    const handle = openRemoteDbViaLocalCopy(srcPath, tmpDir)
+  it('読み取り中にオリジナルが置き換わってもローカルコピーは影響を受けない', async () => {
+    const handle = await openRemoteDbViaLocalCopy(srcPath, tmpDir)
     expect(handle).not.toBeNull()
 
     // オリジナルを書き換え
@@ -69,19 +69,19 @@ describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
     handle!.cleanup()
   })
 
-  it('存在しないファイルを開こうとすると null を返す', () => {
-    const handle = openRemoteDbViaLocalCopy(
+  it('存在しないファイルを開こうとすると null を返す', async () => {
+    const handle = await openRemoteDbViaLocalCopy(
       path.join(testDir, 'does-not-exist.sqlite'),
       tmpDir
     )
     expect(handle).toBeNull()
   })
 
-  it('破損ファイルを開こうとすると null を返し、tmp も残らない', () => {
+  it('破損ファイルを開こうとすると null を返し、tmp も残らない', async () => {
     const badPath = path.join(testDir, 'bad.sqlite')
     fs.writeFileSync(badPath, 'this is not a sqlite database')
 
-    const handle = openRemoteDbViaLocalCopy(badPath, tmpDir)
+    const handle = await openRemoteDbViaLocalCopy(badPath, tmpDir)
     expect(handle).toBeNull()
 
     // tmp ディレクトリに残骸が無いこと
@@ -93,8 +93,8 @@ describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
     }
   })
 
-  it('tmpDir を省略すると os.tmpdir() 配下を使う', () => {
-    const handle = openRemoteDbViaLocalCopy(srcPath)
+  it('tmpDir を省略すると os.tmpdir() 配下を使う', async () => {
+    const handle = await openRemoteDbViaLocalCopy(srcPath)
     expect(handle).not.toBeNull()
 
     const expectedDir = path.join(os.tmpdir(), 'sqlite-nas-sync')
@@ -103,9 +103,9 @@ describe('openRemoteDbViaLocalCopy —— 手元へ写して開く', () => {
     handle!.cleanup()
   })
 
-  it('並行して複数開いても tmp ファイル名が衝突しない', () => {
-    const handles = Array.from({ length: 5 }, () =>
-      openRemoteDbViaLocalCopy(srcPath, tmpDir)
+  it('並行して複数開いても tmp ファイル名が衝突しない', async () => {
+    const handles = await Promise.all(
+      Array.from({ length: 5 }, () => openRemoteDbViaLocalCopy(srcPath, tmpDir))
     )
     for (const h of handles) {
       expect(h).not.toBeNull()
@@ -243,7 +243,7 @@ describe('NASが思いどおりでないとき', () => {
       await copyToNas(db, nasDir, 'me', [])
       db.close()
 
-      const handle = openRemoteDbViaLocalCopy(
+      const handle = await openRemoteDbViaLocalCopy(
         path.join(nasDir, 'client-me.sqlite'),
         path.join(testDir, 'tmp3')
       )
@@ -328,7 +328,7 @@ describe('NASが思いどおりでないとき', () => {
   })
 
   describe('openRemoteDbViaLocalCopy —— 一時領域や元のファイルが使えないとき', () => {
-    it('tmpDir を作れない場所でも例外にせず null を返す', () => {
+    it('tmpDir を作れない場所でも例外にせず null を返す', async () => {
       // 一時領域が用意できないのは、同期を止める理由にはなるが、
       // 呼び出し元を落とす理由にはならない（他の相手とは同期を続ける）。
       const srcPath = path.join(testDir, 'src.sqlite')
@@ -339,14 +339,14 @@ describe('NASが思いどおりでないとき', () => {
       const blocker = path.join(testDir, 'blocker')
       fs.writeFileSync(blocker, '') // ディレクトリを作れない場所（ファイルが居座る）
 
-      const handle = openRemoteDbViaLocalCopy(
+      const handle = await openRemoteDbViaLocalCopy(
         srcPath,
         path.join(blocker, 'tmp')
       )
       expect(handle).toBeNull()
     })
 
-    it('中身が途中までのSQLiteファイルは null を返す', () => {
+    it('中身が途中までのSQLiteファイルは null を返す', async () => {
       // rename 前の .tmp を覗いた、コピーが途中で切れた、といった形。
       const srcPath = path.join(testDir, 'truncated.sqlite')
       const db = new Database(srcPath)
@@ -367,7 +367,7 @@ describe('NASが思いどおりでないとき', () => {
         full.subarray(0, Math.floor(full.length / 2))
       )
 
-      const handle = openRemoteDbViaLocalCopy(
+      const handle = await openRemoteDbViaLocalCopy(
         truncatedPath,
         path.join(testDir, 'tmp-truncated')
       )

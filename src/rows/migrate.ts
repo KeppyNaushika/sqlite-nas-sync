@@ -64,6 +64,7 @@ import {
   strongerSql,
 } from './triggers'
 import { SqlValue } from './versions'
+import { hasTextAffinity, keyMatchSql } from './key-lookup'
 
 /** {@link migrateToRows} の設定。 */
 interface RowsMigrationOptions {
@@ -1057,12 +1058,13 @@ function hasOrphanRows(
 ): boolean {
   const rows = escapeIdentifier(rowsTableName(spec.name))
   const key = escapeIdentifier(pk.name)
+  // 相手はアプリの表の主キーで引く（`r` の行ごとに表を全部なめると、行数の2乗になる）
   const found = db
     .prepare(
       `SELECT 1 AS found FROM ${rows} AS "r"
         WHERE NOT EXISTS (
           SELECT 1 FROM ${escapeIdentifier(spec.name)} AS "a"
-           WHERE CAST("a".${key} AS TEXT) = CAST("r".${key} AS TEXT))
+           WHERE ${keyMatchSql(`"a".${key}`, `CAST("r".${key} AS TEXT)`, hasTextAffinity(pk.type))})
         LIMIT 1`
     )
     .get()

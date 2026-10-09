@@ -460,3 +460,41 @@ describe('0.21.0 で作った DB を setupSync で開くと、トリガーが置
     SLOW
   )
 })
+
+describe('削除のトリガーは _sns_rows_<表> を主キーの索引で引く', () => {
+  /**
+   * アプリが行を1つ消すたびに、統合された側の後始末の文が動く。以前は
+   * `CAST(主キー AS TEXT) IN (…)` で、隠れた行が無くても毎回表を全部なめていた
+   * （9,000 行で1回あたり約 0.45 ms）。索引を使う形と、答えが元の条件と同じことは
+   * `rows-key-lookup.test.ts` が確かめる。ここでは、トリガーがその形を使っていることを見る。
+   */
+  function deleteTriggerOf(type: string): string {
+    const db = new Database(':memory:')
+    try {
+      db.exec(
+        `CREATE TABLE notes (id ${type} PRIMARY KEY, title TEXT, updatedAt TEXT)`
+      )
+      createRowsTables(db, [{ name: 'notes' }], 'a'.repeat(32))
+      createRowsTriggers(db, [{ name: 'notes' }])
+      return db
+        .prepare(`SELECT sql FROM sqlite_master WHERE name = ?`)
+        .pluck()
+        .get('_sns_before_delete_notes') as string
+    } finally {
+      db.close()
+    }
+  }
+
+  it('TEXT の主キー: 元の条件だけで引く箇所が無い', () => {
+    const sql = deleteTriggerOf('TEXT')
+    // 統合された側の削除の版（相関副問い合わせ）と、後始末の DELETE の2か所
+    expect(sql.match(/"id" >= X''/g)).toHaveLength(2)
+    expect(sql).not.toMatch(/WHERE CAST\("id" AS TEXT\) (=|IN)/)
+  })
+
+  it('TEXT 親和性でない主キー: 元の条件のまま', () => {
+    const sql = deleteTriggerOf('INTEGER')
+    expect(sql).not.toContain(`X''`)
+    expect(sql).toMatch(/WHERE CAST\("id" AS TEXT\) IN/)
+  })
+})
