@@ -48,6 +48,7 @@ import {
   syncedColumns,
 } from './schema'
 import { TIME_GROUP, timeGroupSql } from './versions'
+import { hasTextAffinity, keyInSql, keyMatchSql } from './key-lookup'
 
 /* ------------------------------------------------------------------ *
  * §3.3 生成に使う式
@@ -476,7 +477,7 @@ function hiddenBehindSql(parts: TableParts, keyText: string): string {
 function mergedTombstoneSql(parts: TableParts, keyText: string): string {
   const pk = escapeIdentifier(parts.primaryKey.name)
   const heldTs = `(SELECT ${escapeIdentifier(VERSION_COLUMNS.ts)} FROM ${parts.rows}
-         WHERE CAST(${pk} AS TEXT) = "h"."trueId")`
+         WHERE ${keyMatchSql(pk, '"h"."trueId"', hasTextAffinity(parts.primaryKey.type))})`
   const hiddenTs = maxTsSql([
     deletedAtSql(parts),
     heldTs,
@@ -521,8 +522,11 @@ function mergedRowsCleanupSql(parts: TableParts, keyText: string): string {
     lamport: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
     instance: `${parts.rows}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
   }
+  // アプリが行を消すたびに動く。`CAST(主キー AS TEXT) IN (…)` だけだと索引が使えず、
+  // 隠れた行が無くても毎回表を全部なめる
+  const hidden = `SELECT "h"."trueId" ${hiddenBehindSql(parts, keyText)}`
   return `DELETE FROM ${parts.rows}
-       WHERE CAST(${pk} AS TEXT) IN (SELECT "h"."trueId" ${hiddenBehindSql(parts, keyText)})
+       WHERE ${keyInSql(pk, hidden, hasTextAffinity(parts.primaryKey.type))}
          AND EXISTS (SELECT 1 FROM "_tombstone" AS "tb"
                WHERE "tb"."tableName" = ${parts.literal}
                  AND "tb"."recordId" = CAST(${parts.rows}.${pk} AS TEXT)

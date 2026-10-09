@@ -67,8 +67,8 @@ describe('openRemoteDbViaLocalCopy の後片付け', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
-  it('cleanup() が -wal / -shm も消す', () => {
-    const handle = openRemoteDbViaLocalCopy(srcPath, tmpDir)
+  it('cleanup() が -wal / -shm も消す', async () => {
+    const handle = await openRemoteDbViaLocalCopy(srcPath, tmpDir)
     expect(handle).not.toBeNull()
 
     // 読むと副ファイルが作られる（作られない環境ならこの検査は無意味になるので、
@@ -84,7 +84,7 @@ describe('openRemoteDbViaLocalCopy の後片付け', () => {
     expect(listRemnants(tmpDir)).toEqual([])
   })
 
-  it('整合性NGで null を返すときも副ファイルを残さない', () => {
+  it('整合性NGで null を返すときも副ファイルを残さない', async () => {
     const badPath = path.join(dir, 'bad.sqlite')
     // SQLiteのヘッダだけ本物に見せかけた壊れたファイル。
     // コピーは成功し、オープンか integrity_check で落ちる経路を通す。
@@ -93,7 +93,7 @@ describe('openRemoteDbViaLocalCopy の後片付け', () => {
     broken.fill(0x5a, 200, Math.min(broken.length, 4000))
     fs.writeFileSync(badPath, broken)
 
-    expect(openRemoteDbViaLocalCopy(badPath, tmpDir)).toBeNull()
+    expect(await openRemoteDbViaLocalCopy(badPath, tmpDir)).toBeNull()
     expect(listRemnants(tmpDir)).toEqual([])
   })
 })

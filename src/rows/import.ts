@@ -37,6 +37,7 @@ import {
   syncedColumns,
 } from './schema'
 import { canonicalTableSpecs } from './table-name'
+import { KeyLookup, keyLookup } from './key-lookup'
 import { strongerSql } from './triggers'
 import { RowVersion, SqlValue, ValueOrdering } from './versions'
 
@@ -382,6 +383,7 @@ class ImportIo {
   readonly skippedTables: { table: string; reason: string }[] = []
   private readonly tables = new Map<string, TableIo | null>()
   private readonly statements = new Map<string, Database.Statement>()
+  private readonly lookups = new Map<string, KeyLookup>()
   private readonly peerHasTombstone: boolean
 
   constructor(
@@ -478,10 +480,12 @@ class ImportIo {
           selected.push(escapeIdentifier(column))
         }
         return `SELECT ${selected.join(', ')} FROM ${escapeIdentifier(table.rowsTable)}
-                 WHERE CAST(${escapeIdentifier(table.primaryKey)} AS TEXT) = ?`
+                 WHERE ${this.lookupOf(this.peerDb, table).sql}`
       }
     )
-    const row = statement.get(key) as Record<string, SqlValue> | undefined
+    const row = statement.get(
+      ...this.lookupOf(this.peerDb, table).bind(key)
+    ) as Record<string, SqlValue> | undefined
     return this.toRowClaim(table, row)
   }
 
@@ -492,9 +496,10 @@ class ImportIo {
       `local-row:${table.name}`,
       () =>
         `SELECT * FROM ${escapeIdentifier(table.rowsTable)}
-          WHERE CAST(${escapeIdentifier(table.primaryKey)} AS TEXT) = ?`
+          WHERE ${this.lookupOf(this.db, table).sql}`
     )
-    const row = statement.get(key) as Record<string, SqlValue> | undefined
+    const row = statement.get(...this.lookupOf(this.db, table).bind(key)) as
+      Record<string, SqlValue> | undefined
     return this.toRowClaim(table, row)
   }
 
@@ -583,8 +588,8 @@ class ImportIo {
       `delete-row:${table.name}`,
       () =>
         `DELETE FROM ${escapeIdentifier(table.rowsTable)}
-          WHERE CAST(${escapeIdentifier(table.primaryKey)} AS TEXT) = ?`
-    ).run(key)
+          WHERE ${this.lookupOf(this.db, table).sql}`
+    ).run(...this.lookupOf(this.db, table).bind(key))
   }
 
   /** `_tombstone` へ（**受け取った版をそのまま**）書く。 */
@@ -695,6 +700,19 @@ class ImportIo {
     if (version === null) return null
     version.kind = 'delete'
     return { version, tombstone: row }
+  }
+
+  /**
+   * `_sns_rows_<t>` を真の id で引く条件（{@link keyLookup}）。DB と表ごとに1回だけ作る。
+   * 相手の写しと手元は別の DB なので、親和性はそれぞれの宣言で決める
+   */
+  private lookupOf(db: Database.Database, table: TableIo): KeyLookup {
+    const cacheKey = `${db === this.db ? 'local' : 'peer'}:${table.name}`
+    const cached = this.lookups.get(cacheKey)
+    if (cached !== undefined) return cached
+    const lookup = keyLookup(db, table.rowsTable, table.primaryKey)
+    this.lookups.set(cacheKey, lookup)
+    return lookup
   }
 
   private prepare(

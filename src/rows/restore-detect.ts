@@ -28,6 +28,7 @@ import * as path from 'path'
 import Database from 'better-sqlite3'
 import { fullMergeCursor } from '../changelog'
 import { openRemoteDbViaLocalCopy } from '../nas'
+import type { SyncWorker } from '../worker-host'
 import { escapeIdentifier } from '../setup/sql'
 import {
   SNS_META_KEYS,
@@ -220,10 +221,11 @@ interface RowsRestoreReport {
  *
  * 写しが無ければ何も言わない —— 初回起動がそれで、誤検出してはいけない。
  */
-export function checkRestoreBeforeImport(
+export async function checkRestoreBeforeImport(
   db: Database.Database,
-  location: RowsCopyLocation
-): RowsRestoreReport {
+  location: RowsCopyLocation,
+  worker?: SyncWorker
+): Promise<RowsRestoreReport> {
   const report: RowsRestoreReport = {
     issues: [],
     restored: false,
@@ -237,7 +239,11 @@ export function checkRestoreBeforeImport(
     report.copyMissing = true
     return report
   }
-  const handle = openRemoteDbViaLocalCopy(filePath, location.tmpDir)
+  const handle = await openRemoteDbViaLocalCopy(
+    filePath,
+    location.tmpDir,
+    worker
+  )
   if (handle === null) {
     report.issues.push({
       kind: 'copy-unreadable',
@@ -313,11 +319,12 @@ interface RowsCopyOwnershipReport {
  * 取り合いが起きていたら**同期を止める** —— 2台が同じクライアント id を名乗ると、
  * 互いの写しを上書きし合って、どちらの事実も相手へ届かない。
  */
-export function checkCopyOwnership(
+export async function checkCopyOwnership(
   db: Database.Database,
   location: RowsCopyLocation,
-  instanceId?: string
-): RowsCopyOwnershipReport {
+  instanceId?: string,
+  worker?: SyncWorker
+): Promise<RowsCopyOwnershipReport> {
   const mine =
     instanceId ??
     readSnsMeta(db, SNS_META_KEYS.instanceId) ??
@@ -330,7 +337,11 @@ export function checkCopyOwnership(
   }
   const filePath = selfCopyPath(location)
   if (!fs.existsSync(filePath)) return report
-  const handle = openRemoteDbViaLocalCopy(filePath, location.tmpDir)
+  const handle = await openRemoteDbViaLocalCopy(
+    filePath,
+    location.tmpDir,
+    worker
+  )
   if (handle === null) return report
   try {
     report.copyInstanceId =

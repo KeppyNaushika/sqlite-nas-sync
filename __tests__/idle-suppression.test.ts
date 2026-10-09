@@ -18,22 +18,22 @@ import { FORCE_EVERY } from '../src/sync/idle'
 import { performSync } from '../src/sync'
 import { createRebuildState } from '../src/rows/rebuild'
 
-/** 手元へ写した回数を数える（写した直後の `query_only = ON` を数える）。 */
+/**
+ * 手元へ写した回数を数える。NAS 上のファイルを手元の一時ファイル（`remote-*.sqlite`）へ
+ * 写す `fs.promises.copyFile` を数える。`SyncTransfers` の数え方とは別に、
+ * 写したという出来事そのものを数えるので、両者の突き合わせが検査になる。
+ */
 const copyCounter = { copies: 0 }
-type PragmaHost = { name: string }
-const dbProto = Database.prototype as unknown as {
-  pragma: (source: string, options?: unknown) => unknown
-}
-const realPragma = dbProto.pragma
-dbProto.pragma = function counted(
-  this: PragmaHost,
-  source: string,
-  options?: unknown
-): unknown {
-  if (source === 'query_only = ON' && /remote-.*\.sqlite$/.test(this.name)) {
+const realCopyFile = fs.promises.copyFile
+fs.promises.copyFile = function counted(
+  source: fs.PathLike,
+  destination: fs.PathLike,
+  mode?: number
+): Promise<void> {
+  if (/remote-[^/\\]*\.sqlite$/.test(String(destination))) {
     copyCounter.copies += 1
   }
-  return realPragma.call(this, source, options)
+  return realCopyFile(source, destination, mode)
 }
 
 describe('無駄な転送の抑制', () => {
