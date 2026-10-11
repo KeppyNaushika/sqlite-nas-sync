@@ -5,12 +5,13 @@
  * 0.21.0 までは、列が無いという SQLite の例外で `setupSync` が止まるか、`_id_merge` などはアプリの表が黙って消えた。
  * ここでは、`setupSync` が DB に触る前に、どの表が何と重なっているかを示す例外にすることを確かめる。
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
+import { SyncInstance } from '../src/types'
 
 const T = '2026-01-01T00:00:00.000Z'
 
@@ -40,7 +41,12 @@ describe('内部テーブルと同じ名前のアプリの表', () => {
   beforeEach(() => {
     work = mkdtempSync(join(tmpdir(), 'nas-internal-names-'))
   })
-  afterEach(() => rmSync(work, { recursive: true, force: true }))
+  /** 開いた同期。後片付けで閉じてから消す（Windows は開いているファイルを消せない） */
+  const opened: SyncInstance[] = []
+  afterEach(async () => {
+    for (const sync of opened.splice(0)) await sync.close()
+    rmSync(work, { recursive: true, force: true })
+  })
 
   function makeDb(statement: string): string {
     const dbPath = join(work, `${Math.random().toString(36).slice(2)}.sqlite`)
@@ -61,6 +67,7 @@ describe('内部テーブルと同じ名前のアプリの表', () => {
       schemaVersion: '1',
       intervalMs: 3_600_000,
     })
+    opened.push(sync)
     return () => sync.stop()
   }
 
@@ -88,6 +95,20 @@ describe('内部テーブルと同じ名前のアプリの表', () => {
       }
     }
   )
+
+  it('例外になるときは、開いた接続を閉じてから投げる', () => {
+    // 閉じないと、Windows ではアプリがこの DB ファイルを消すことも置き換えることもできない
+    const dbPath = makeDb(
+      `CREATE TABLE "_sns_clock" (id TEXT PRIMARY KEY NOT NULL, body TEXT)`
+    )
+    const close = vi.spyOn(Database.prototype, 'close')
+    try {
+      expect(() => open(dbPath)).toThrow(/_sns_clock/)
+      expect(close).toHaveBeenCalledTimes(1)
+    } finally {
+      close.mockRestore()
+    }
+  })
 
   it('内部テーブルと同じ名前のビューも例外になる', () => {
     const dbPath = makeDb(`CREATE VIEW _sync_state AS SELECT id FROM notes`)

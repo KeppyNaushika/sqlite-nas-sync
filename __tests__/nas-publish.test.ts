@@ -16,6 +16,7 @@ import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
 import { copyToNas } from '../src/nas'
 import { SyncConfig, SyncInstance } from '../src/types'
+import { isolateTmpDir } from './helpers/tmp-dir'
 
 const testDir = path.join(__dirname, 'test-data-nas-publish')
 const nasDir = path.join(testDir, 'nas')
@@ -24,21 +25,20 @@ const tmpRoot = path.join(testDir, 'tmp')
 const copyDir = path.join(tmpRoot, 'sqlite-nas-sync')
 const AT = '2026-09-01T00:00:00.000Z'
 
-let savedTmpDir: string | undefined
+let restoreTmpDir = (): void => {}
 const instances: SyncInstance[] = []
 
 beforeEach(() => {
   fs.rmSync(testDir, { recursive: true, force: true })
   fs.mkdirSync(nasDir, { recursive: true })
   fs.mkdirSync(tmpRoot, { recursive: true })
-  savedTmpDir = process.env.TMPDIR
-  process.env.TMPDIR = tmpRoot
+  restoreTmpDir = isolateTmpDir(tmpRoot)
 })
 
-afterEach(() => {
-  for (const instance of instances.splice(0)) instance.stop()
-  if (savedTmpDir === undefined) delete process.env.TMPDIR
-  else process.env.TMPDIR = savedTmpDir
+afterEach(async () => {
+  // 接続を閉じてから消す。Windows は開いているファイルを消せない（EBUSY）
+  for (const instance of instances.splice(0)) await instance.close()
+  restoreTmpDir()
   fs.rmSync(testDir, { recursive: true, force: true })
 })
 

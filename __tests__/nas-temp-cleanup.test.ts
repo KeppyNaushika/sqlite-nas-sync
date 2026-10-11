@@ -19,6 +19,7 @@ import Database from 'better-sqlite3'
 import { openRemoteDbViaLocalCopy, sweepStaleRemoteCopies } from '../src/nas'
 import { performSync } from '../src/sync'
 import { createSyncFixture, TABLES } from './helpers/sync-fixtures'
+import { isolateTmpDir } from './helpers/tmp-dir'
 
 const { prepare, cleanup, testDir, createClientDb, makeConfig } =
   createSyncFixture('test-data-nas-temp')
@@ -100,29 +101,24 @@ describe('openRemoteDbViaLocalCopy の後片付け', () => {
 
 describe('performSync 後の一時領域', () => {
   // `performSync` 経由では `os.tmpdir()` 配下が使われる。os.tmpdir() は呼ぶたびに
-  // TMPDIR を見るので、環境変数を差し替えるだけで隔離できる
+  // 環境変数を見るので、差し替えるだけで隔離できる（`helpers/tmp-dir.ts`）
   // （このためだけに設定項目を増やすのは、利用者に無関係な旋盤を渡すことになる）。
-  let savedTmpDir: string | undefined
+  let restoreTmpDir = (): void => {}
   let isolatedTmp: string
 
   beforeEach(() => {
     prepare()
     isolatedTmp = path.join(testDir, 'ostmp')
     fs.mkdirSync(isolatedTmp, { recursive: true })
-    savedTmpDir = process.env.TMPDIR
-    process.env.TMPDIR = isolatedTmp
+    restoreTmpDir = isolateTmpDir(isolatedTmp)
   })
 
   afterEach(() => {
-    if (savedTmpDir === undefined) {
-      delete process.env.TMPDIR
-    } else {
-      process.env.TMPDIR = savedTmpDir
-    }
+    restoreTmpDir()
     cleanup()
   })
 
-  /** 差し替えた TMPDIR 配下の一時コピー置き場。 */
+  /** 差し替えた一時フォルダの下の、一時コピーの置き場。 */
   function copyDir(): string {
     return path.join(os.tmpdir(), 'sqlite-nas-sync')
   }
@@ -251,7 +247,11 @@ describe('sweepStaleRemoteCopies（起きたついでの残骸回収）', () => 
     const mine = makeCopy(process.pid, 'aabbccdd')
     // 他プロセス（PID 1 は常に居る。root所有なので `kill(1, 0)` は EPERM になる ——
     // 「触れない」を「居ない」と読み替えると、他ユーザーが使用中のコピーを消してしまう）。
-    const others = makeCopy(1, 'eeff0011')
+    // Windows には PID 1 が無いので、生きている親プロセスを使う
+    const others = makeCopy(
+      process.platform === 'win32' ? process.ppid : 1,
+      'eeff0011'
+    )
 
     expect(sweepStaleRemoteCopies(dir)).toBe(0)
     expect(fs.existsSync(path.join(dir, mine))).toBe(true)

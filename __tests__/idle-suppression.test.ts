@@ -17,6 +17,7 @@ import { SyncConfig, SyncInstance, SyncTransfers } from '../src/types'
 import { FORCE_EVERY } from '../src/sync/idle'
 import { performSync } from '../src/sync'
 import { createRebuildState } from '../src/rows/rebuild'
+import { isolateTmpDir } from './helpers/tmp-dir'
 
 /**
  * 手元へ写した回数を数える。NAS 上のファイルを手元の一時ファイル（`remote-*.sqlite`）へ
@@ -40,23 +41,22 @@ describe('無駄な転送の抑制', () => {
   const testDir = path.join(__dirname, 'test-data-idle')
   const nasDir = path.join(testDir, 'nas')
   const isolatedTmp = path.join(testDir, 'tmp')
-  let savedTmpDir: string | undefined
+  let restoreTmpDir = (): void => {}
   /** この試験で作った `SyncInstance`。後片付けで `stop()` を呼ぶ */
   const instances: SyncInstance[] = []
 
   beforeEach(() => {
     fs.mkdirSync(nasDir, { recursive: true })
     fs.mkdirSync(isolatedTmp, { recursive: true })
-    // 一時コピーをこの試験の中に閉じ込める（`os.tmpdir()` は毎回 TMPDIR を見る）
-    savedTmpDir = process.env.TMPDIR
-    process.env.TMPDIR = isolatedTmp
+    // 一時コピーをこの試験の中に閉じ込める（`os.tmpdir()` は呼ぶたびに環境変数を見る）
+    restoreTmpDir = isolateTmpDir(isolatedTmp)
     copyCounter.copies = 0
   })
 
-  afterEach(() => {
-    for (const instance of instances.splice(0)) instance.stop()
-    if (savedTmpDir === undefined) delete process.env.TMPDIR
-    else process.env.TMPDIR = savedTmpDir
+  afterEach(async () => {
+    // 接続を閉じてから消す。Windows は開いているファイルを消せない（EBUSY）
+    for (const instance of instances.splice(0)) await instance.close()
+    restoreTmpDir()
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
   })
 
@@ -341,9 +341,10 @@ describe('無駄な転送の抑制', () => {
     expect(relayed).toEqual([{ id: 'n-b' }])
   })
 
-  // root で走らせると chmod が効かない（何でも書けてしまう）ので、その場合は飛ばす
+  // root で走らせると chmod が効かない（何でも書けてしまう）ので、その場合は飛ばす。
+  // Windows の chmod は読み取り専用の属性しか変えず、ディレクトリへの書き込みを禁じられないので、これも飛ばす
   const asRoot = typeof process.getuid === 'function' && process.getuid() === 0
-  it.skipIf(asRoot)(
+  it.skipIf(asRoot || process.platform === 'win32')(
     '作り直しと写しの両方が例外で止まったら、両方の例外を投げる',
     async () => {
       const pathA = createDb('a')
@@ -483,6 +484,9 @@ describe('無駄な転送の抑制', () => {
       for (let round = 0; round < 3; round += 1) {
         for (const sync of syncs) await sync.syncNow()
       }
+      // 次の回はこの回のファイルを消してから始めるので、接続を閉じておく
+      // （Windows は開いているファイルを消せない）
+      for (const sync of syncs) await sync.close()
       return JSON.stringify(paths.map(rows))
     }
 

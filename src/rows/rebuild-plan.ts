@@ -43,15 +43,55 @@ interface RebuildToken {
   importTick: string
 }
 
-/** 適用する表1つ分。 */
+/** アプリの表に当てる差の内訳（設計書 §4.4 の `inserted` / `updated` / `deleted`）。 */
+export interface RebuildPlanCounts {
+  /** 計画にあって、アプリの表に無かった行 */
+  inserted: number
+  /** 主キーは同じだが中身が違っていた行 */
+  updated: number
+  /** アプリの表にあって、計画に無かった行 */
+  deleted: number
+}
+
+/**
+ * 消す行1つ。主キーを、DB に格納されたバイト列のまま持つ（設計書 §3.7.2）。
+ *
+ * JS の文字列を通すと、UTF-8 として正しくないバイト列は U+FFFD に置き換わり、元の行を指せなくなる。
+ */
+export interface RebuildPlanDelete {
+  /** 主キーが TEXT で格納されているか（そうでなければ BLOB） */
+  text: boolean
+  /** `CAST(<主キー> AS BLOB)`。TEXT なら DB の文字コードのバイト列 */
+  bytes: Buffer
+}
+
+/** 計画のすべての表の差の内訳を足し合わせる。 */
+export function sumCounts(plan: RebuildPlan): RebuildPlanCounts {
+  const counts: RebuildPlanCounts = { inserted: 0, updated: 0, deleted: 0 }
+  for (const table of plan.apply) {
+    counts.inserted += table.counts.inserted
+    counts.updated += table.counts.updated
+    counts.deleted += table.counts.deleted
+  }
+  return counts
+}
+
+/**
+ * 適用する表1つ分。**計算した時点のアプリの表との差**だけを持つ（設計書 §3.7.2）。
+ *
+ * 中身の違う行は、`deletes` で消してから `inserts` で入れ直す。
+ */
 export interface RebuildPlanTable {
   name: string
   /** 主キーの列 */
   primaryKey: string
   /** 書き込む列（生成列を除く） */
   columns: string[]
+  /** 消す行 */
+  deletes: RebuildPlanDelete[]
   /** 入れる行（`columns` の値） */
-  rows: Record<string, SqlValue>[]
+  inserts: Record<string, SqlValue>[]
+  counts: RebuildPlanCounts
 }
 
 /** 1:1 の表の「真の id ↔ 表示している id」（`_sns_shown`）。 */
@@ -136,7 +176,7 @@ export function computeRebuildPlan(
     const versions = readVersions(db, computed, metas)
 
     const derived = derive(versions, schema)
-    const values = new ValueOrdering()
+    const values = new ValueOrdering({ memoize: true })
     try {
       const apply: RebuildPlanTable[] = []
       const shown: RebuildPlanShown[] = []
@@ -145,12 +185,16 @@ export function computeRebuildPlan(
       for (const table of order) {
         if (!targets.has(table)) continue
         const meta = metas.get(table) as TableMeta
-        const rows = derived.rows.get(table) ?? []
+        const rows = (derived.rows.get(table) ?? []).map((row) =>
+          pick(row, meta.storedColumns)
+        )
         apply.push({
           name: table,
           primaryKey: meta.primaryKey,
           columns: meta.storedColumns,
-          rows: rows.map((row) => pick(row, meta.storedColumns)),
+          // アプリの表も同じ読みのトランザクションで読む。token より後の書き込みは
+          // 適用の直前に token で捕まえるので、ここで読んだ姿との差を当ててよい
+          ...diffAgainstApplication(db, meta, rows, values),
         })
         for (const candidate of (
           derived.candidates.get(table) ?? new Map<string, CandidateResult>()
@@ -207,15 +251,20 @@ export function sameRebuildToken(a: RebuildToken, b: RebuildToken): boolean {
  */
 export function reviveRebuildPlan(plan: RebuildPlan): RebuildPlan {
   for (const table of plan.apply) {
-    for (const row of table.rows) {
+    for (const key of table.deletes) key.bytes = Buffer.from(key.bytes)
+    for (const row of table.inserts) {
       for (const [column, value] of Object.entries(row)) {
-        if (value instanceof Uint8Array && !Buffer.isBuffer(value)) {
-          row[column] = Buffer.from(value)
-        }
+        row[column] = reviveValue(value)
       }
     }
   }
   return plan
+}
+
+function reviveValue(value: SqlValue): SqlValue {
+  return value instanceof Uint8Array && !Buffer.isBuffer(value)
+    ? Buffer.from(value)
+    : value
 }
 
 /* ------------------------------------------------------------------ *
@@ -535,6 +584,151 @@ function collectOutputs(
     causeTable: candidate.cause?.table ?? null,
     causeId: candidate.cause?.key ?? null,
   })
+}
+
+/** アプリの表の行に添えて読む、主キーの格納の形（列名は `_sns_` で始まるのでアプリの列と重ならない）。 */
+const KEY_TYPE = '_sns_key_type'
+const KEY_BYTES = '_sns_key_bytes'
+
+/**
+ * 計画の行とアプリの表の差を作る（設計書 §3.7.2）。
+ *
+ * 行は真の id の正規形（`CAST(<主キー> AS TEXT)`）で突き合わせる。
+ * 中身は格納されたものまで同じときだけ同じとみなす（{@link StoredRows.same}）。違えば入れ直すので、
+ * 適用したあとのアプリの表は、計画の行を全部入れ直したときと同じになる。
+ *
+ * 同じ正規形を持つ行がアプリの表に2つ以上ある（`'1'` と `X'31'` など）ときは、
+ * 中身の同じ1つだけを残し、残りは消す。
+ */
+function diffAgainstApplication(
+  db: Database.Database,
+  meta: TableMeta,
+  rows: readonly Record<string, SqlValue>[],
+  values: ValueOrdering
+): Pick<RebuildPlanTable, 'deletes' | 'inserts' | 'counts'> {
+  const key = escapeIdentifier(meta.primaryKey)
+  const statement = db.prepare(
+    `SELECT ${meta.storedColumns.map(escapeIdentifier).join(', ')},
+            typeof(${key}) AS ${escapeIdentifier(KEY_TYPE)},
+            CAST(${key} AS BLOB) AS ${escapeIdentifier(KEY_BYTES)}
+       FROM ${escapeIdentifier(meta.name)}`
+  )
+  statement.safeIntegers(true)
+  const stored = new StoredRows(db, meta)
+  const present = new Map<string, Record<string, SqlValue>[]>()
+  for (const row of statement.iterate() as Iterable<Record<string, SqlValue>>) {
+    const id = values.idKey(row[meta.primaryKey] ?? null)
+    const same = present.get(id)
+    if (same === undefined) present.set(id, [row])
+    else same.push(row)
+  }
+  const deletes: RebuildPlanDelete[] = []
+  const inserts: Record<string, SqlValue>[] = []
+  const counts: RebuildPlanCounts = { inserted: 0, updated: 0, deleted: 0 }
+  for (const row of rows) {
+    const id = values.idKey(row[meta.primaryKey] ?? null)
+    const same = present.get(id)
+    if (same === undefined || same.length === 0) {
+      counts.inserted += 1
+      inserts.push(row)
+      continue
+    }
+    const at = same.findIndex((other) => stored.same(row, other))
+    if (at >= 0) {
+      same.splice(at, 1)
+      continue
+    }
+    counts.updated += 1
+    deletes.push(deleteOf(same.shift() as Record<string, SqlValue>))
+    inserts.push(row)
+  }
+  for (const same of present.values()) {
+    for (const row of same) {
+      counts.deleted += 1
+      deletes.push(deleteOf(row))
+    }
+  }
+  return { deletes, inserts, counts }
+}
+
+function deleteOf(row: Record<string, SqlValue>): RebuildPlanDelete {
+  return {
+    text: row[KEY_TYPE] === 'text',
+    bytes: row[KEY_BYTES] as Buffer,
+  }
+}
+
+/**
+ * アプリの表の行が、計画の行と格納されたものまで同じかを答える。
+ *
+ * 値はまず JS の値で比べる（{@link sameValue}）。
+ * ただし、UTF-8 として正しくない TEXT は、JS の文字列にした時点で U+FFFD に置き換わるので、JS の値が同じでも格納されたバイト列は違いうる。
+ * アプリの表の文字列に U+FFFD があるときだけ、格納されたバイト列を SQLite で比べ直す。
+ */
+class StoredRows {
+  /** 列と主キーの格納の形 → 格納されたバイト列を比べる文 */
+  private readonly statements = new Map<string, Database.Statement>()
+
+  constructor(
+    private readonly db: Database.Database,
+    private readonly meta: TableMeta
+  ) {}
+
+  same(
+    planned: Record<string, SqlValue>,
+    present: Record<string, SqlValue>
+  ): boolean {
+    for (const column of this.meta.storedColumns) {
+      const value = planned[column] ?? null
+      const held = present[column] ?? null
+      if (!sameValue(value, held)) return false
+      if (
+        typeof held === 'string' &&
+        held.includes('\uFFFD') &&
+        !this.sameBytes(column, value as string, present)
+      ) {
+        return false
+      }
+    }
+    return true
+  }
+
+  private sameBytes(
+    column: string,
+    value: string,
+    present: Record<string, SqlValue>
+  ): boolean {
+    const text = present[KEY_TYPE] === 'text'
+    const token = `${column}\u0000${String(text)}`
+    let statement = this.statements.get(token)
+    if (statement === undefined) {
+      statement = this.db.prepare(
+        `SELECT CAST(${escapeIdentifier(column)} AS BLOB) = CAST(? AS BLOB)
+           FROM ${escapeIdentifier(this.meta.name)}
+          WHERE ${escapeIdentifier(this.meta.primaryKey)} = ${
+            text ? 'CAST(? AS TEXT)' : '?'
+          }`
+      )
+      statement.pluck()
+      this.statements.set(token, statement)
+    }
+    return statement.get(value, present[KEY_BYTES]) === 1
+  }
+}
+
+/**
+ * 値が型まで同じか。
+ *
+ * 整数（`bigint`）と実数（`number`）は、値が等しくても別とみなす。
+ * 計画の行もアプリの表の行も、同じ宣言の表から `safeIntegers(true)` で読んでいるので、
+ * 同じ値なら型も同じになる。型が違えば格納の形が違うので、入れ直す。
+ */
+function sameValue(a: SqlValue, b: SqlValue): boolean {
+  if (Buffer.isBuffer(a) || Buffer.isBuffer(b)) {
+    return Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.equals(b)
+  }
+  if (typeof a !== typeof b) return false
+  return typeof a === 'number' ? Object.is(a, b) : a === b
 }
 
 function pick(

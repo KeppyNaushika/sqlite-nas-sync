@@ -16,6 +16,7 @@ import { checkIntegrity } from './integrity'
 import type { SyncWorker } from './worker-host'
 import { isPublishedTable, quoteLiteral } from './rows/schema'
 import { escapeIdentifier, isSameIdentifier } from './setup/sql'
+import { STEP_MS, yieldToEventLoop } from './event-loop'
 
 /**
  * ディレクトリが存在しない場合に再帰的に作成する。
@@ -109,9 +110,6 @@ export async function copyToNas(
 /** 写しの DB を `localDb` に `ATTACH` するときのスキーマ名。 */
 const PUBLISH_SCHEMA = 'sns_publish'
 
-/** 写しを作る処理を、イベントループへ戻らずに続ける時間の目安（ミリ秒）。 */
-const STEP_MS = 10
-
 /**
  * `localDb` から、NAS の写しに載せる表だけを `destPath` の新しい DB へ写す。
  *
@@ -150,7 +148,7 @@ async function writePublishedTables(
         if (!yieldsBetweenSteps || performance.now() - resumed < STEP_MS) {
           continue
         }
-        await new Promise((resolve) => setImmediate(resolve))
+        await yieldToEventLoop()
         resumed = performance.now()
       }
       localDb.exec('COMMIT')

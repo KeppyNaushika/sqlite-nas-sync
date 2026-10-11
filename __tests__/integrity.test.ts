@@ -27,40 +27,23 @@ import Database from 'better-sqlite3'
 import { checkIntegrity } from '../src/integrity'
 import { createSyncWorker } from '../src/worker-host'
 import { openRemoteDbViaLocalCopy } from '../src/nas'
+import { buildWorker } from './helpers/build-worker'
 
 const WORKER_BUILD = 'sync-worker-test'
-const build = join(process.cwd(), 'node_modules', '.cache', WORKER_BUILD)
+/** ワーカーを組み上げた先（`buildWorker` が返す） */
+let build = ''
 const dir = join(process.cwd(), 'test-data-integrity')
 const tmpDir = join(dir, 'tmp')
 let workerPath = ''
 
 beforeAll(() => {
-  // ワーカーは組み上げた JS からしか起動できない（`rows-rebuild.test.ts` と同じ手順）
-  execFileSync(
-    'npx',
-    [
-      'tsc',
-      '--ignoreConfig',
-      'src/worker.ts',
-      'src/worker-host.ts',
-      '--outDir',
-      build,
-      '--module',
-      'node16',
-      '--moduleResolution',
-      'node16',
-      '--target',
-      'ES2020',
-      '--esModuleInterop',
-      '--skipLibCheck',
-    ],
-    { cwd: process.cwd(), stdio: 'pipe' }
-  )
+  // ワーカーは組み上げた JS からしか起動できない
+  build = buildWorker(WORKER_BUILD)
   workerPath = join(build, 'worker.js')
 }, 60000)
 
 afterAll(() => {
-  fs.rmSync(build, { recursive: true, force: true })
+  if (build !== '') fs.rmSync(build, { recursive: true, force: true })
 })
 
 beforeEach(() => {

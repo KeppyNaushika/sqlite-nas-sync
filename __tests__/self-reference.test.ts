@@ -11,7 +11,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
-import { SyncResult } from '../src/types'
+import { SyncInstance, SyncResult } from '../src/types'
 
 const T = '2026-01-01T00:00:00.000Z'
 
@@ -22,7 +22,12 @@ describe('自己参照の外部キーを持つ表', () => {
     work = mkdtempSync(join(tmpdir(), 'nas-self-reference-'))
     nasPath = join(work, 'nas')
   })
-  afterEach(() => rmSync(work, { recursive: true, force: true }))
+  /** 開いた同期。後片付けで閉じてから消す（Windows は開いているファイルを消せない） */
+  const opened: SyncInstance[] = []
+  afterEach(async () => {
+    for (const sync of opened.splice(0)) await sync.close()
+    rmSync(work, { recursive: true, force: true })
+  })
 
   /** 木の表を持つ DB を作る。`seed` は `setupSync` の前に入れる行で、並びのとおりに入れる。 */
   function makeDb(name: string, seed: [string, string | null][] = []): string {
@@ -48,6 +53,7 @@ describe('自己参照の外部キーを持つ表', () => {
       schemaVersion: '1',
       intervalMs: 3_600_000,
     })
+    opened.push(sync)
     const db = new Database(dbPath)
     return { sync, db }
   }

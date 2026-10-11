@@ -66,7 +66,11 @@ import {
 } from './idle'
 import { readSchemaVersion, writeSchemaVersion } from '../setup/schema-version'
 import { getSyncState, recordSkippedRemote, updateSyncState } from './state'
-import { ROWS_FORMAT, RowsImportKey, importFromPeer } from '../rows/import'
+import {
+  ROWS_FORMAT,
+  RowsImportKey,
+  importFromPeerInSteps,
+} from '../rows/import'
 import {
   RowsRebuildHooks,
   RowsRebuildState,
@@ -92,6 +96,7 @@ import { escapeIdentifier } from '../setup/sql'
 import { SyncWorker, createSyncWorker } from '../worker-host'
 import { KeyLookup, keyLookup } from '../rows/key-lookup'
 import { SNS_META_KEYS, readSnsMeta } from '../rows/meta'
+import { STEP_MS, yieldToEventLoop } from '../event-loop'
 
 /**
  * `SyncInstance` が全体で1つ持つ記憶（設計書 §3.7.4）。
@@ -410,7 +415,7 @@ async function performRowsSyncWith(
     // 作り直しが例外で止まっても、取り込んだ版と手元の書き込みは上げてから投げ直す。
     // 作り直しの失敗は版の表を巻き戻さないので、上げる中身は変わらない。
     // 上げるのも例外で止まったら、両方の例外を `AggregateError` にまとめて投げる
-    importAll(localDb, peers, schemaVersion, specs, idle, result)
+    await importAll(localDb, peers, schemaVersion, specs, idle, result)
     let rebuildFailed = false
     let rebuildError: unknown
     try {
@@ -530,15 +535,28 @@ interface PeerSlot {
   skipped: boolean
 }
 
-function importAll(
+/**
+ * 相手を1人ずつ取り込む。
+ *
+ * 取り込みは呼んだスレッドで行う（手元の DB に書くので、ワーカーへは出せない）。
+ * 1人ぶんの取り込みは、キーを区切って {@link STEP_MS} ごとのトランザクションに分け、
+ * 区切りの間でイベントループへ戻る（`importFromPeerInSteps`）。
+ * 取り込んだ相手と次の相手の間でも戻る。次の相手の差分の読み出しを、前の相手の取り込みと
+ * 続けて行わないためである。何もしなかった相手の後では戻らない。
+ * 戻している間にアプリが書いても、取り込みはキーごとに強い方を採るだけなので答えは変わらない。
+ */
+async function importAll(
   localDb: Database.Database,
   peers: PeerSlot[],
   schemaVersion: string | undefined,
   specs: RowsTableSpec[],
   idle: IdleMemory,
   result: SyncResult
-): void {
+): Promise<void> {
+  let imported = false
   for (const peer of peers) {
+    if (imported) await yieldToEventLoop()
+    imported = false
     const remote = peer.remote
     try {
       if (peer.skipped) {
@@ -590,10 +608,13 @@ function importAll(
         cursor = entries[entries.length - 1].id
       }
 
-      const imported = importFromPeer(localDb, peerDb, {
-        tables: specs,
-        keys,
-      })
+      imported = true
+      const outcome = await importFromPeerInSteps(
+        localDb,
+        peerDb,
+        { tables: specs, keys },
+        STEP_MS
+      )
       // **この取り込みが版を1つでも動かしたか。** 動かしていないなら、同じ
       // ファイルを同じ読み位置でもう一度読んでも動かない（下の `rememberRead`）。
       // `_sns_dirty` に表を載せるのは `Max` が動いたキーがあるときだけなので、
@@ -601,19 +622,19 @@ function importAll(
       // `_sns_clock` の token や lamport の引き上げは数えない —— どちらも
       // 二度目は同じ値で、取り込みの答えを変えないから
       const movedNothing =
-        imported.status === 'imported' && imported.changed.length === 0
-      if (imported.status === 'skipped') {
+        outcome.status === 'imported' && outcome.changed.length === 0
+      if (outcome.status === 'skipped') {
         result.warnings.push(
-          `Skipped remote ${remote.clientId}: ${imported.reason ?? '不明'}`
+          `Skipped remote ${remote.clientId}: ${outcome.reason ?? '不明'}`
         )
         continue
       }
       // `Max` を変えずに格納した版は印に表れない。他の端末が読む帳簿は
       // 変わっているので、上げた覚えを捨てて上げ直す
-      if (imported.storedQuietly > 0) idle.push = null
-      result.skipped += imported.skipped
-      result.conflictsResolved += imported.conflicts
-      for (const skippedTable of imported.skippedTables) {
+      if (outcome.storedQuietly > 0) idle.push = null
+      result.skipped += outcome.skipped
+      result.conflictsResolved += outcome.conflicts
+      for (const skippedTable of outcome.skippedTables) {
         result.warnings.push(
           `Skipped table ${skippedTable.table}: ${skippedTable.reason}`
         )

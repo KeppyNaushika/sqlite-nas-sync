@@ -3,7 +3,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
 import { setupSync, SyncResult } from '../src/index'
-import { SyncConfig } from '../src/types'
+import { SyncConfig, SyncInstance } from '../src/types'
 
 describe('Integration Tests', () => {
   const testDir = path.join(__dirname, 'test-data-integration')
@@ -83,12 +83,23 @@ describe('Integration Tests', () => {
     return rows
   }
 
+  /** 開いた同期。後片付けで閉じてから消す（Windows は開いているファイルを消せない） */
+  const opened: SyncInstance[] = []
+  function openSync(config: SyncConfig): SyncInstance {
+    const sync = setupSync(config)
+    opened.push(sync)
+    return sync
+  }
+
   beforeEach(() => {
+    // 前の実行が途中で落ちて残したものを消してから始める
+    fs.rmSync(testDir, { recursive: true, force: true })
     fs.mkdirSync(testDir, { recursive: true })
     fs.mkdirSync(nasDir, { recursive: true })
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const sync of opened.splice(0)) await sync.close()
     if (fs.existsSync(testDir)) {
       fs.rmSync(testDir, { recursive: true })
     }
@@ -100,8 +111,8 @@ describe('Integration Tests', () => {
       const pathB = createClientDb('client-b')
 
       // setupSyncでトリガーを作成
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
 
       // トリガー存在後にデータ追加
       insertUserViaDb(
@@ -147,8 +158,8 @@ describe('Integration Tests', () => {
       const pathB = createClientDb('client-b')
 
       // setupSyncでトリガーを作成
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
 
       // 両方に同じIDのレコード（異なる内容・タイムスタンプ）
       insertUserViaDb(
@@ -190,8 +201,8 @@ describe('Integration Tests', () => {
       const pathB = createClientDb('client-b')
 
       // setupSyncでトリガー作成
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
 
       // Client A: レコード追加 → sync
       insertUserViaDb(
@@ -227,7 +238,7 @@ describe('Integration Tests', () => {
   describe('イベントシステム', () => {
     it('sync:start / sync:complete イベントが発火する', async () => {
       const pathA = createClientDb('client-a')
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       const events: string[] = []
       let completedResult: SyncResult | null = null
@@ -248,9 +259,11 @@ describe('Integration Tests', () => {
     it('sync:error イベントが発火する（NAS接続不可時）', async () => {
       const pathA = createClientDb('client-a')
       const badConfig = makeConfig(pathA, 'client-a')
-      badConfig.nasPath = '/nonexistent/path/that/cannot/exist'
+      // 普通のファイルの下は、どの OS でもディレクトリにできない。
+      // `/nonexistent/...` のような絶対パスは、Windows では C ドライブの下に作れてしまう
+      badConfig.nasPath = path.join(pathA, 'nas')
 
-      const syncA = setupSync(badConfig)
+      const syncA = openSync(badConfig)
 
       const errors: unknown[] = []
       syncA.on('sync:error', (err) => errors.push(err))
@@ -265,7 +278,7 @@ describe('Integration Tests', () => {
   describe('getStatus', () => {
     it('初期状態が正しい', () => {
       const pathA = createClientDb('client-a')
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       const status = syncA.getStatus()
       expect(status.isSyncing).toBe(false)
@@ -278,7 +291,7 @@ describe('Integration Tests', () => {
 
     it('sync後にステータスが更新される', async () => {
       const pathA = createClientDb('client-a')
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       await syncA.syncNow()
       const status = syncA.getStatus()
@@ -294,7 +307,7 @@ describe('Integration Tests', () => {
   describe('getSyncedTables', () => {
     it('検出されたテーブル名のリストを返す', () => {
       const pathA = createClientDb('client-a')
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       const tables = syncA.getSyncedTables()
       expect(tables.sort()).toEqual(['posts', 'users'])
@@ -304,7 +317,7 @@ describe('Integration Tests', () => {
 
     it('返り値はスナップショットでありミューテートしても内部状態に影響しない', () => {
       const pathA = createClientDb('client-a')
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       const tables = syncA.getSyncedTables()
       tables.push('hacked')
@@ -326,7 +339,7 @@ describe('Integration Tests', () => {
         excludeTables: ['posts'],
       })
 
-      const syncA = setupSync(config(pathA, 'client-a'))
+      const syncA = openSync(config(pathA, 'client-a'))
       expect(syncA.getSyncedTables()).toEqual(['users'])
 
       // posts に直接 INSERT してもトリガーが作られていないので changelog に乗らない
@@ -346,7 +359,7 @@ describe('Integration Tests', () => {
       await syncA.syncNow()
       syncA.stop()
 
-      const syncB = setupSync(config(pathB, 'client-b'))
+      const syncB = openSync(config(pathB, 'client-b'))
       const result = await syncB.syncNow()
       syncB.stop()
 
@@ -367,7 +380,7 @@ describe('Integration Tests', () => {
       const config = makeConfig(pathA, 'client-a')
       config.intervalMs = 50
 
-      const syncA = setupSync(config)
+      const syncA = openSync(config)
       let syncCount = 0
       syncA.on('sync:complete', () => syncCount++)
 
@@ -393,7 +406,7 @@ describe('Integration Tests', () => {
       // 同期対象になりうるテーブルを一切作らない
       db.close()
 
-      expect(() => setupSync(makeConfig(dbPath, 'invalid'))).toThrow(
+      expect(() => openSync(makeConfig(dbPath, 'invalid'))).toThrow(
         'No sync tables discovered'
       )
     })
@@ -412,7 +425,7 @@ describe('Integration Tests', () => {
       `)
       db.close()
 
-      expect(() => setupSync(makeConfig(dbPath, 'invalid-pk'))).toThrow(
+      expect(() => openSync(makeConfig(dbPath, 'invalid-pk'))).toThrow(
         'Validation failed'
       )
     })
@@ -431,7 +444,7 @@ describe('Integration Tests', () => {
       `)
       db.close()
 
-      expect(() => setupSync(makeConfig(dbPath, 'other-pk'))).toThrow(
+      expect(() => openSync(makeConfig(dbPath, 'other-pk'))).toThrow(
         "Primary key column 'id' is not the declared PRIMARY KEY"
       )
     })
@@ -443,7 +456,7 @@ describe('Integration Tests', () => {
       const pathB = createClientDb('client-b')
 
       // setupSyncでトリガー作成
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
 
       // トリガー存在後にデータ追加
       const dbA = new Database(pathA)
@@ -463,7 +476,7 @@ describe('Integration Tests', () => {
       syncA.stop()
 
       // Client B sync
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
       const result = await syncB.syncNow()
       syncB.stop()
 
@@ -511,8 +524,8 @@ describe('Integration Tests', () => {
         changelogRetentionDays: 7,
       })
 
-      const syncA = setupSync(config(pathA, 'client-a'))
-      const syncB = setupSync(config(pathB, 'client-b'))
+      const syncA = openSync(config(pathA, 'client-a'))
+      const syncB = openSync(config(pathB, 'client-b'))
 
       // 両方に同じIDのレコード（Bが新しい）
       const dbA = new Database(pathA)
@@ -567,7 +580,7 @@ describe('Integration Tests', () => {
         },
       }
 
-      const syncA = setupSync(config)
+      const syncA = openSync(config)
       await syncA.syncNow()
       syncA.stop()
 
@@ -583,8 +596,8 @@ describe('Integration Tests', () => {
       const pathB = createClientDb('client-b')
 
       // schemaVersion未指定 → 自動ハッシュが使われる
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
 
       insertUserViaDb(
         pathA,
@@ -629,8 +642,8 @@ describe('Integration Tests', () => {
       `)
       dbB.close()
 
-      const syncA = setupSync(makeConfig(pathA, 'client-a'))
-      const syncB = setupSync(makeConfig(pathB, 'client-b'))
+      const syncA = openSync(makeConfig(pathA, 'client-a'))
+      const syncB = openSync(makeConfig(pathB, 'client-b'))
 
       insertUserViaDb(
         pathA,

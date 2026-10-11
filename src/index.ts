@@ -61,48 +61,25 @@ import { RowsSyncRuntime, performSync } from './sync'
 import { createIdleMemory } from './sync/idle'
 import { createSyncWorker } from './worker-host'
 
-/**
- * 同期インスタンスを作成する。
- *
- * 次の順に準備して、{@link SyncInstance} を返す。
- *
- * 1. ローカル DB を開き、WAL モードにする
- * 2. {@link discoverTables} で同期するテーブルを検出する
- * 3. テーブルと DB が前提を満たすかを確かめる。満たさなければ例外を投げる。気になる点は警告として最初の同期の `warnings` に載せる
- * 4. 同期に使う内部テーブルとトリガーを作る。以前のバージョンのライブラリの形式の DB は移行し、テーブルの列の増減にも追従する
- *
- * 呼ぶたびにこのクライアントを識別する乱数を作り直す。
- * 同じ `clientId` を使う別のクライアントが NAS 上のコピーを書き換えていないかを、これで見分ける。
- *
- * @param config - 同期設定
- * @returns 同期操作を行うインスタンス
- * @throws 次のいずれかに当たる場合。
- * - 同期するテーブルが1つも見つからない
- * - 同期するテーブルが次のどれかに当たる（`Validation failed` またはそれぞれの文面）
- *   - `primaryKey` の列が無い、`TEXT` でない、テーブルで宣言された主キーでない
- *   - 主キーが無い、複合主キーである、`NOT NULL` でも `WITHOUT ROWID` でもない、主キーが NULL の行がある
- *   - 時刻列に ISO-8601 の文字列でない値がある行がある
- *   - `CHECK` 制約・部分索引の条件・式索引の式に、決定的でない関数・独自に登録した関数・組み込みでない照合順序がある、または索引の定義を読めない
- *   - 列名が `_sns_` で始まる
- * - 同期するテーブルを親とする外部キーが、親の主キー以外の列を参照している（子が同期しないテーブルでも同じ）
- * - テーブルに増えた列が `NOT NULL` で既定値が定数でなく、ユーザーテーブルから埋め直せない行がある
- *
- * @example
- * ```ts
- * const sync = setupSync({
- *   dbPath: './data/local.sqlite',
- *   nasPath: '/mnt/nas/shared-db/',
- *   clientId: 'client-abc123',
- *   intervalMs: 60000,         // 1分間隔
- *   changelogRetentionDays: 14 // 14日間保持
- * });
- * ```
- */
-export function setupSync(config: SyncConfig): SyncInstance {
-  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
+/** {@link prepareDatabase} の結果。 */
+interface PreparedDatabase {
+  tables: ReturnType<typeof discoverTables>
+  /** 最初の同期の `warnings` に載せる警告 */
+  setupWarnings: string[]
+  instanceId: string
+  resolvedConfig: SyncConfig
+}
 
-  // ローカルDB接続
-  const db = new Database(config.dbPath)
+/**
+ * {@link setupSync} の準備のうち、例外を投げうる部分（表の検出・前提の確認・移行・仕掛けの取り付け）。
+ *
+ * 例外を投げたら、呼ぶ側が接続を閉じる。
+ */
+function prepareDatabase(
+  db: Database.Database,
+  config: SyncConfig,
+  primaryKey: string
+): PreparedDatabase {
   db.pragma('journal_mode = WAL')
 
   // 同期対象テーブルを自動検出
@@ -114,7 +91,6 @@ export function setupSync(config: SyncConfig): SyncInstance {
   })
 
   if (tables.length === 0) {
-    db.close()
     throw new Error(
       `No sync tables discovered in ${config.dbPath}. ` +
         `Ensure tables exist with "${primaryKey}" and "updatedAt" columns ` +
@@ -129,7 +105,6 @@ export function setupSync(config: SyncConfig): SyncInstance {
   // バリデーション（discoverTablesは存在チェック済みだが、PK型まではチェックしない）
   const errors = validateDatabase(db, tables, primaryKey)
   if (errors.length > 0) {
-    db.close()
     throw new Error(
       `Validation failed:\n${errors.map((e) => `  ${e.table}: ${e.message}`).join('\n')}`
     )
@@ -179,6 +154,64 @@ export function setupSync(config: SyncConfig): SyncInstance {
     ...config,
     schemaVersion: resolvedSchemaVersion,
   }
+
+  return { tables, setupWarnings, instanceId, resolvedConfig }
+}
+
+/**
+ * 同期インスタンスを作成する。
+ *
+ * 次の順に準備して、{@link SyncInstance} を返す。
+ *
+ * 1. ローカル DB を開き、WAL モードにする
+ * 2. {@link discoverTables} で同期するテーブルを検出する
+ * 3. テーブルと DB が前提を満たすかを確かめる。満たさなければ例外を投げる。気になる点は警告として最初の同期の `warnings` に載せる
+ * 4. 同期に使う内部テーブルとトリガーを作る。以前のバージョンのライブラリの形式の DB は移行し、テーブルの列の増減にも追従する
+ *
+ * 呼ぶたびにこのクライアントを識別する乱数を作り直す。
+ * 同じ `clientId` を使う別のクライアントが NAS 上のコピーを書き換えていないかを、これで見分ける。
+ *
+ * @param config - 同期設定
+ * @returns 同期操作を行うインスタンス
+ * @throws 次のいずれかに当たる場合。
+ * - 同期するテーブルが1つも見つからない
+ * - 同期するテーブルが次のどれかに当たる（`Validation failed` またはそれぞれの文面）
+ *   - `primaryKey` の列が無い、`TEXT` でない、テーブルで宣言された主キーでない
+ *   - 主キーが無い、複合主キーである、`NOT NULL` でも `WITHOUT ROWID` でもない、主キーが NULL の行がある
+ *   - 時刻列に ISO-8601 の文字列でない値がある行がある
+ *   - `CHECK` 制約・部分索引の条件・式索引の式に、決定的でない関数・独自に登録した関数・組み込みでない照合順序がある、または索引の定義を読めない
+ *   - 列名が `_sns_` で始まる
+ * - 同期するテーブルを親とする外部キーが、親の主キー以外の列を参照している（子が同期しないテーブルでも同じ）
+ * - テーブルに増えた列が `NOT NULL` で既定値が定数でなく、ユーザーテーブルから埋め直せない行がある
+ *
+ * 例外を投げるときは、開いた DB の接続を閉じてから投げる。
+ *
+ * @example
+ * ```ts
+ * const sync = setupSync({
+ *   dbPath: './data/local.sqlite',
+ *   nasPath: '/mnt/nas/shared-db/',
+ *   clientId: 'client-abc123',
+ *   intervalMs: 60000,         // 1分間隔
+ *   changelogRetentionDays: 14 // 14日間保持
+ * });
+ * ```
+ */
+export function setupSync(config: SyncConfig): SyncInstance {
+  const primaryKey = config.primaryKey ?? DEFAULTS.primaryKey
+
+  // ローカルDB接続
+  const db = new Database(config.dbPath)
+  let prepared: PreparedDatabase
+  try {
+    prepared = prepareDatabase(db, config, primaryKey)
+  } catch (error) {
+    // 開いた接続を閉じてから投げる。閉じないと、Windows ではアプリがこの DB ファイルを
+    // 消すことも置き換えることもできない（接続は GC されるまで残る）
+    db.close()
+    throw error
+  }
+  const { tables, setupWarnings, instanceId, resolvedConfig } = prepared
 
   // 作り直しの記憶は `SyncInstance` が全体で1つ持つ（§3.7.4）。同期のたびに
   // 作り直すと、見送りがいくら続いても k 回目の合流経路へ入れない
