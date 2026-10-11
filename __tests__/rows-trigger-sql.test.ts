@@ -384,7 +384,7 @@ describe('0.21.0 で作った DB を setupSync で開くと、トリガーが置
 
   it(
     '4本とも新しい SQL になり、行の版と削除の版がこれまでどおり書かれる',
-    () => {
+    async () => {
       const dbPath = join(work, 'app.sqlite')
       writeFileSync(
         dbPath,
@@ -410,7 +410,8 @@ describe('0.21.0 で作った DB を setupSync で開くと、トリガーが置
         schemaVersion: '1',
         intervalMs: 3_600_000,
       })
-      sync.stop()
+      // 同期はしない。トリガーを置き換えたところで閉じる（Windows は開いているファイルを消せない）
+      await sync.close()
 
       const db = new Database(dbPath)
       try {

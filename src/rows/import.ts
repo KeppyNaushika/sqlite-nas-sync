@@ -1,7 +1,9 @@
 /**
  * 相手1人ぶんの取り込み（設計書 `docs/rows-table-design.md` §4.3）。
  *
- * 1つの `BEGIN IMMEDIATE` … `COMMIT` の中で、キーごとに次を行う。
+ * キーをいくつかの区切りに分け、区切りごとに1つの `BEGIN IMMEDIATE` … `COMMIT` の中で、キーごとに次を行う。
+ * 区切らずに1つのトランザクションで行うのが {@link importFromPeer}、区切りの間でイベントループへ戻るのが
+ * {@link importFromPeerInSteps} である。
  *
  * 1. 相手の `_sns_rows_<t>` の行（`rW`）と `_tombstone` の行（`rD`）を読む
  * 2. 手元の `lW` / `lD` と見比べ、**強い方**を採る（`W'` / `D'`）
@@ -40,6 +42,7 @@ import { canonicalTableSpecs } from './table-name'
 import { KeyLookup, keyLookup } from './key-lookup'
 import { strongerSql } from './triggers'
 import { RowVersion, SqlValue, ValueOrdering } from './versions'
+import { yieldToEventLoop } from '../event-loop'
 
 /** `_sync_meta.schemaVersion` に書く形式の名前（設計書 §3.8）。 */
 export const ROWS_FORMAT = 'rows1'
@@ -188,6 +191,50 @@ export function importFromPeer(
   peerDb: Database.Database,
   options: RowsImportOptions
 ): RowsImportResult {
+  const steps = importSteps(db, peerDb, options, Number.POSITIVE_INFINITY)
+  for (;;) {
+    const step = steps.next()
+    if (step.done === true) return step.value
+  }
+}
+
+/**
+ * 相手1人ぶんを、キーを区切って取り込む（設計書 §4.3）。
+ *
+ * 1つの区切りを1つのトランザクションで行い、区切りの間でイベントループへ戻る。
+ * 区切りは、`stepMs` を超えたところで閉じる（キーを少なくとも1つは取り込む）。
+ * 取り込みはキーごとに強い方を採るだけなので、区切りの間にアプリが書いても、途中で落ちて
+ * 取り込み直しても、答えは1つのトランザクションで行ったときと変わらない。
+ *
+ * @param stepMs 1つの区切りの時間の目安（ミリ秒）
+ */
+export async function importFromPeerInSteps(
+  db: Database.Database,
+  peerDb: Database.Database,
+  options: RowsImportOptions,
+  stepMs: number
+): Promise<RowsImportResult> {
+  const steps = importSteps(db, peerDb, options, stepMs)
+  for (;;) {
+    const step = steps.next()
+    if (step.done === true) return step.value
+    await yieldToEventLoop()
+  }
+}
+
+/**
+ * 取り込みの本体。区切りを1つ確定するたびに `yield` する。
+ *
+ * 区切りごとに、`Max` が動いた表を `_sns_dirty` に載せ、`_sns_clock` の lamport を引き上げ、
+ * `importTick` を進める。どれも区切りの中で確定するので、区切りの間に作り直しの計算が
+ * 始まっても、取り込んだ分を見落とさない。
+ */
+function* importSteps(
+  db: Database.Database,
+  peerDb: Database.Database,
+  options: RowsImportOptions,
+  stepMs: number
+): Generator<void, RowsImportResult> {
   const empty: RowsImportResult = {
     status: 'skipped',
     changed: [],
@@ -211,7 +258,9 @@ export function importFromPeer(
   // 表の名前は**入り口で1回だけ**畳む（`src/rows/table-name.ts`）。畳まずに
   // 持ち回ると、綴りの違う2端末で `_tombstone` の版の鍵が割れる
   const specs = canonicalTableSpecs(db, options.tables)
-  const values = new ValueOrdering()
+  // 1人ぶんの取り込みでは、同じ時刻を何度も比べる（キー1つにつき版を最大5回比べる）。
+  // 答えを覚えないと、比べるたびに SQLite へ尋ねる
+  const values = new ValueOrdering({ memoize: true })
   try {
     const io = new ImportIo(db, peerDb, specs, values)
     const keys = options.keys ?? collectPeerKeys(peerDb, specs)
@@ -224,14 +273,20 @@ export function importFromPeer(
       conflicts: 0,
       storedQuietly: 0,
     }
-    // 1つのトランザクション。途中で落ちたら、その相手ぶんだけ丸ごと戻る。
+    const dirty = new Set<string>()
+    let next = 0
+    // 1つの区切りを1つのトランザクションで行う。途中で落ちたら、その区切りだけが戻る。
     // `BEGIN IMMEDIATE`（`.immediate()`）にするのは、書き込みのロックを最初に
     // 取るためである。`BEGIN`（DEFERRED）だと、読みのあとで書き込みへ上がる
     // ところで `SQLITE_BUSY` になり、取り込みの途中で落ちうる
-    const run = db.transaction(() => {
+    const step = db.transaction(() => {
+      const started = performance.now()
       let highestLamport = 0
-      const dirty = new Set<string>()
-      for (const entry of keys) {
+      const dirtyHere = new Set<string>()
+      do {
+        const entry = keys[next]
+        next += 1
+        if (entry === undefined) break
         const table = io.table(entry.table)
         if (table === null) continue
         const outcome = importOneKey(io, table, entry.key)
@@ -251,14 +306,21 @@ export function importFromPeer(
           operation: outcome.operation,
         })
         // 見え方は `Max` だけで決まるので、作り直しが要るのは `Max` が動いた表だけ
-        dirty.add(table.name)
+        dirtyHere.add(table.name)
+      } while (next < keys.length && performance.now() - started < stepMs)
+      for (const name of dirtyHere) {
+        io.markDirty(name)
+        dirty.add(name)
       }
-      for (const name of dirty) io.markDirty(name)
-      result.dirtyTables = [...dirty]
       io.raiseLamport(highestLamport)
       io.bumpImportTick()
     })
-    run.immediate()
+    for (;;) {
+      step.immediate()
+      if (next >= keys.length) break
+      yield
+    }
+    result.dirtyTables = [...dirty]
     return result
   } finally {
     values.close()
@@ -376,14 +438,32 @@ interface TableIo {
   /** 列 → 既定値の SQL の字面（相手に無い列を埋めるのに使う） */
   defaults: Map<string, string | null>
   rowsTable: string
+  /** この表の文（文の名前 → 文）。キーごとに鍵の文字列を組み立てないよう、表に持たせる */
+  statements: Statements
+  /** `_sns_rows_<t>` を真の id で引く条件。手元と相手で親和性が違いうるので別々に持つ */
+  lookups: { local: KeyLookup | null; peer: KeyLookup | null }
+}
+
+/** 用意した文。どちらの DB の文かで置き場を分け、同じ名前でも取り違えない。 */
+interface Statements {
+  local: Map<string, Database.Statement>
+  peer: Map<string, Database.Statement>
+}
+
+function emptyStatements(): Statements {
+  return { local: new Map(), peer: new Map() }
 }
 
 /** 取り込みの読み書きを1か所にまとめる。文はすべて使い回す。 */
 class ImportIo {
   readonly skippedTables: { table: string; reason: string }[] = []
+  /**
+   * 綴り → 表の材料。最初は同期する表の綴りだけを持ち、範囲 `S` に別の綴りが現れたら
+   * 引いた結果を足す（キーごとに綴りを畳み直さない）
+   */
   private readonly tables = new Map<string, TableIo | null>()
-  private readonly statements = new Map<string, Database.Statement>()
-  private readonly lookups = new Map<string, KeyLookup>()
+  /** 表に依らない文 */
+  private readonly statements = emptyStatements()
   private readonly peerHasTombstone: boolean
 
   constructor(
@@ -394,7 +474,7 @@ class ImportIo {
   ) {
     this.peerHasTombstone = tableExists(peerDb, '_tombstone')
     for (const spec of specs) {
-      this.tables.set(foldIdentifier(spec.name), this.readTable(spec))
+      this.tables.set(spec.name, this.readTable(spec))
     }
   }
 
@@ -405,7 +485,18 @@ class ImportIo {
    * （相手のトリガーが埋め込んだ字面がそのまま載っている）。
    */
   table(name: string): TableIo | null {
-    return this.tables.get(foldIdentifier(name)) ?? null
+    const known = this.tables.get(name)
+    if (known !== undefined) return known
+    const folded = foldIdentifier(name)
+    let found: TableIo | null = null
+    for (const [spelling, table] of this.tables) {
+      if (table !== null && foldIdentifier(spelling) === folded) {
+        found = table
+        break
+      }
+    }
+    this.tables.set(name, found)
+    return found
   }
 
   private readTable(spec: RowsTableSpec): TableIo | null {
@@ -459,6 +550,8 @@ class ImportIo {
         columns.map((column) => [column.name, defaultOf(column)])
       ),
       rowsTable,
+      statements: emptyStatements(),
+      lookups: { local: null, peer: null },
     }
   }
 
@@ -469,7 +562,7 @@ class ImportIo {
     if (table.peerColumns === null) return null
     const statement = this.prepare(
       this.peerDb,
-      `peer-row:${table.name}`,
+      'peer-row',
       () => {
         const selected = table.columns.map((column) =>
           table.peerColumns?.has(column) === true
@@ -481,7 +574,8 @@ class ImportIo {
         }
         return `SELECT ${selected.join(', ')} FROM ${escapeIdentifier(table.rowsTable)}
                  WHERE ${this.lookupOf(this.peerDb, table).sql}`
-      }
+      },
+      table
     )
     const row = statement.get(
       ...this.lookupOf(this.peerDb, table).bind(key)
@@ -493,10 +587,11 @@ class ImportIo {
   readLocalRow(table: TableIo, key: string): Claim | null {
     const statement = this.prepare(
       this.db,
-      `local-row:${table.name}`,
+      'local-row',
       () =>
         `SELECT * FROM ${escapeIdentifier(table.rowsTable)}
-          WHERE ${this.lookupOf(this.db, table).sql}`
+          WHERE ${this.lookupOf(this.db, table).sql}`,
+      table
     )
     const row = statement.get(...this.lookupOf(this.db, table).bind(key)) as
       Record<string, SqlValue> | undefined
@@ -546,33 +641,38 @@ class ImportIo {
 
   /** `_sns_rows_<t>` へ（**受け取った版をそのまま**）書く。 */
   writeRow(table: TableIo, claim: Claim): void {
-    const statement = this.prepare(this.db, `write-row:${table.name}`, () => {
-      const names = [...table.columns, ...Object.values(VERSION_COLUMNS)]
-      const excluded = {
-        ts: `"excluded".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
-        lamport: `"excluded".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
-        instance: `"excluded".${escapeIdentifier(VERSION_COLUMNS.instance)}`,
-      }
-      const quoted = escapeIdentifier(table.rowsTable)
-      const held = {
-        ts: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.ts)}`,
-        lamport: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
-        instance: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
-      }
-      const assignments = names
-        .filter((column) => column !== table.primaryKey)
-        .map(
-          (column) =>
-            `${escapeIdentifier(column)} = "excluded".${escapeIdentifier(column)}`
-        )
-      // `SELECT … WHERE true` の形（設計書 §4.3 の K）。`VALUES` では
-      // `ON CONFLICT` の前に `WHERE` を置けず、`near "DO": syntax error` になる
-      return `INSERT INTO ${quoted} (${names.map(escapeIdentifier).join(', ')})
+    const statement = this.prepare(
+      this.db,
+      'write-row',
+      () => {
+        const names = [...table.columns, ...Object.values(VERSION_COLUMNS)]
+        const excluded = {
+          ts: `"excluded".${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+          lamport: `"excluded".${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+          instance: `"excluded".${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+        }
+        const quoted = escapeIdentifier(table.rowsTable)
+        const held = {
+          ts: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.ts)}`,
+          lamport: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.lamport)}`,
+          instance: `${quoted}.${escapeIdentifier(VERSION_COLUMNS.instance)}`,
+        }
+        const assignments = names
+          .filter((column) => column !== table.primaryKey)
+          .map(
+            (column) =>
+              `${escapeIdentifier(column)} = "excluded".${escapeIdentifier(column)}`
+          )
+        // `SELECT … WHERE true` の形（設計書 §4.3 の K）。`VALUES` では
+        // `ON CONFLICT` の前に `WHERE` を置けず、`near "DO": syntax error` になる
+        return `INSERT INTO ${quoted} (${names.map(escapeIdentifier).join(', ')})
               SELECT ${names.map(() => '?').join(', ')} WHERE true
               ON CONFLICT (${escapeIdentifier(table.primaryKey)}) DO UPDATE SET
                 ${assignments.join(',\n                ')}
               WHERE ${strongerSql(excluded, held)}`
-    })
+      },
+      table
+    )
     const row = claim.row as Record<string, SqlValue>
     statement.run(
       ...([...table.columns, ...Object.values(VERSION_COLUMNS)].map(
@@ -585,10 +685,11 @@ class ImportIo {
   deleteRow(table: TableIo, key: string): void {
     this.prepare(
       this.db,
-      `delete-row:${table.name}`,
+      'delete-row',
       () =>
         `DELETE FROM ${escapeIdentifier(table.rowsTable)}
-          WHERE ${this.lookupOf(this.db, table).sql}`
+          WHERE ${this.lookupOf(this.db, table).sql}`,
+      table
     ).run(...this.lookupOf(this.db, table).bind(key))
   }
 
@@ -707,27 +808,35 @@ class ImportIo {
    * 相手の写しと手元は別の DB なので、親和性はそれぞれの宣言で決める
    */
   private lookupOf(db: Database.Database, table: TableIo): KeyLookup {
-    const cacheKey = `${db === this.db ? 'local' : 'peer'}:${table.name}`
-    const cached = this.lookups.get(cacheKey)
-    if (cached !== undefined) return cached
+    const side = db === this.db ? 'local' : 'peer'
+    const cached = table.lookups[side]
+    if (cached !== null) return cached
     const lookup = keyLookup(db, table.rowsTable, table.primaryKey)
-    this.lookups.set(cacheKey, lookup)
+    table.lookups[side] = lookup
     return lookup
   }
 
+  /**
+   * 文を用意する（1回だけ）。`table` を渡せばその表の文として、渡さなければ表に依らない文として覚える。
+   * 手元の文と相手の文は別の置き場に覚える。
+   */
   private prepare(
     db: Database.Database,
     token: string,
-    sql: () => string
+    sql: () => string,
+    table?: TableIo
   ): Database.Statement {
-    const cacheKey = `${db === this.db ? 'local' : 'peer'}:${token}`
-    const cached = this.statements.get(cacheKey)
+    const side = db === this.db ? 'local' : 'peer'
+    const cache = (table === undefined ? this.statements : table.statements)[
+      side
+    ]
+    const cached = cache.get(token)
     if (cached !== undefined) return cached
     const statement = db.prepare(sql())
     // 2^53 を超える整数が潰れると、別の id や別の時刻が同着になり、
     // 書き戻したときに値が変わる（設計書 §3.7.1 の「値の受け渡し」）
     statement.safeIntegers(true)
-    this.statements.set(cacheKey, statement)
+    cache.set(token, statement)
     return statement
   }
 }

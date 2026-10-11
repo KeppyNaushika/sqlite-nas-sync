@@ -13,7 +13,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { setupSync } from '../src/index'
-import { SyncConfig } from '../src/types'
+import { SyncConfig, SyncInstance } from '../src/types'
 import {
   announceFullMerge,
   cleanupChangelog,
@@ -38,7 +38,12 @@ describe('起動のたびに _sync_state を空にしない', () => {
     work = mkdtempSync(join(tmpdir(), 'nas-keep-state-'))
     nasPath = join(work, 'nas')
   })
-  afterEach(() => rmSync(work, { recursive: true, force: true }))
+  /** 開いた同期。後片付けで閉じてから消す（Windows は開いているファイルを消せない） */
+  const opened: SyncInstance[] = []
+  afterEach(async () => {
+    for (const sync of opened.splice(0)) await sync.close()
+    rmSync(work, { recursive: true, force: true })
+  })
 
   function makeDb(file: string, tables: string[]): string {
     const dbPath = join(work, file)
@@ -65,6 +70,7 @@ describe('起動のたびに _sync_state を空にしない', () => {
       intervalMs: 3_600_000,
       ...extra,
     })
+    opened.push(sync)
     const db = new Database(dbPath)
     return {
       sync,

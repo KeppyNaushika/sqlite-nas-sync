@@ -18,11 +18,12 @@ import {
   WorkerOutcome,
   WorkerTask,
 } from '../src/worker-host'
+import { isolateTmpDir } from './helpers/tmp-dir'
 
 const testDir = path.join(__dirname, 'test-data-peer-copies')
 const nasDir = path.join(testDir, 'nas')
 const isolatedTmp = path.join(testDir, 'tmp')
-let savedTmpDir: string | undefined
+let restoreTmpDir = (): void => {}
 
 /** 写しの出入り。`fs.promises.copyFile` を数える。 */
 const copies = { started: [] as string[], inFlight: 0, maxInFlight: 0 }
@@ -101,17 +102,15 @@ beforeEach(() => {
   fs.rmSync(testDir, { recursive: true, force: true })
   fs.mkdirSync(nasDir, { recursive: true })
   fs.mkdirSync(isolatedTmp, { recursive: true })
-  // 一時コピーをこの試験の中に閉じ込める（`os.tmpdir()` は毎回 TMPDIR を見る）
-  savedTmpDir = process.env.TMPDIR
-  process.env.TMPDIR = isolatedTmp
+  // 一時コピーをこの試験の中に閉じ込める（`os.tmpdir()` は呼ぶたびに環境変数を見る）
+  restoreTmpDir = isolateTmpDir(isolatedTmp)
   copies.started = []
   copies.inFlight = 0
   copies.maxInFlight = 0
 })
 
 afterEach(() => {
-  if (savedTmpDir === undefined) delete process.env.TMPDIR
-  else process.env.TMPDIR = savedTmpDir
+  restoreTmpDir()
   fs.rmSync(testDir, { recursive: true, force: true })
 })
 

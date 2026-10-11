@@ -12,7 +12,6 @@
  * - **適用の前後で事実が増えないこと**、`PRAGMA` が戻ること、
  *   一時トリガーが一時のまま戻ること、冪等であること
  */
-import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -33,6 +32,7 @@ import {
 import { RowsTableSpec, createRowsTables } from '../src/rows/schema'
 import { createRowsTriggers } from '../src/rows/triggers'
 import { createSyncWorker } from '../src/worker-host'
+import { buildWorker } from './helpers/build-worker'
 
 const NOTES = `CREATE TABLE notes (
   id        TEXT PRIMARY KEY NOT NULL,
@@ -51,15 +51,16 @@ function scratchDir(): string {
   return dir
 }
 
-/** ワーカーを組み上げる先（`node_modules/.cache/` の下）。 */
+/** ワーカーを組み上げる先の名前（`node_modules/.cache/` の下）。 */
 const WORKER_BUILD = 'rows-worker-test'
+/** ワーカーを組み上げた先（`buildWorker` が返す）。組み上げていなければ `null` */
+let workerBuild: string | null = null
 
 afterAll(() => {
   for (const dir of scratch) rmSync(dir, { recursive: true, force: true })
-  rmSync(join(process.cwd(), 'node_modules', '.cache', WORKER_BUILD), {
-    recursive: true,
-    force: true,
-  })
+  if (workerBuild !== null) {
+    rmSync(workerBuild, { recursive: true, force: true })
+  }
 })
 
 /** 案A の仕掛けを載せた端末を1つ開く。 */
@@ -129,7 +130,13 @@ describe('作り直し —— 計算と適用の分離（§3.7.1）', () => {
 
       const plan = computeRebuildPlan(mine, { tables: ['notes'] })
       expect(plan.apply.map((table) => table.name)).toEqual(['notes'])
-      expect(plan.apply[0].rows.map((row) => row.id)).toEqual(['k1'])
+      expect(plan.apply[0].inserts.map((row) => row.id)).toEqual(['k1'])
+      expect(plan.apply[0].deletes).toEqual([])
+      expect(plan.apply[0].counts).toEqual({
+        inserted: 1,
+        updated: 0,
+        deleted: 0,
+      })
       // 書いていない
       expect(notesOf(mine)).toEqual([])
       expect(dirtyOf(mine)).toEqual(['notes'])
@@ -609,7 +616,7 @@ describe('作り直し —— 適用の前後で壊さないもの', () => {
     }
   })
 
-  it('UNIQUE の値を2行の間で入れ替える計画も通る（表全体の入れ替え）', () => {
+  it('UNIQUE の値を2行の間で入れ替える計画も通る（消す行を先に全部消す）', () => {
     const seats = `CREATE TABLE seats (
       id        TEXT PRIMARY KEY NOT NULL,
       slot      TEXT NOT NULL UNIQUE,
@@ -641,6 +648,307 @@ describe('作り直し —— 適用の前後で壊さないもの', () => {
     } finally {
       mine.close()
       peer.close()
+    }
+  })
+})
+
+/* ================================================================== *
+ * 差だけを当てる（§3.7.2）
+ * ================================================================== */
+
+describe('作り直し —— 差だけを当てる（§3.7.2）', () => {
+  /** トリガーを素通りさせて、アプリの表だけを書き換える（版は変わらない） */
+  function behindTriggers(db: Database.Database, sql: string): void {
+    db.exec(`INSERT INTO _sns_rebuilding (onlyRow) VALUES (0)`)
+    try {
+      db.exec(sql)
+    } finally {
+      db.exec(`DELETE FROM _sns_rebuilding`)
+    }
+  }
+
+  function rowids(db: Database.Database): Row[] {
+    return db.prepare(`SELECT rowid, id FROM notes ORDER BY id`).all() as Row[]
+  }
+
+  it.each(['UTF-8', 'UTF-16le'])(
+    'UTF-8 として正しくないバイト列の主キーの行も消せる（%s の DB）',
+    (encoding) => {
+      const mine = openClient('aaaa', {
+        statements: [`PRAGMA encoding = '${encoding}'`, NOTES],
+      })
+      try {
+        mine
+          .prepare(
+            `INSERT INTO notes VALUES ('k1', '手元', NULL, '2026-01-01')`
+          )
+          .run()
+        rebuildOnce(mine, { tables: ['notes'] })
+        // JS の文字列にすると U+FFFD に置き換わる主キー。版は無いので、作り直しで消える行
+        behindTriggers(
+          mine,
+          `INSERT INTO notes VALUES (CAST(X'6BFF00' AS TEXT), '外から', NULL, '2026-01-01')`
+        )
+        mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('notes')`)
+
+        const outcome = rebuildOnce(mine, { tables: ['notes'] })
+        expect(outcome.status).toBe('applied')
+        expect(outcome.counts).toEqual({ inserted: 0, updated: 0, deleted: 1 })
+        expect(
+          mine.prepare(`SELECT id FROM notes ORDER BY id`).pluck().all()
+        ).toEqual(['k1'])
+      } finally {
+        mine.close()
+      }
+    }
+  )
+
+  it('UTF-8 として正しくないバイト列の値は入れ直し、正しい U+FFFD は入れ直し続けない', () => {
+    const mine = openClient('aaaa')
+    try {
+      // 版の中身は正しい U+FFFD（EF BF BD）
+      mine
+        .prepare(`INSERT INTO notes VALUES ('k1', ?, NULL, '2026-01-01')`)
+        .run('a\uFFFD')
+      rebuildOnce(mine, { tables: ['notes'] })
+      expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(0)
+
+      // アプリの表だけ、JS では同じ 'a\uFFFD' に見える正しくないバイト列（61 FF）にする
+      behindTriggers(
+        mine,
+        `UPDATE notes SET title = CAST(X'61FF' AS TEXT) WHERE id = 'k1'`
+      )
+      expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(1)
+      mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('notes')`)
+      const outcome = rebuildOnce(mine, { tables: ['notes'] })
+      expect(outcome.counts).toEqual({ inserted: 0, updated: 1, deleted: 0 })
+      expect(mine.prepare(`SELECT hex(title) FROM notes`).pluck().get()).toBe(
+        '61EFBFBD'
+      )
+      expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(0)
+    } finally {
+      mine.close()
+    }
+  })
+
+  it('同じ DB を開いた別の接続が先に作り直したら、見送る（差を二重に当てない）', () => {
+    const path = join(scratchDir(), 'shared.sqlite')
+    const mine = openClient('aaaa', { path })
+    const peer = openClient('bbbb')
+    try {
+      peer
+        .prepare(`INSERT INTO notes VALUES ('k1', '相手', NULL, '2026-02-01')`)
+        .run()
+      seedFromPeer(mine, peer)
+      const other = new Database(path)
+      try {
+        const outcome = rebuildOnce(mine, {
+          tables: ['notes'],
+          hooks: {
+            // 計算を終えて適用する前に、別の接続が同じ計画を当てる
+            duringCompute: () => {
+              const first = rebuildOnce(other, { tables: ['notes'] })
+              expect(first.status).toBe('applied')
+            },
+          },
+        })
+        expect(outcome.status).toBe('deferred')
+        expect(notesOf(mine).map((row) => row.id)).toEqual(['k1'])
+        expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(0)
+      } finally {
+        other.close()
+      }
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('計算のあとに token が捕まえない書き込みで行が消えていたら、見送って次の回に揃える', () => {
+    const mine = openClient('aaaa')
+    try {
+      mine
+        .prepare(`INSERT INTO notes VALUES ('k1', '手元', NULL, '2026-01-01')`)
+        .run()
+      rebuildOnce(mine, { tables: ['notes'] })
+      // 版の無い行。作り直しで消える
+      behindTriggers(
+        mine,
+        `INSERT INTO notes VALUES ('x', '外から', NULL, '2026-01-01')`
+      )
+      mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('notes')`)
+
+      const state = createRebuildState()
+      const first = rebuildOnce(mine, {
+        tables: ['notes'],
+        state,
+        hooks: {
+          // 旗を立てて書く別の書き手（token に表れない）が、先に消してしまう
+          duringCompute: (db) =>
+            behindTriggers(db, `DELETE FROM notes WHERE id = 'x'`),
+        },
+      })
+      expect(first.status).toBe('deferred')
+      expect(state.skips).toBe(1)
+
+      const second = rebuildOnce(mine, { tables: ['notes'], state })
+      expect(second.status).toBe('applied')
+      expect(notesOf(mine).map((row) => row.id)).toEqual(['k1'])
+      expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(0)
+    } finally {
+      mine.close()
+    }
+  })
+
+  it('計算のあとに token が捕まえない書き込みで入れる行が先にあったら、見送って次の回に揃える', () => {
+    const mine = openClient('aaaa')
+    const peer = openClient('bbbb')
+    try {
+      peer
+        .prepare(`INSERT INTO notes VALUES ('k1', '相手', NULL, '2026-02-01')`)
+        .run()
+      seedFromPeer(mine, peer)
+
+      const state = createRebuildState()
+      const first = rebuildOnce(mine, {
+        tables: ['notes'],
+        state,
+        hooks: {
+          duringCompute: (db) =>
+            behindTriggers(
+              db,
+              `INSERT INTO notes VALUES ('k1', '別の書き手', NULL, '2026-01-01')`
+            ),
+        },
+      })
+      expect(first.status).toBe('deferred')
+
+      const second = rebuildOnce(mine, { tables: ['notes'], state })
+      expect(second.status).toBe('applied')
+      expect(second.counts).toEqual({ inserted: 0, updated: 1, deleted: 0 })
+      expect(notesOf(mine).map((row) => row.title)).toEqual(['相手'])
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('差の無い表では、アプリのトリガーを外さず、importTick も進めない', () => {
+    const mine = openClient('aaaa', {
+      statements: [
+        NOTES,
+        `CREATE TABLE audit (id TEXT)`,
+        `CREATE TRIGGER notes_audit AFTER INSERT ON notes BEGIN
+           INSERT INTO audit VALUES (NEW.id);
+         END`,
+      ],
+    })
+    try {
+      mine
+        .prepare(`INSERT INTO notes VALUES ('k1', '手元', NULL, '2026-01-01')`)
+        .run()
+      rebuildOnce(mine, { tables: ['notes'] })
+      mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('notes')`)
+      const schemaVersion = (): unknown =>
+        mine.pragma('schema_version', { simple: true })
+      const importTick = (): unknown =>
+        mine.prepare(`SELECT importTick FROM _sns_clock`).pluck().get()
+      const before = { schema: schemaVersion(), tick: importTick() }
+
+      const outcome = rebuildOnce(mine, { tables: ['notes'] })
+      expect(outcome.status).toBe('applied')
+      expect(outcome.counts).toEqual({ inserted: 0, updated: 0, deleted: 0 })
+      // `DROP TRIGGER` はスキーマを変える。差が無ければ触らない
+      expect({ schema: schemaVersion(), tick: importTick() }).toEqual(before)
+      expect(dirtyOf(mine)).toEqual([])
+    } finally {
+      mine.close()
+    }
+  })
+
+  it('変わらない行には触らない（rowid が変わらない）', () => {
+    const mine = openClient('aaaa')
+    const peer = openClient('bbbb')
+    try {
+      for (const id of ['k1', 'k2', 'k3']) {
+        mine
+          .prepare(`INSERT INTO notes VALUES (?, '手元', NULL, '2026-01-01')`)
+          .run(id)
+      }
+      rebuildOnce(mine, { tables: ['notes'] })
+      const before = rowids(mine)
+      peer
+        .prepare(`INSERT INTO notes VALUES ('k2', '相手', NULL, '2026-02-01')`)
+        .run()
+      importFromPeer(mine, peer, { tables: ['notes'] })
+
+      const outcome = rebuildOnce(mine, { tables: ['notes'] })
+      expect(outcome.status).toBe('applied')
+      expect(outcome.counts).toEqual({ inserted: 0, updated: 1, deleted: 0 })
+      const after = rowids(mine)
+      expect(after.filter((row) => row.id !== 'k2')).toEqual(
+        before.filter((row) => row.id !== 'k2')
+      )
+      expect(
+        mine.prepare(`SELECT title FROM notes WHERE id = 'k2'`).pluck().get()
+      ).toBe('相手')
+      expect(rebuildDiffCount(mine, { tables: ['notes'] })).toBe(0)
+    } finally {
+      mine.close()
+      peer.close()
+    }
+  })
+
+  it('値が等しくても型が違う行は入れ直す（整数の 1 と実数の 1.0）', () => {
+    const items = `CREATE TABLE items (
+      id        TEXT PRIMARY KEY NOT NULL,
+      n,
+      updatedAt TEXT
+    )`
+    const mine = openClient('aaaa', { statements: [items], tables: ['items'] })
+    try {
+      mine.prepare(`INSERT INTO items VALUES ('k1', 1, '2026-01-01')`).run()
+      rebuildOnce(mine, { tables: ['items'] })
+      behindTriggers(mine, `UPDATE items SET n = 1.0 WHERE id = 'k1'`)
+      expect(mine.prepare(`SELECT typeof(n) FROM items`).pluck().get()).toBe(
+        'real'
+      )
+
+      expect(
+        rebuildDiffCount(mine, { tables: ['items'], targets: ['items'] })
+      ).toBe(1)
+      mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('items')`)
+      const outcome = rebuildOnce(mine, { tables: ['items'] })
+      expect(outcome.counts).toEqual({ inserted: 0, updated: 1, deleted: 0 })
+      expect(mine.prepare(`SELECT typeof(n) FROM items`).pluck().get()).toBe(
+        'integer'
+      )
+    } finally {
+      mine.close()
+    }
+  })
+
+  it('同じ正規形の主キーを持つ行が2つあれば、中身の同じ1つを残して残りを消す', () => {
+    const mine = openClient('aaaa')
+    try {
+      mine
+        .prepare(`INSERT INTO notes VALUES ('k1', '手元', NULL, '2026-01-01')`)
+        .run()
+      rebuildOnce(mine, { tables: ['notes'] })
+      // 'k1' と X'6B31' は別の値なので主キーは衝突しないが、真の id はどちらも 'k1'
+      behindTriggers(
+        mine,
+        `INSERT INTO notes VALUES (X'6B31', '外から', NULL, '2026-01-01')`
+      )
+      mine.exec(`INSERT INTO _sns_dirty (tableName) VALUES ('notes')`)
+
+      const outcome = rebuildOnce(mine, { tables: ['notes'] })
+      expect(outcome.counts).toEqual({ inserted: 0, updated: 0, deleted: 1 })
+      expect(
+        mine.prepare(`SELECT typeof(id) AS t, title FROM notes`).all()
+      ).toEqual([{ t: 'text', title: '手元' }])
+    } finally {
+      mine.close()
     }
   })
 })
@@ -696,32 +1004,8 @@ describe('作り直し —— 確定したことを知らせる', () => {
 describe('作り直し —— worker_threads で計算する', () => {
   it('ワーカーの計算は、主スレッドの計算と同じ計画になる', async () => {
     const dir = scratchDir()
-    // ワーカーは Node がそのまま読める JS でなければならない（`vitest` の
-    // 変換は別スレッドには効かない）。段階3 の試験では、その場で組み上げる。
-    // **組み上げ先は `node_modules/.cache/` の下**である —— `better-sqlite3` を
-    // `require` するので、`node_modules` をたどれる場所に置く必要がある
-    const build = join(process.cwd(), 'node_modules', '.cache', WORKER_BUILD)
-    execFileSync(
-      'npx',
-      [
-        'tsc',
-        '--ignoreConfig',
-        'src/worker.ts',
-        'src/worker-host.ts',
-        '--outDir',
-        build,
-        '--module',
-        'node16',
-        '--moduleResolution',
-        'node16',
-        '--target',
-        'ES2020',
-        '--esModuleInterop',
-        '--skipLibCheck',
-      ],
-      { cwd: process.cwd(), stdio: 'pipe' }
-    )
-    const workerPath = join(build, 'worker.js')
+    workerBuild = buildWorker(WORKER_BUILD)
+    const workerPath = join(workerBuild, 'worker.js')
     expect(existsSync(workerPath)).toBe(true)
     const worker = createSyncWorker({ workerPath })
 

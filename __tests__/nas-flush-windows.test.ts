@@ -14,6 +14,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import Database from 'better-sqlite3'
 import { copyToNas } from '../src/nas'
+import { isolateTmpDir } from './helpers/tmp-dir'
 
 // `vi.mock` は import より前へ巻き上げられるので、差し替えが読む値も巻き上げる
 const flushes = vi.hoisted(() => ({ readOnly: 0, writable: 0 }))
@@ -58,20 +59,18 @@ vi.mock('fs', async (importOriginal) => {
 describe('写しの書き出し（Windows のハンドルの権限）', () => {
   const testDir = path.join(__dirname, 'test-data-nas-flush-windows')
   const nasDir = path.join(testDir, 'nas')
-  let savedTmpDir: string | undefined
+  let restoreTmpDir = (): void => {}
 
   beforeEach(() => {
     fs.rmSync(testDir, { recursive: true, force: true })
     fs.mkdirSync(nasDir, { recursive: true })
-    savedTmpDir = process.env.TMPDIR
-    process.env.TMPDIR = path.join(testDir, 'tmp')
+    restoreTmpDir = isolateTmpDir(path.join(testDir, 'tmp'))
     flushes.readOnly = 0
     flushes.writable = 0
   })
 
   afterEach(() => {
-    if (savedTmpDir === undefined) delete process.env.TMPDIR
-    else process.env.TMPDIR = savedTmpDir
+    restoreTmpDir()
     fs.rmSync(testDir, { recursive: true, force: true })
   })
 

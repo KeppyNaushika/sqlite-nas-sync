@@ -15,6 +15,7 @@ import {
   ROWS_FORMAT,
   collectPeerKeys,
   importFromPeer,
+  importFromPeerInSteps,
   readSnsFormat,
 } from '../src/rows/import'
 import { RowsTableSpec, createRowsTables } from '../src/rows/schema'
@@ -539,6 +540,81 @@ describe('取り込み —— 表の名前を sqlite_master の綴りへ畳む',
     } finally {
       mine.close()
       peer.close()
+    }
+  })
+})
+
+describe('取り込みを区切る（importFromPeerInSteps）', () => {
+  /** 相手に行と削除を書く。削除の版は書いた時刻を持つので、相手は1つだけ作って両方の手元に読ませる */
+  function seedPeer(): Database.Database {
+    const peer = openClient('bbbb')
+    for (let i = 0; i < 20; i += 1) {
+      peer
+        .prepare(`INSERT INTO notes VALUES (?, ?, NULL, '2026-02-01')`)
+        .run(`k${String(i)}`, `k${String(i)}`)
+    }
+    peer.prepare(`DELETE FROM notes WHERE id IN ('k3', 'k12')`).run()
+    return peer
+  }
+
+  /** 手元。相手と重なるキーに古い版を置く */
+  function seedMine(): Database.Database {
+    const mine = openClient('aaaa')
+    for (let i = 10; i < 25; i += 1) {
+      mine
+        .prepare(`INSERT INTO notes VALUES (?, ?, NULL, '2026-01-01')`)
+        .run(`k${String(i)}`, `k${String(i)}`)
+    }
+    return mine
+  }
+
+  function snapshot(db: Database.Database): unknown {
+    return {
+      rows: rowsOf(db),
+      tombstones: tombstonesOf(db),
+      changelog: db
+        .prepare(
+          `SELECT tableName, recordId, operation FROM _changelog ORDER BY id`
+        )
+        .all(),
+      dirty: db.prepare(`SELECT tableName FROM _sns_dirty`).pluck().all(),
+      lamport: lamportOf(db),
+    }
+  }
+
+  const importTickOf = (db: Database.Database): number =>
+    db.prepare(`SELECT importTick FROM _sns_clock`).pluck().get() as number
+
+  it('区切って確定しても、1つのトランザクションで取り込んだときと同じになる', async () => {
+    const peer = seedPeer()
+    const whole = { mine: seedMine(), peer }
+    const stepped = { mine: seedMine(), peer }
+    try {
+      const expected = importFromPeer(whole.mine, whole.peer, {
+        tables: ['notes'],
+      })
+      const tickBefore = importTickOf(stepped.mine)
+      let turns = 0
+      const counting = setInterval(() => {
+        turns += 1
+      }, 0)
+      const actual = await importFromPeerInSteps(
+        stepped.mine,
+        stepped.peer,
+        { tables: ['notes'] },
+        0
+      ).finally(() => clearInterval(counting))
+
+      expect(actual).toEqual(expected)
+      expect(snapshot(stepped.mine)).toEqual(snapshot(whole.mine))
+      // 区切りを 0 ms にすると、キー1つごとに確定する（区切りごとに importTick が進む）
+      const keys = collectPeerKeys(stepped.peer, ['notes']).length
+      expect(importTickOf(stepped.mine) - tickBefore).toBe(keys)
+      expect(importTickOf(whole.mine)).toBe(tickBefore + 1)
+      // 区切りの間でイベントループへ戻っている
+      expect(turns).toBeGreaterThan(0)
+    } finally {
+      for (const db of [whole.mine, stepped.mine, peer]) db.close()
     }
   })
 })

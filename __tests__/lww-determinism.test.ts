@@ -56,7 +56,7 @@ describe('削除 vs 更新の勝敗は、クライアントの同期の順に依
       await fn(db, sync)
     } finally {
       db.close()
-      sync.stop()
+      await sync.close()
     }
   }
 

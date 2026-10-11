@@ -13,8 +13,9 @@
  * 2. **`SQLITE_BUSY` は見送り**（§3.7.2 の (J)）。`busy_timeout = 0` の
  *    `BEGIN IMMEDIATE` は例外を投げる。投げ直すと見送りに数えられず、
  *    k 回目の合流経路に永久に入らない。token の不一致も見送りに数える
- * 3. **適用は表全体の入れ替え**（消す → 入れる）。UNIQUE の値を2行の間で
- *    入れ替える計画が通るのはこのためである
+ * 3. **適用は差だけを当てる**（消す行を全部消してから、入れる行を入れる）。
+ *    途中の表はどの時点でも計画の行の部分集合なので、UNIQUE の値を2行の間で
+ *    入れ替える計画も途中で衝突しない
  * 4. **旗（`_sns_rebuilding`）が立っている間に `_sns_dirty` を消す**。
  *    先に旗を下ろすと、その間に走ったトリガーが立てた汚れまで消してしまう
  * 5. **`DROP TRIGGER` は schema 修飾**。main と temp に同名のトリガーがあると、
@@ -32,7 +33,9 @@ import { escapeIdentifier, foldIdentifier } from '../setup/sql'
 import { missingParentAction } from './on-delete'
 import {
   RebuildPlan,
+  RebuildPlanCounts,
   RebuildPlanTable,
+  sumCounts,
   computeRebuildPlan,
   dependencyOrder,
   foreignKeysOf,
@@ -42,7 +45,6 @@ import {
 } from './rebuild-plan'
 import { RowsColumn } from './schema'
 import { canonicalTableSpecs } from './table-name'
-import { SqlValue, ValueOrdering } from './versions'
 import type { SyncWorker } from '../worker-host'
 
 /** 合流経路に落ちるまでの見送りの回数（設計書 §3.7.4 の k）。 */
@@ -132,20 +134,10 @@ interface RowsRebuildOutcome {
   /**
    * アプリの表に当てた差の内訳（設計書 §4.4 の `inserted` / `updated` / `deleted`）。
    *
-   * 適用は表全体の入れ替えなので、**入れ替える前のアプリの表と計画の行を
-   * 突き合わせて**数える。`status` が `applied` でなければ全部 0。
+   * 計算したときのアプリの表と計画の行の差（`src/rows/rebuild-plan.ts`）。
+   * `status` が `applied` でなければ全部 0。
    */
-  counts: RowsRebuildCounts
-}
-
-/** アプリの表に当てた差の内訳。 */
-interface RowsRebuildCounts {
-  /** 計画にあって、アプリの表に無かった行 */
-  inserted: number
-  /** 主キーは同じだが中身が違っていた行 */
-  updated: number
-  /** アプリの表にあって、計画に無かった行 */
-  deleted: number
+  counts: RebuildPlanCounts
 }
 
 /** まっさらな記憶。 */
@@ -208,16 +200,8 @@ export function rebuildDiffCount(
     targets: options.targets ?? tables,
     excluded: [...state.excluded],
   })
-  const values = new ValueOrdering()
-  try {
-    let diff = 0
-    for (const table of plan.apply) {
-      diff += countDifferences(db, table, values)
-    }
-    return diff
-  } finally {
-    values.close()
-  }
+  const counts = sumCounts(plan)
+  return counts.inserted + counts.updated + counts.deleted
 }
 
 /* ------------------------------------------------------------------ *
@@ -388,6 +372,13 @@ function applyRebuild(
       state.skips += 1
       return outcome(state, 'deferred', mode, [], '適用の途中で待たされた')
     }
+    // 計算した時点の表と合わなかった。token が捕まえない書き手（旗を立てて書く別の版の
+    // ライブラリなど）が間に入った。見送れば次の回に計算し直し、見送りが続けば
+    // 計算と適用を同じトランザクションで行う合流経路（§3.7.4）で必ず揃う
+    if (error instanceof StalePlanError && mode === 'normal') {
+      state.skips += 1
+      return outcome(state, 'deferred', mode, [], error.message)
+    }
     throw error
   }
   restore()
@@ -407,8 +398,8 @@ interface ApplyReport {
   applied: string[]
   /** 外部キーの検査に落ちて、対象から外すべき表 */
   violations: string[]
-  /** アプリの表に当てた差の内訳（入れ替える**前**に数える） */
-  counts: RowsRebuildCounts
+  /** アプリの表に当てた差の内訳 */
+  counts: RebuildPlanCounts
 }
 
 /** トランザクションの中身（設計書 §3.7.2 の箱の中）。 */
@@ -418,15 +409,24 @@ function applyPlan(
   tables: string[]
 ): ApplyReport {
   const applied = plan.apply.map((table) => table.name)
-  // 差は**入れ替える前に**数える。入れ替えたあとでは、消した行も入れた行も
-  // 区別が付かない（表全体が計画どおりになっているだけ）
-  const counts = countApplied(db, plan)
-  raiseFlag(db)
-  const dropped = dropApplicationTriggers(db, applied)
-  // 消す → 入れる（表全体の入れ替え）。消すのは子から、入れるのは親から
-  for (const table of [...plan.apply].reverse()) {
-    db.exec(`DELETE FROM ${escapeIdentifier(table.name)}`)
+  const counts = sumCounts(plan)
+  // 差のある表。アプリのトリガーを外すのはこの表だけにする。
+  // `DROP TRIGGER` はスキーマの変更で、アプリの接続の用意済みの文がすべて作り直しになる
+  const changed = plan.apply
+    .filter((table) => table.deletes.length > 0 || table.inserts.length > 0)
+    .map((table) => table.name)
+  if (changed.length > 0) {
+    // token を進める。旗が立っている間はトリガーが `_sns_tick` を進めないので、
+    // 同じ DB を開いている別のインスタンスが同じ計画を計算していても、ここで進めた
+    // `importTick` の違いで見送りになる（差を二重に当てない）
+    db.exec(`UPDATE "_sns_clock" SET "importTick" = "importTick" + 1`)
   }
+  raiseFlag(db)
+  const dropped = dropApplicationTriggers(db, changed)
+  // 差だけを当てる。消す行（中身の違う行も含む）を全部消してから入れるので、
+  // 途中の表はどの時点でも計画の行の部分集合で、UNIQUE の値の入れ替えも通る。
+  // 消すのは子から、入れるのは親から
+  for (const table of [...plan.apply].reverse()) deleteRows(db, table)
   for (const table of plan.apply) insertRows(db, table)
   // 同期しない表からの外部キーの後始末（設計書 §3.7.5）
   const touched = cleanupUnsyncedChildren(db, applied, tables)
@@ -448,47 +448,6 @@ function applyPlan(
   return { applied, violations, counts }
 }
 
-/**
- * 計画とアプリの表の差を数える（設計書 §4.4）。**入れ替える前に**呼ぶこと。
- */
-function countApplied(
-  db: Database.Database,
-  plan: RebuildPlan
-): RowsRebuildCounts {
-  const counts: RowsRebuildCounts = { inserted: 0, updated: 0, deleted: 0 }
-  const values = new ValueOrdering()
-  try {
-    for (const table of plan.apply) {
-      const statement = db.prepare(
-        `SELECT ${table.columns.map(escapeIdentifier).join(', ')}
-           FROM ${escapeIdentifier(table.name)}`
-      )
-      statement.safeIntegers(true)
-      const actual = new Map<string, Record<string, SqlValue>>()
-      for (const row of statement.all() as Record<string, SqlValue>[]) {
-        actual.set(values.idKey(row[table.primaryKey] ?? null), row)
-      }
-      const seen = new Set<string>()
-      for (const row of table.rows) {
-        const key = values.idKey(row[table.primaryKey] ?? null)
-        seen.add(key)
-        const other = actual.get(key)
-        if (other === undefined) {
-          counts.inserted += 1
-        } else if (!sameRow(table.columns, row, other)) {
-          counts.updated += 1
-        }
-      }
-      for (const key of actual.keys()) {
-        if (!seen.has(key)) counts.deleted += 1
-      }
-    }
-    return counts
-  } finally {
-    values.close()
-  }
-}
-
 function raiseFlag(db: Database.Database): void {
   db.exec(
     `INSERT INTO "_sns_rebuilding" ("onlyRow") VALUES (0)
@@ -500,9 +459,32 @@ function lowerFlag(db: Database.Database): void {
   db.exec(`DELETE FROM "_sns_rebuilding"`)
 }
 
-/** 計画の行を入れる。**生成列は書かない**（計画の `columns` に入っていない）。 */
+/**
+ * 計画の消す行を消す。主キーは格納されたバイト列で持っているので、`=` で同じ行を1つだけ指す
+ * （主キーは `TEXT` で `NOT NULL` なので、格納の形は TEXT か BLOB。設計書 §1.8 の P1）。
+ * TEXT は `CAST(? AS TEXT)` でバイト列を DB の文字コードの文字列に戻す。式は主キーの索引を使える。
+ * 消えた行が1でなければ、計算した時点の表と合わないので、適用をやめて見送る（{@link StalePlanError}）。
+ */
+function deleteRows(db: Database.Database, table: RebuildPlanTable): void {
+  if (table.deletes.length === 0) return
+  const sql = (key: string): string =>
+    `DELETE FROM ${escapeIdentifier(table.name)}
+      WHERE ${escapeIdentifier(table.primaryKey)} = ${key}`
+  const asText = db.prepare(sql('CAST(? AS TEXT)'))
+  const asBlob = db.prepare(sql('?'))
+  for (const key of table.deletes) {
+    const changes = (key.text ? asText : asBlob).run(key.bytes).changes
+    if (changes !== 1) {
+      throw new StalePlanError(
+        `${table.name} の消すはずの行が ${String(changes)} 行に当たった（計算した時点の表と違う）`
+      )
+    }
+  }
+}
+
+/** 計画の入れる行を入れる。**生成列は書かない**（計画の `columns` に入っていない）。 */
 function insertRows(db: Database.Database, table: RebuildPlanTable): void {
-  if (table.rows.length === 0) return
+  if (table.inserts.length === 0) return
   const statement = db.prepare(
     `INSERT INTO ${escapeIdentifier(table.name)} (${table.columns
       .map(escapeIdentifier)
@@ -511,12 +493,30 @@ function insertRows(db: Database.Database, table: RebuildPlanTable): void {
   )
   // `BigInt` のまま束縛する（`Number` へ戻すと 2^53 を超える id が壊れる）
   statement.safeIntegers(true)
-  for (const row of table.rows) {
-    statement.run(
-      ...(table.columns.map((column) => row[column] ?? null) as never[])
-    )
+  for (const row of table.inserts) {
+    try {
+      statement.run(
+        ...(table.columns.map((column) => row[column] ?? null) as never[])
+      )
+    } catch (error) {
+      // 計画の行は一時 DB で同じ制約を通っていて、適用したあとの表は計画の行そのものになる。
+      // それでも主キーや UNIQUE に当たるのは、計算した時点の表と違うときだけである
+      const code = (error as { code?: string }).code
+      if (
+        code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+        code === 'SQLITE_CONSTRAINT_UNIQUE'
+      ) {
+        throw new StalePlanError(
+          `${table.name} に入れる行が ${code} に当たった（計算した時点の表と違う）`
+        )
+      }
+      throw error
+    }
   }
 }
+
+/** 計画が、計算した時点のアプリの表と合わなかった（適用の途中で分かる）。 */
+class StalePlanError extends Error {}
 
 /* ------------------------------------------------------------------ *
  * アプリのトリガーの外し戻し（設計書 §3.7.3）
@@ -865,7 +865,7 @@ function outcome(
   mode: 'normal' | 'merged',
   tables: string[],
   reason?: string,
-  counts?: RowsRebuildCounts
+  counts?: RebuildPlanCounts
 ): RowsRebuildOutcome {
   return {
     status,
@@ -924,60 +924,4 @@ function primaryKeyNames(db: Database.Database, table: string): string[] {
     .filter((column) => column.pk > 0)
     .sort((a, b) => a.pk - b.pk)
     .map((column) => column.name)
-}
-
-/** 計画の行と、いまのアプリの表の行の差の件数。 */
-function countDifferences(
-  db: Database.Database,
-  table: RebuildPlanTable,
-  values: ValueOrdering
-): number {
-  const statement = db.prepare(
-    `SELECT ${table.columns.map(escapeIdentifier).join(', ')}
-       FROM ${escapeIdentifier(table.name)}`
-  )
-  statement.safeIntegers(true)
-  const actual = new Map<string, Record<string, SqlValue>>()
-  for (const row of statement.all() as Record<string, SqlValue>[]) {
-    actual.set(values.idKey(row[table.primaryKey] ?? null), row)
-  }
-  let diff = 0
-  const seen = new Set<string>()
-  for (const row of table.rows) {
-    const key = values.idKey(row[table.primaryKey] ?? null)
-    seen.add(key)
-    const other = actual.get(key)
-    if (other === undefined) {
-      diff += 1
-      continue
-    }
-    if (!sameRow(table.columns, row, other)) diff += 1
-  }
-  for (const key of actual.keys()) {
-    if (!seen.has(key)) diff += 1
-  }
-  return diff
-}
-
-function sameRow(
-  columns: readonly string[],
-  a: Record<string, SqlValue>,
-  b: Record<string, SqlValue>
-): boolean {
-  return columns.every((column) =>
-    sameValue(a[column] ?? null, b[column] ?? null)
-  )
-}
-
-function sameValue(a: SqlValue, b: SqlValue): boolean {
-  if (Buffer.isBuffer(a) || Buffer.isBuffer(b)) {
-    if (!Buffer.isBuffer(a) || !Buffer.isBuffer(b)) return false
-    return a.equals(b)
-  }
-  if (typeof a === 'bigint' || typeof b === 'bigint') {
-    if (a === null || b === null) return a === b
-    if (typeof a === 'string' || typeof b === 'string') return false
-    return BigInt(a as bigint | number) === BigInt(b as bigint | number)
-  }
-  return a === b
 }

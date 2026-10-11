@@ -190,6 +190,10 @@ export class ValueOrdering {
    * 負なら `a` が弱い。群が違えば群の順、同じ群なら群ごとの比べ方による。
    */
   compareTs(a: SqlValue, b: SqlValue): number {
+    // 同じ値なら、どの群でも同着になる。尋ねずに返す（取り込みでは、手元と相手が
+    // 同じ版を持つキーがほとんどで、比べる時刻の多くがこれに当たる）。
+    // 実数の NaN は `===` で等しくならないので、ここを素通りする
+    if (a === b) return 0
     const left = this.describe(a)
     const right = this.describe(b)
     if (left.group !== right.group) return left.group < right.group ? -1 : 1
@@ -228,6 +232,8 @@ export class ValueOrdering {
     const byTs = this.compareTs(a.ts, b.ts)
     if (byTs !== 0) return byTs
     if (a.lamport !== b.lamport) return a.lamport < b.lamport ? -1 : 1
+    // 同じ文字列なら UTF-8 のバイト列も同じ
+    if (a.instance === b.instance) return 0
     const byInstance = Buffer.compare(
       Buffer.from(a.instance, 'utf8'),
       Buffer.from(b.instance, 'utf8')
@@ -249,6 +255,9 @@ export class ValueOrdering {
    */
   idKey(value: SqlValue): string {
     if (Buffer.isBuffer(value)) return value.toString('utf8')
+    // 文字列の `CAST(… AS TEXT)` は同じ文字列なので、尋ねずに返す。
+    // ただし対になっていないサロゲートは、SQLite へ渡すときに U+FFFD へ置き換わるので尋ねる
+    if (typeof value === 'string' && !LONE_SURROGATE.test(value)) return value
     return String(this.describe(value).text)
   }
 
@@ -291,6 +300,9 @@ function memoKey(value: SqlValue): string | null {
   if (typeof value === 'string') return `s${value}`
   return null
 }
+
+/** 対になっていないサロゲート（`u` を付けると、対になったものには当たらない） */
+const LONE_SURROGATE = /\p{Surrogate}/u
 
 function compareNumbers(a: number, b: number): number {
   return a < b ? -1 : a > b ? 1 : 0

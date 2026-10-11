@@ -211,9 +211,10 @@ describe('NASが思いどおりでないとき', () => {
     })
 
     // root で走らせると chmod が効かない（何でも書けてしまう）ので、その場合は飛ばす。
+    // Windows の chmod は読み取り専用の属性しか変えず、ディレクトリへの書き込みを禁じられないので、これも飛ばす
     const asRoot =
       typeof process.getuid === 'function' && process.getuid() === 0
-    it.skipIf(asRoot)(
+    it.skipIf(asRoot || process.platform === 'win32')(
       '書き込めない場所なら例外を投げる（黙って成功しない）',
       async () => {
         const db = new Database(path.join(testDir, 'local2.sqlite'))
